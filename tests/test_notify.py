@@ -50,9 +50,34 @@ async def test_throttle_keys_are_independent():
 
 
 async def test_a_failing_transport_never_propagates():
+    calls = {"n": 0}
+
     class Broken:
         async def send(self, text: str) -> None:
+            calls["n"] += 1
             raise RuntimeError("telegram is down")
 
     throttled = Throttled(Broken(), interval_sec=1, now=lambda: 0.0)
     await throttled.send_once("k", "text")  # must not raise
+    assert calls["n"] == 1  # swallowed, not skipped
+
+
+async def test_a_failed_send_is_retried_rather_than_throttled():
+    # The alert exists to escalate. Treating a transport failure as a delivered
+    # message would silence a full disk for the whole interval.
+    calls = {"n": 0}
+
+    class Broken:
+        async def send(self, text: str) -> None:
+            calls["n"] += 1
+            raise RuntimeError("telegram is down")
+
+    throttled = Throttled(Broken(), interval_sec=3600, now=lambda: 0.0)
+    await throttled.send_once("disk", "full")
+    await throttled.send_once("disk", "full")
+    assert calls["n"] == 2
+
+
+async def test_build_falls_back_when_only_one_credential_is_set():
+    assert isinstance(build_notifier(Settings(_env_file=None, bot_token="t")), NullNotifier)
+    assert isinstance(build_notifier(Settings(_env_file=None, chat_id="c")), NullNotifier)

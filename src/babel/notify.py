@@ -59,11 +59,17 @@ class Throttled:
         last = self._last.get(key)
         if last is not None and now - last < self._interval:
             return
-        self._last[key] = now
         try:
             await self._inner.send(text)
         except Exception:  # noqa: BLE001 — an alert failing must never stop the crawl
             log.exception("could not deliver notification: %s", text)
+            return
+        # Recorded only on success. Stamping before the send would treat a
+        # Telegram hiccup exactly like a delivered message and silence the
+        # condition for the whole interval — the opposite of what an alert that
+        # exists to escalate should do. A persistently broken transport retries
+        # each cycle instead, which is cheap and leaves a log line every time.
+        self._last[key] = now
 
 
 def build_notifier(settings) -> Notifier:
