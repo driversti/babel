@@ -153,6 +153,21 @@ def test_self_closing_br_with_an_attribute_still_breaks_a_line():
     assert _body('Alpha<br class="clear" />Beta') == "Alpha\nBeta"
 
 
+def test_br_attribute_containing_a_gt_does_not_end_the_match_early():
+    """A naive '[^>]*' body for the attribute run stops at the first '>' it
+    sees, including one inside a quoted attribute value -- so
+    <br title="a>b"> would be cut into <br title="a> (matched, turned into a
+    newline) followed by the literal text b">, leaking raw markup into the
+    stored body. Because raw HTML is never archived, a body corrupted this
+    way cannot be repaired except by re-fetching the article. The pattern
+    must treat a quoted value as one unit and consume it whole.
+    """
+    result = _body('Alpha<br title="a>b">Beta')
+    assert result == "Alpha\nBeta"
+    assert "<" not in result
+    assert ">" not in result
+
+
 def test_br_is_matched_case_insensitively():
     assert _body("Alpha<BR>Beta") == "Alpha\nBeta"
 

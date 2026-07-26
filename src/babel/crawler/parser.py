@@ -43,7 +43,7 @@ _COMMENTS_RE = re.compile(r"\.\s*(\d+)\s+comments?\b")
 _COUNTRY_HREF_RE = re.compile(r"^/en/main/news/latest/all/([^/]+)/")
 _CITIZEN_HREF_RE = re.compile(r"^/en/citizen/profile/(\d+)")
 _PUBLISHED_BY_RE = re.compile(r"published by (.+?) on day")
-_BR_RE = re.compile(r"<br\b[^>]*>", re.IGNORECASE)
+_BR_RE = re.compile(r"""<br\b(?:[^>"']|"[^"]*"|'[^']*')*>""", re.IGNORECASE)
 _BLOCK_CLOSE_RE = re.compile(
     r"</(?:p|div|li|ul|ol|h[1-6]|tr|table|blockquote|pre)\s*>", re.IGNORECASE
 )
