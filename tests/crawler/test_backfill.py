@@ -92,6 +92,24 @@ async def test_discovers_a_start_when_no_cursor_is_stored(pg):
     assert await repo.get_cursor(pg, "backfill") == 97
 
 
+async def test_a_discovered_start_is_persisted_before_any_work(pg):
+    """Otherwise a restart before the first batch completes has to ask the feed again.
+
+    The cursor is only written when a batch finishes — 50 articles, so ~50s at
+    1 req/s. Observed on a live bootstrap: 31 articles collected and crawl_cursor
+    still empty. If the feed happens to be down at that moment, rediscovery raises
+    and the service crash-loops with work already in the database.
+    """
+    async def ingest(article_id: int) -> str:
+        raise AssertionError("no ingest should happen with max_cycles=0")
+
+    async def discover() -> int:
+        return 2797026
+
+    await run_backfill(pg, ingest, discover_start=discover, sleep=noop_sleep, max_cycles=0)
+    assert await repo.get_cursor(pg, "backfill") == 2797026
+
+
 async def test_an_explicit_start_id_beats_discovery(pg):
     """--start-id is the operator overriding the default, so it must win."""
     seen: list[int] = []

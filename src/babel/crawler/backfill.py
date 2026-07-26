@@ -71,6 +71,12 @@ async def run_backfill(
     cursor = await repo.get_cursor(conn, cursor_name)
     if cursor is None:
         cursor = await _first_cursor(start_id, discover_start)
+        # Written before any article is fetched. The loop only persists the cursor
+        # once a whole batch finishes — 50 articles, about a minute — and a restart
+        # inside that window would otherwise have to ask the feed again. If the feed
+        # is down just then, rediscovery raises and the service crash-loops with
+        # work already in the database. One write removes that dependency.
+        await repo.set_cursor(conn, cursor_name, cursor)
 
     cycles = 0
     while max_cycles is None or cycles < max_cycles:

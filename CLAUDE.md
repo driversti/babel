@@ -11,7 +11,7 @@ expensive to obtain; do not re-derive them, and update them there if the site ch
 Phase 1 — crawler. All ten original tasks are implemented: config, article/comment parser, DB
 schema + migration runner, repository layer, rate limiter + fetcher, content-addressed image
 store, end-to-end article ingest, RSS poller, newest-first backfill walker, and the CLI/service
-that composes them (`src/babel/cli.py`). 175 tests, all passing (`uv run pytest`, needs Docker for
+that composes them (`src/babel/cli.py`). 176 tests, all passing (`uv run pytest`, needs Docker for
 the `postgres:17` testcontainer); `uv run ruff check src tests` clean.
 
 **The probe has passed.** 100 article IDs fetched through a VPN tunnel from the target host:
