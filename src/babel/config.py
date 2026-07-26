@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     rss_pages: int = Field(default=5, ge=1, le=5)
     ip_check_interval_sec: int = Field(default=900, ge=60)
 
+    retry_cooldown_sec: int = Field(default=3600, ge=0)
+    backfill_idle_sleep_sec: float = Field(default=300.0, gt=0)
+
     def article_url(self, article_id: int) -> str:
         return f"{BASE_URL}/en/article/{article_id}/1/{self.comments_per_page}"
 
