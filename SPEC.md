@@ -14,7 +14,7 @@ it searchable regardless of the reader's language.
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 1 | Crawler: live polling + backfill → Postgres | **current** |
+| 1 | Crawler: live polling + backfill → Postgres, including images | **current** |
 | 2 | Public web archive (browse + keyword search) | later |
 | 3 | Embeddings + cross-language semantic search | later |
 | 4 | Telegram digest / sentiment | maybe |
@@ -57,6 +57,39 @@ Nesting depth is encoded as `padding-left:{30*depth}px` on a wrapper div. Delete
 as `<i>[removed]</i>`.
 
 Comment IDs are globally sequential (~44.8M as of 2026-07).
+
+### Images
+
+Articles average **6.2 images**, embedded from wherever the author happened to host them. Of 344
+image URLs sampled across all eras and actually downloaded:
+
+| Era | Still resolving |
+|-----|----------------:|
+| 2007–2014 | **7%** |
+| 2015–2020 | 34% |
+| 2021–2026 | **66%** |
+
+Top hosts are a roll-call of dead and dying image services: imageshack, photobucket, prntscr,
+`content.foto.my.mail.ru`, Dropbox public links, personal domains. A live image is 55 KB at the
+median, 84 KB at the mean, 221 KB at p90.
+
+The conclusion is the opposite of the intuitive one. Old images are not worth rushing for — 93% of
+2007–2014 is already gone and no crawl will bring it back. **Recent images are the ones actively
+being lost**: a third of 2021–2026 has already rotted, and the rest is decaying now. Every month of
+delay permanently costs part of the only layer still recoverable.
+
+So image capture belongs in phase 1, in the same pass as the article, in the same newest-first
+order. A later pass over 2024's articles will find strictly less than a pass today.
+
+| Depth | Images surviving | Bytes |
+|-------|-----------------:|------:|
+| 5 years | ~155 000 | ~13 GB |
+| 10 years | ~430 000 | ~36 GB |
+| Everything | ~4 900 000 | ~410 GB |
+
+Content-addressed storage deduplicates this substantially — flags, avatars, unit logos and recycled
+memes recur across thousands of articles — realistically landing near 250–300 GB for the full set.
+Still roughly 30× the text.
 
 ### Volume
 
@@ -177,6 +210,25 @@ CREATE TABLE comments (
     body        text                            -- NULL when [removed]
 );
 
+CREATE TABLE images (
+    sha256      bytea PRIMARY KEY,              -- content address; also the path on disk
+    mime        text,
+    bytes       int         NOT NULL,
+    width       int,
+    height      int,
+    stored_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE article_images (
+    article_id bigint      NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+    position   int         NOT NULL,            -- order within the article body
+    source_url text        NOT NULL,            -- as written by the author
+    sha256     bytea       REFERENCES images(sha256),   -- NULL when not retrieved
+    status     text        NOT NULL,            -- ok | dead | skipped_no_space | error
+    checked_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (article_id, position)
+);
+
 CREATE TABLE fetch_log (
     article_id bigint PRIMARY KEY,
     status     text        NOT NULL,            -- ok | missing | error
@@ -205,6 +257,41 @@ date = 2007-11-21 + eday days, in America/Los_Angeles
 
 Cross-check: eDay 6 819 → 2026-07-23, which matches the article page.
 
+### Image storage
+
+Binary data does not go in Postgres. Files are written to a content-addressed tree —
+`{IMAGE_ROOT}/ab/cd/abcdef...` keyed by SHA-256 — which deduplicates for free and makes the whole
+store relocatable with `rsync`. Postgres keeps only the metadata above.
+
+`IMAGE_ROOT` is configuration, never a constant. The archive will outgrow the crawler's host, and
+moving it must not require touching code.
+
+`article_images` records every image reference whether or not the bytes were retrieved, so a dead
+link is a recorded fact rather than an absence. `status = dead` is permanent knowledge: it says
+this image was already gone when we looked, which is worth keeping.
+
+**A free-space floor is mandatory.** Before each batch the crawler checks available space and
+stops fetching images below the threshold, recording `skipped_no_space` and continuing with text.
+On the intended host the image tree shares a filesystem with both Postgres and the OS root, so
+filling it takes down the machine and not merely the crawl. Text ingestion must never be blocked
+by image storage.
+
+### Target host
+
+An NVIDIA Jetson Orin Nano Super dev kit: 6 cores, 7.4 GiB of unified memory, a 465 GB NVMe with
+~388 GB free, JetPack 6 (L4T R36.4.7), Docker 29.6. Bare metal, so `/dev/net/tun` is available for
+the VPN.
+
+Notes that follow from this:
+
+- Text, metadata and vectors total roughly 15 GB. The disk is not a constraint for them.
+- Images are, eventually. 388 GB does not comfortably hold the full ~410 GB unreduced set on a
+  partition it shares with the OS, hence the free-space floor and the relocatable `IMAGE_ROOT`.
+- Memory is unified between CPU and GPU; the 3.7 GiB of zram swap is compressed RAM and adds no
+  real capacity, so it should not be counted toward an index budget.
+- The NVIDIA container runtime is **not** currently configured — `docker info` reports only `runc`.
+  Irrelevant to phase 1, a prerequisite for phase 3.
+
 ### Decisions
 
 **Raw HTML is not archived at full scale.** 118 GB for something we can re-fetch. Keep raw HTML
@@ -214,7 +301,12 @@ for the last 30 days only, as insurance against a parser bug or a markup change.
 to fetch an article without them.
 
 **Backfill runs newest-first.** The archive is useful from day one and no depth decision has to be
-made up front. Stopping at any point still leaves the most relevant years collected.
+made up front. Stopping at any point still leaves the most relevant years collected. Images make
+this ordering matter more, not less: the newest are both the most numerous survivors and the ones
+still actively disappearing.
+
+**Images are fetched in the same pass as the article.** Not a later sweep. The survival curve means
+a deferred pass recovers strictly less, and the loss is permanent.
 
 **Nothing is translated at ingest time.** Store originals; translation is a phase 3 concern and
 belongs at query time, on the handful of documents actually retrieved.
@@ -236,6 +328,20 @@ which is what that hardware is genuinely good at, and free to re-run when the mo
 Storage as `halfvec(1024)` with a `bit(1024)` binary-quantised HNSW index — about 400 MB for the
 full 2.8M archive, so 8 GB of unified memory is not a constraint. Retrieval reranks the binary
 candidates against the full vectors.
+
+Postgres stays the only datastore. The queries this archive exists to answer are hybrid — a
+metadata predicate and a semantic one together, "articles from Serbia in March about X" — and in
+Postgres that is one statement with a `WHERE` clause. A separate vector database would mean either
+mirroring all metadata into it or intersecting two result sets by hand, and a second database to
+run on a 7 GB machine. At 2.8M vectors there is nothing pgvector cannot handle; the case for a
+dedicated store starts an order of magnitude further up.
+
+**pgvector 0.8 or newer is required.** Earlier versions apply the `WHERE` filter after traversing
+the HNSW graph, so a filtered vector query silently returns too few rows or poor recall. Iterative
+index scans, added in 0.8, fix exactly that — and filtered vector search is the primary query
+shape here, not an edge case.
+
+Prerequisite: the NVIDIA container runtime must be installed and configured on the host first.
 
 **Phase 4 — digest / sentiment.** A daily Telegram digest is one cron job and one model call once
 the crawler exists. Sentiment analysis is the weakest idea here: it produces confident output that
