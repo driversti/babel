@@ -21,6 +21,9 @@ dist/
 .env.local
 pgdata/
 db_data/
+# Gluetun's bind mount. Runtime state the container writes itself, including a
+# 7 MB server list it regenerates on first start.
+gluetun/
 .DS_Store
 
 # Database dumps / backups
