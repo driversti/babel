@@ -21,6 +21,9 @@ dist/
 .env.local
 pgdata/
 db_data/
+# Default IMAGE_ROOT_HOST. The image tree reaches hundreds of GB; it must never
+# be committable to a public repo by someone who did not set IMAGE_ROOT_HOST.
+data/
 # Gluetun's bind mount. Runtime state the container writes itself, including a
 # 7 MB server list it regenerates on first start.
 gluetun/
