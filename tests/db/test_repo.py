@@ -276,3 +276,133 @@ async def test_the_sweep_can_actually_use_the_partial_index(pg):
     await pg.execute("SET enable_seqscan = on")
     assert "fetch_log_retryable_idx" in plan, plan
     assert "fetch_log_retryable_idx" not in wider, wider
+
+
+async def test_claim_returns_newest_articles_first(pg):
+    for article_id in (100, 300, 200):
+        await pg.execute(
+            "INSERT INTO articles (id, title, body, published_at) VALUES ($1, 't', 'b', now())",
+            article_id,
+        )
+        await pg.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status)
+               VALUES ($1, 0, 'https://x.example/a.png', 'pending')""",
+            article_id,
+        )
+    claimed = await repo.claim_pending_images(pg, limit=10)
+    assert [c.article_id for c in claimed] == [300, 200, 100]
+
+
+async def test_claim_excludes_terminal_statuses(pg):
+    # 'ok' and 'dead' are answers and must never be reclaimed; 'pending' and
+    # 'error' are unfinished business and both belong in the claim -- see
+    # test_an_errored_row_is_reclaimed_below_the_ceiling for why 'error' alone
+    # is retried while 'dead' alone is not.
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    for position, status in enumerate(["pending", "ok", "dead", "error"]):
+        await pg.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status)
+               VALUES (1, $1, 'https://x.example/a.png', $2)""",
+            position, status,
+        )
+    claimed = await repo.claim_pending_images(pg, limit=10)
+    assert [c.position for c in claimed] == [0, 3]
+
+
+async def test_claim_skips_rows_at_the_attempt_ceiling(pg):
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status, attempts)
+           VALUES (1, 0, 'https://x.example/a.png', 'pending', $1)""",
+        repo.MAX_IMAGE_ATTEMPTS,
+    )
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status, attempts)
+           VALUES (1, 1, 'https://x.example/b.png', 'pending', $1)""",
+        repo.MAX_IMAGE_ATTEMPTS - 1,
+    )
+    claimed = await repo.claim_pending_images(pg, limit=10)
+    assert [c.position for c in claimed] == [1]
+
+
+async def test_claim_respects_the_limit(pg):
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    for position in range(5):
+        await pg.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status)
+               VALUES (1, $1, 'https://x.example/a.png', 'pending')""",
+            position,
+        )
+    assert len(await repo.claim_pending_images(pg, limit=2)) == 2
+
+
+async def test_record_result_sets_status_and_bumps_attempts(pg):
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status)
+           VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
+    )
+    await repo.record_image_result(pg, 1, 0, "error")
+    row = await pg.fetchrow("SELECT status, attempts FROM article_images WHERE article_id = 1")
+    assert row["status"] == "error"
+    assert row["attempts"] == 1
+
+    await repo.record_image_result(pg, 1, 0, "error")
+    row = await pg.fetchrow("SELECT status, attempts FROM article_images WHERE article_id = 1")
+    assert row["attempts"] == 2
+
+
+async def test_an_errored_row_is_reclaimed_below_the_ceiling(pg):
+    # 'error' means we could not tell whether the image is there. Unlike 'dead',
+    # it must come back around until the attempt ceiling is reached.
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status)
+           VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
+    )
+    await repo.record_image_result(pg, 1, 0, "error")
+    assert [c.position for c in await repo.claim_pending_images(pg, limit=10)] == [0]
+
+
+async def test_the_queue_can_actually_use_the_partial_index(pg):
+    # article_images_queue_idx's predicate and this query's status list must stay
+    # textually identical: Postgres proves a partial index applicable only from a
+    # Const. Disabling seqscan makes the planner take the index if -- and only if
+    # -- it can prove it applies, so this tests provability, not cost preference.
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status)
+           VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
+    )
+    await pg.execute("SET enable_seqscan = off")
+    plan = "\n".join(
+        r["QUERY PLAN"]
+        for r in await pg.fetch(
+            """EXPLAIN SELECT article_id, position, source_url, attempts FROM article_images
+               WHERE status IN ('pending', 'error') AND attempts < 5
+               ORDER BY article_id DESC, position LIMIT 50"""
+        )
+    )
+    # Control: a predicate the index does not cover must NOT reach it, or the
+    # assertion below would pass for any query at all.
+    wider = "\n".join(
+        r["QUERY PLAN"]
+        for r in await pg.fetch(
+            """EXPLAIN SELECT article_id FROM article_images
+               WHERE status IN ('pending', 'error', 'ok')
+               ORDER BY article_id DESC LIMIT 50"""
+        )
+    )
+    await pg.execute("SET enable_seqscan = on")
+    assert "article_images_queue_idx" in plan, plan
+    assert "article_images_queue_idx" not in wider, wider
+
+
+async def test_a_dead_row_is_never_reclaimed(pg):
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status)
+           VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
+    )
+    await repo.record_image_result(pg, 1, 0, "dead")
+    assert await repo.claim_pending_images(pg, limit=10) == []

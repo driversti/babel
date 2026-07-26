@@ -6,6 +6,7 @@ crawl safe.
 """
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import asyncpg
 
@@ -195,4 +196,62 @@ async def record_image(
            ON CONFLICT (article_id, position) DO UPDATE SET
                sha256 = EXCLUDED.sha256, status = EXCLUDED.status, checked_at = now()""",
         article_id, position, source_url, sha256, status,
+    )
+
+
+# An image host that answers with a timeout rather than a 404 would otherwise sit
+# in the queue forever. 'dead' is final and never recounted; only 'error' retries.
+MAX_IMAGE_ATTEMPTS = 5
+
+
+@dataclass(frozen=True, slots=True)
+class PendingImage:
+    article_id: int
+    position: int
+    source_url: str
+    attempts: int
+
+
+async def claim_pending_images(conn: asyncpg.Connection, limit: int) -> list[PendingImage]:
+    """Next images to fetch, newest article first.
+
+    Ordering is not cosmetic: 66% of 2021-2026 images still resolve against 7%
+    of 2007-2014, so draining oldest-first would spend the crawl on links that
+    are already gone while the recoverable ones rot.
+
+    An 'error' row returns to 'pending' via record_image_result only implicitly —
+    it is re-offered here because its status is not terminal and its attempts are
+    below the ceiling.
+    """
+    rows = await conn.fetch(
+        """
+        -- The status set is written as a literal, not a bound parameter, and
+        -- must stay textually identical to article_images_queue_idx's predicate.
+        -- Postgres only proves a partial index applicable from a Const; with a
+        -- Param it cannot, and the planner would sequentially scan a table
+        -- holding millions of rows that are almost all 'ok' or 'dead'.
+        SELECT article_id, position, source_url, attempts
+        FROM article_images
+        WHERE status IN ('pending', 'error') AND attempts < $1
+        ORDER BY article_id DESC, position
+        LIMIT $2
+        """,
+        MAX_IMAGE_ATTEMPTS, limit,
+    )
+    return [PendingImage(**dict(r)) for r in rows]
+
+
+async def record_image_result(
+    conn: asyncpg.Connection,
+    article_id: int,
+    position: int,
+    status: str,
+    sha256: bytes | None = None,
+) -> None:
+    """Set an image slot's outcome and count the attempt."""
+    await conn.execute(
+        """UPDATE article_images
+           SET status = $3, sha256 = $4, attempts = attempts + 1, checked_at = now()
+           WHERE article_id = $1 AND position = $2""",
+        article_id, position, status, sha256,
     )
