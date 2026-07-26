@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     min_free_bytes: int = Field(default=20 * 1024**3, ge=0)
     max_image_bytes: int = Field(default=8 * 1024**2, ge=1)
 
+    image_requests_per_second: float = Field(default=5.0, gt=0, le=100)
+    image_batch_size: int = Field(default=50, ge=1)
+    image_idle_sleep_sec: float = Field(default=60.0, gt=0)
+    image_disk_full_sleep_sec: float = Field(default=300.0, gt=0)
+
     poll_interval_sec: int = Field(default=900, ge=60)
     rss_pages: int = Field(default=5, ge=1, le=5)
     ip_check_interval_sec: int = Field(default=900, ge=60)

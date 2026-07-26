@@ -1,6 +1,7 @@
 import pathlib
 
 import asyncpg
+import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
@@ -19,3 +20,32 @@ async def pg():
             yield conn
         finally:
             await conn.close()
+
+
+class FakePool:
+    """asyncpg.Pool.acquire() is an async context manager; one connection suffices."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def acquire(self):
+        conn = self._conn
+
+        class _Ctx:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+@pytest.fixture
+def fake_pool():
+    """asyncpg.Pool.acquire() is an async context manager; tests hand it one connection."""
+
+    def build(conn):
+        return FakePool(conn)
+
+    return build
