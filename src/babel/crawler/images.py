@@ -8,16 +8,31 @@ with rsync because nothing outside it records a path.
 The distinction between 'dead' and 'error' is load-bearing. 'dead' means the
 host answered and the image is genuinely gone — permanent knowledge, never worth
 retrying. 'error' means we could not tell, and should look again later.
+
+Because 'dead' is permanent, it needs positive evidence, not merely an unhappy
+response. The first version inferred it from any non-200, which meant a 429 threw
+the image away forever; the first live run lost every rate-limited imgur image
+that way. Retryability is the safe default here — this archive exists because
+these links die, so the cost of a wasted retry is nothing beside the cost of
+recording a live image as gone.
 """
 
 import hashlib
+import logging
 import pathlib
 import shutil
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+log = logging.getLogger("babel.images")
 
 BytesGetter = Callable[[str, int], Awaitable[tuple[int, bytes, str | None]]]
+
+# The only codes that positively say the image is gone. Everything else is a
+# host having a bad moment, and must stay retryable.
+GONE_STATUS_CODES = frozenset({404, 410})
 
 
 class ImageTooLarge(Exception):  # noqa: N818 — name is a fixed interface, not open to renaming
@@ -37,6 +52,11 @@ def normalise_url(src: str) -> str:
     if src.startswith("//"):
         return "https:" + src
     return src
+
+
+def _host(url: str) -> str:
+    """Host alone, so a warning groups by host instead of printing 17M URLs."""
+    return urlsplit(normalise_url(url)).netloc or "?"
 
 
 def image_path(root: pathlib.Path, digest: bytes) -> pathlib.Path:
@@ -103,10 +123,21 @@ async def capture_image(
     except Exception:  # noqa: BLE001 — could not determine, so not 'dead'
         return ImageOutcome(status="error")
 
-    if status_code != 200 or not data:
+    if status_code in GONE_STATUS_CODES:
         return ImageOutcome(status="dead")
+    if status_code != 200 or not data:
+        # Anything else the host said is not evidence the image is gone: 429 and
+        # 5xx are explicitly "ask again", and an empty 200 is a host misbehaving.
+        # These used to land in 'dead', which never retries — the first live run
+        # discarded every rate-limited imgur image permanently.
+        return ImageOutcome(status="error")
     if mime is None or not mime.startswith("image/"):
-        # Parked domains and "file removed" pages answer 200 with HTML.
+        # The host answered with a page rather than an image. Usually that page
+        # says the upload was removed, so this stays permanent — but two hosts
+        # served a landing page to a request that merely looked like navigation,
+        # so log it: a run where this dominates means a header or a host changed,
+        # not that the images died.
+        log.warning("%s answered %s, not an image", _host(source_url), mime)
         return ImageOutcome(status="dead")
 
     digest = store_bytes(root, data)

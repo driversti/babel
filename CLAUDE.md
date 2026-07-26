@@ -11,14 +11,24 @@ expensive to obtain; do not re-derive them, and update them there if the site ch
 Phase 1 — crawler. All ten original tasks are implemented: config, article/comment parser, DB
 schema + migration runner, repository layer, rate limiter + fetcher, content-addressed image
 store, end-to-end article ingest, RSS poller, newest-first backfill walker, and the CLI/service
-that composes them (`src/babel/cli.py`). 136 tests, all passing (`uv run pytest`, needs Docker for
+that composes them (`src/babel/cli.py`). 148 tests, all passing (`uv run pytest`, needs Docker for
 the `postgres:17` testcontainer); `uv run ruff check src tests` clean.
 
 **The probe has passed.** 100 article IDs fetched through a VPN tunnel from the target host:
 85 ok, 15 missing, zero Cloudflare challenges. Anonymous access from a VPN exit works.
 
-**The crawler itself has still never run.** The probe validates reachability, nothing more. No
-article has been stored. **C1 and I4 from the whole-branch review are closed** — see
+**The crawler has now run for real**, on the target host, collecting articles and comments at
+1 req/s from article 2797025 downward. It works: articles, authors, e-days, and full comment
+threads in Persian, Serbian, Hungarian, Indonesian, Bulgarian, Polish, Spanish and English.
+
+That run also found two image-capture defects that no test could have caught, because both were
+about what real hosts do — see SPEC.md under "Image requests must be shaped like an `<img>` load"
+and "`dead` requires positive evidence". 64% of images on same-day articles were recorded as
+permanently gone while being perfectly alive. Both are fixed and pinned by tests. **If you touch
+image fetching, read those two spec entries first** — the failure is silent, and the status it
+writes is the one that never gets retried.
+
+**C1 and I4 from the whole-branch review are closed** — see
 `docs/superpowers/plans/2026-07-26-final-review-findings.md`: the backfill now cycles through a
 walk/sweep/idle loop instead of returning, `fetch_log` gained a `stale` status, and
 `babel refetch --ids/--from/--to` lets an operator queue already-collected articles for

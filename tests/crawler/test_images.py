@@ -114,6 +114,49 @@ async def test_capture_marks_a_non_image_response_as_dead(tmp_path):
     assert outcome.status == "dead"
 
 
+async def test_capture_marks_a_410_as_dead(tmp_path):
+    """410 Gone is the other code that positively states the image is not coming back."""
+
+    async def get_bytes(url, max_bytes):
+        return 410, b"", None
+
+    outcome = await capture_image(
+        get_bytes, tmp_path, "https://x.example/gone.png", max_bytes=10_000
+    )
+    assert outcome.status == "dead"
+
+
+@pytest.mark.parametrize("status_code", [429, 403, 500, 502, 503, 408])
+async def test_a_host_refusing_us_is_retryable_not_dead(tmp_path, status_code):
+    """'dead' is permanent, so only 404/410 may produce it.
+
+    The first live run recorded 429s from imgur as 'dead', which is never
+    reclaimed — every rate-limited image was lost for good. A host that
+    throttles, breaks, or blocks us says nothing about whether the image
+    exists.
+    """
+
+    async def get_bytes(url, max_bytes):
+        return status_code, b"", "application/json"
+
+    outcome = await capture_image(
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
+    )
+    assert outcome.status == "error", f"{status_code} must stay retryable"
+
+
+async def test_an_empty_200_is_retryable_not_dead(tmp_path):
+    """A 200 with no body is a host misbehaving, not a removal notice."""
+
+    async def get_bytes(url, max_bytes):
+        return 200, b"", "image/png"
+
+    outcome = await capture_image(
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
+    )
+    assert outcome.status == "error"
+
+
 async def test_capture_refuses_an_oversized_image(tmp_path):
     async def get_bytes(url, max_bytes):
         raise ImageTooLarge

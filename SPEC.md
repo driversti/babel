@@ -416,6 +416,26 @@ eRepublik's, plus at most one concurrent request per hostname. Articles cite CDN
 personal server side by side; the CDN will not notice either way, and the personal server should
 not be handed CDN-shaped load.
 
+**Image requests must be shaped like an `<img>` load, not like navigation.** Measured on the first
+live run: 64% of the images on *same-day* articles were recorded as gone. None of them were.
+curl_cffi's `impersonate="chrome"` sends the header set a browser uses when a human navigates to a
+URL, and the large image hosts content-negotiate on it — `media.giphy.com` and `i.postimg.cc`
+answered `200 text/html` with a landing page, `i.imgur.com` answered `429`. Sending
+`Sec-Fetch-Dest: image` (with `Sec-Fetch-Mode: no-cors`, `Sec-Fetch-Site: cross-site` and an
+`Accept: image/*` list) returns the real bytes from all three. A `Referer` also satisfies postimg
+and is deliberately not sent: it would disclose our crawling to every author-chosen third-party
+host, and `Sec-Fetch-Dest` achieves the same without telling anyone anything.
+
+**`dead` requires positive evidence; everything else is retryable.** `dead` is permanent and never
+reclaimed, so only **404** and **410** may produce it — codes that state the image is not coming
+back. A 429, a 5xx, a 403 or an empty 200 says something about the host's mood, not the image's
+existence, and must be recorded as `error` so the attempt ceiling gets another look at it. The
+first implementation inferred `dead` from any non-200, which is how the rate-limited imgur images
+above were discarded permanently. This archive exists *because* these links die: a wasted retry
+costs one request, a false `dead` costs the image forever. A 200 carrying a non-image body remains
+`dead` — the host answered with a page, which is what a removal notice looks like — but it is
+logged per host, because the two cases above prove that inference can be wrong at scale.
+
 **Nothing is translated at ingest time.** Store originals; translation is a phase 3 concern and
 belongs at query time, on the handful of documents actually retrieved.
 

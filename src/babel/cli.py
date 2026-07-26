@@ -92,6 +92,25 @@ async def _probe(count: int, newest: int, save_fixtures: int) -> None:
         raise SystemExit("Cloudflare challenged us from this exit node — stop and reconsider.")
 
 
+# What a browser sends when it loads an <img>, and not what it sends when it
+# navigates to a page. curl_cffi's impersonation supplies the navigation header
+# set, so without this the request looks like a human opening the image's landing
+# page — and the big image hosts answer accordingly. Measured on the first live
+# run, where 64% of images from same-day articles were recorded as gone:
+#   - media.giphy.com  returned 200 text/html instead of the gif
+#   - i.postimg.cc     returned its 200 text/html "Postimages" viewer page
+#   - i.imgur.com      returned 429
+# All three return the actual bytes once these are set. Sec-Fetch-Dest is the
+# load-bearing one; a Referer also satisfies postimg but would tell every
+# author-chosen third-party host where we crawl from, so we do not send one.
+IMAGE_FETCH_HEADERS = {
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Sec-Fetch-Dest": "image",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "cross-site",
+}
+
+
 def _bytes_getter(session: AsyncSession, timeout_sec: int):
     """Fetch image bytes, abandoning anything past max_bytes.
 
@@ -101,7 +120,9 @@ def _bytes_getter(session: AsyncSession, timeout_sec: int):
     """
 
     async def get_bytes(url: str, max_bytes: int) -> tuple[int, bytes, str | None]:
-        response = await session.get(url, timeout=timeout_sec, stream=True)
+        response = await session.get(
+            url, timeout=timeout_sec, stream=True, headers=IMAGE_FETCH_HEADERS
+        )
         try:
             declared = response.headers.get("content-length")
             if declared and declared.isdigit() and int(declared) > max_bytes:
