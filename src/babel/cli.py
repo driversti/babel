@@ -156,10 +156,12 @@ async def _run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
         if not no_poll:
             tasks.append(asyncio.create_task(_poll_forever(pool, ingestor, fetch_rss, settings)))
         if not no_backfill:
-            tasks.append(asyncio.create_task(_backfill_forever(pool, ingestor, start_id)))
+            tasks.append(
+                asyncio.create_task(_backfill_forever(pool, ingestor, start_id, settings))
+            )
 
-        # Any task exiting means something is wrong — an IP leak, an exhausted
-        # backfill, a crash. Bring the rest down rather than limping on.
+        # Any task exiting means something is wrong — an IP leak, a crash. Bring
+        # the rest down rather than limping on.
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
@@ -229,10 +231,18 @@ async def _poll_forever(pool, ingestor: Ingestor, fetch_rss, settings: Settings)
         await asyncio.sleep(settings.poll_interval_sec)
 
 
-async def _backfill_forever(pool, ingestor: Ingestor, start_id: int | None) -> None:
+async def _backfill_forever(
+    pool, ingestor: Ingestor, start_id: int | None, settings: Settings
+) -> None:
     async with pool.acquire() as conn:
-        await run_backfill(conn, ingestor.ingest, start_id=start_id, stop_at=1)
-    log.info("backfill reached article 1 — archive complete")
+        await run_backfill(
+            conn,
+            ingestor.ingest,
+            start_id=start_id,
+            stop_at=1,
+            cooldown_sec=settings.retry_cooldown_sec,
+            idle_sleep_sec=settings.backfill_idle_sleep_sec,
+        )
 
 
 def parse_id_selection(ids: str | None, from_id: int | None, to_id: int | None) -> list[int]:

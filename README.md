@@ -45,12 +45,13 @@ docker compose logs -f crawler
 ```
 
 `babel run` starts both producers and the egress watchdog together, and exits — non-zero — the
-moment any of them does, so a leaked tunnel or a crashed producer never runs unattended. The one
-exception is the backfill reaching article 1: that is a completed archive, not a failure, and the
-process exits cleanly. Pass `--start-id <id>` on the very first run (there is no cursor yet);
-after that the cursor in `crawl_cursor` picks up where the last run stopped. Use `--no-poll` or
-`--no-backfill` to run only one producer, e.g. `babel run --start-id <id> --no-poll` for a
-backfill-only pass.
+moment any of them does, so a leaked tunnel or a crashed producer never runs unattended. The
+service is expected to run indefinitely: reaching article 1 is not an end state. Once the backfill
+walk bottoms out, it cycles into sweeping `fetch_log` for anything left `error` or `stale` and
+retrying it, idling only when there is truly nothing to do, so the process keeps running rather
+than exiting. Pass `--start-id <id>` on the very first run (there is no cursor yet); after that the
+cursor in `crawl_cursor` picks up where the last run stopped. Use `--no-poll` or `--no-backfill` to
+run only one producer, e.g. `babel run --start-id <id> --no-poll` for a backfill-only pass.
 
 ## Commands
 
@@ -59,6 +60,12 @@ backfill-only pass.
   before trusting it with a real run
 - `babel migrate` — apply any pending SQL migrations
 - `babel run [--start-id N] [--no-poll] [--no-backfill]` — run the crawler until stopped
+- `babel refetch --ids 123,456` or `babel refetch --from 100 --to 200` — queue already-collected
+  articles for re-collection, e.g. after fixing a parser bug or when the site's markup has changed.
+  Only `ok` and `error` rows are touched — a `missing` row is a fact about the article, not about
+  our copy of it, and an ID never fetched will be reached by the walk anyway. Selections over
+  10,000 IDs ask for confirmation (skip with `--yes`); the running service's backfill sweep phase
+  picks the queued IDs up on its own, no restart required
 
 ## Development
 

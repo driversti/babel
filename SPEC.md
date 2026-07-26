@@ -206,10 +206,28 @@ reason to find the ceiling the hard way. Raise only after a clean multi-day run.
 
 ### Resumability
 
-Every attempted ID gets a row recording the outcome. The backfill cursor is persisted after each
-batch. A restart resumes from the cursor and retries only IDs marked as errors — never re-fetches
-successes, never re-walks completed ranges. This matters: the full backfill is a month long and
-will be interrupted.
+Every attempted ID gets a `fetch_log` row recording one of four statuses: `ok` and `missing` are
+final answers about the article itself; `error` and `stale` are unfinished business — a fetch that
+failed, or a row deliberately queued for re-collection by `babel refetch` (see below). The backfill
+cursor is persisted after each batch. This matters: the full backfill is a month long and will be
+interrupted, repeatedly, over its lifetime.
+
+`run_backfill` never returns; it cycles through three phases indefinitely:
+
+1. **Walk.** While the cursor is above `stop_at`, fetch a batch of unseen IDs downward from it and
+   advance the cursor. This is the original newest-first sweep down toward article 1.
+2. **Sweep.** Once the walk bottoms out, claim IDs whose `fetch_log` row is `error` or `stale`,
+   past a cooldown (`retry_cooldown_sec`) and under the attempt ceiling, and retry them. This is
+   also where a transient failure inside a completed walk batch gets another chance — the cursor
+   has already moved past it, so only the sweep will ever see it again.
+3. **Idle.** When neither phase has work — the walk is done and nothing is retryable — sleep
+   (`backfill_idle_sleep_sec`) and check again. Reaching article 1 no longer ends the process; it
+   just means the loop spends most of its time in this phase, still watching for new `stale`/`error`
+   rows.
+
+A restart resumes from the persisted cursor and re-enters whichever phase applies; it never
+re-fetches an `ok` row on its own. `babel refetch --ids/--from/--to` is the operator's way to force
+one back into rotation: it flips `ok`/`error` rows to `stale`, which the sweep phase then picks up.
 
 ### Schema
 
@@ -261,7 +279,7 @@ CREATE TABLE article_images (
 
 CREATE TABLE fetch_log (
     article_id bigint PRIMARY KEY,
-    status     text        NOT NULL,            -- ok | missing | error
+    status     text        NOT NULL,            -- ok | missing | error | stale
     attempts   smallint    NOT NULL DEFAULT 1,
     last_error text,
     updated_at timestamptz NOT NULL DEFAULT now()
@@ -351,8 +369,24 @@ Notes that follow:
 
 ### Decisions
 
-**Raw HTML is not archived at full scale.** 118 GB for something we can re-fetch. Keep raw HTML
-for the last 30 days only, as insurance against a parser bug or a markup change.
+**Raw HTML is not archived, including the 30-day window this document originally specified.** 118
+GB for something we can re-fetch. The implementation plan dropped that window entirely — not just
+the full-scale archive — on the grounds that articles "remain re-fetchable, and `fetch_log` records
+which IDs would need it."
+
+That justification was false when it was written: no refetch path existed, `filter_unseen` treated
+`ok` as final forever, and a cursor that had already advanced meant an ID that failed mid-batch was
+gone for good. The whole-branch review caught this before merge (finding C1, in
+`docs/superpowers/plans/2026-07-26-final-review-findings.md`) and flagged it as the reason this
+document's own headline risk — "the parser will break" — would have been unrecoverable: a markup
+change on day 20 would have written millions of degraded rows with no raw HTML left to reparse and
+no way to even identify which rows needed it.
+
+It is true now. `fetch_log` carries a status per attempted ID (`ok | missing | error | stale`), the
+backfill's sweep phase retries `error` and `stale` rows on a cooldown, and `babel refetch
+--ids/--from/--to` lets an operator queue a known-bad range for re-collection by hand after a fix
+ships. The 30-day window stays dropped — deliberately now, with the capability that makes dropping
+it safe actually built, rather than assumed.
 
 **Comments come free.** They arrive in the same request as the article, so there is never a reason
 to fetch an article without them.
@@ -426,7 +460,9 @@ rather than a mood score.
 ## Risks
 
 **The parser will break.** eRepublik will change its markup eventually. Mitigated by fixture-based
-tests and the 30-day raw HTML window.
+tests and, since the raw-HTML window was dropped rather than kept (see "Decisions"), by
+`babel refetch`: a fixed parser can be pointed back at any already-collected range instead of
+needing the original bytes on hand.
 
 **A month-long crawl invites trouble** — restarts, IP throttling, transient 5xx. Handled by the
 resumability design above; correctness here is worth more than speed.

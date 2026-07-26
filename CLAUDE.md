@@ -11,16 +11,22 @@ expensive to obtain; do not re-derive them, and update them there if the site ch
 Phase 1 — crawler. All ten tasks are implemented: config, article/comment parser, DB schema +
 migration runner, repository layer, rate limiter + fetcher, content-addressed image store,
 end-to-end article ingest, RSS poller, newest-first backfill walker, and the CLI/service that
-composes them (`src/babel/cli.py`). 93 tests, all passing (`uv run pytest`, needs Docker for the
+composes them (`src/babel/cli.py`). 114 tests, all passing (`uv run pytest`, needs Docker for the
 `postgres:17` testcontainer); `uv run ruff check src tests` clean.
 
 **The probe has passed.** 100 article IDs fetched through a VPN tunnel from the target host:
 85 ok, 15 missing, zero Cloudflare challenges. Anonymous access from a VPN exit works.
 
 **The crawler itself has still never run.** The probe validates reachability, nothing more. No
-article has been stored, and one Critical plus four Important findings from the whole-branch review
-are open — see `docs/superpowers/plans/2026-07-26-final-review-findings.md`. The largest is C1:
-there is no way to re-visit an article once recorded, so a transient failure loses it permanently.
+article has been stored. **C1 and I4 from the whole-branch review are closed** — see
+`docs/superpowers/plans/2026-07-26-final-review-findings.md`: the backfill now cycles through a
+walk/sweep/idle loop instead of returning, `fetch_log` gained a `stale` status, and
+`babel refetch --ids/--from/--to` lets an operator queue already-collected articles for
+re-collection by hand. The service is expected to run indefinitely; reaching article 1 is not an
+end state, it just means the loop spends more time sweeping and idling. Still open: I1 (`pending`
+image rows stranded by an unclean shutdown), I2 (images share eRepublik's rate limit, ~7× the
+spec's crawl estimate), I6 (image bodies buffered before the size cap) — addressed by the image-
+worker plan, not this one.
 
 **Runs on the x86_64 host, not the Jetson.** The Tegra kernel lacks `CONFIG_IP_ADVANCED_ROUTER`,
 so `ip rule` is unavailable and gluetun cannot start there at all. Details in `SPEC.md` under
@@ -43,3 +49,6 @@ so `ip rule` is unavailable and gluetun cannot start there at all. Details in `S
 - `docker compose up -d` — run the stack
 - `docker compose run --rm crawler babel migrate` — apply migrations
 - `docker compose run --rm crawler babel probe --newest <id>` — check the exit node is not challenged
+- `docker compose run --rm crawler babel refetch --ids 123,456` or
+  `babel refetch --from 100 --to 200` — queue already-collected articles for re-collection after a
+  parser fix or a markup change; the running service's sweep phase picks them up on its own
