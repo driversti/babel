@@ -9,6 +9,8 @@ from babel.crawler.images import (
     have_space,
     image_path,
     normalise_url,
+    resolve_mime,
+    sniff_image_mime,
     store_bytes,
 )
 
@@ -155,6 +157,63 @@ async def test_an_empty_200_is_retryable_not_dead(tmp_path):
         get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
     )
     assert outcome.status == "error"
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 20
+GIF = b"GIF89a" + b"\x00" * 20
+WEBP = b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 12
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (PNG, "image/png"),
+        (JPEG, "image/jpeg"),
+        (GIF, "image/gif"),
+        (WEBP, "image/webp"),
+        (b"BM" + b"\x00" * 20, "image/bmp"),
+        (b"II*\x00" + b"\x00" * 20, "image/tiff"),
+        (b"<!DOCTYPE html><html>gone</html>", None),
+        (b"", None),
+    ],
+)
+def test_sniff_image_mime(data, expected):
+    assert sniff_image_mime(data) == expected
+
+
+def test_a_declared_image_type_is_trusted_even_without_a_signature():
+    """SVG has no magic bytes, and neither will the next format. Sniffing may
+    only ever widen what we accept, never narrow it."""
+    assert resolve_mime("image/svg+xml", b"<svg xmlns='...'></svg>") == "image/svg+xml"
+    assert resolve_mime("image/png; charset=binary", PNG) == "image/png; charset=binary"
+
+
+def test_a_generic_declaration_over_image_bytes_resolves_to_the_real_type():
+    assert resolve_mime("application/octet-stream", PNG) == "image/png"
+    assert resolve_mime(None, JPEG) == "image/jpeg"
+
+
+def test_a_generic_declaration_over_a_web_page_stays_unresolved():
+    assert resolve_mime("application/octet-stream", b"<!DOCTYPE html>") is None
+
+
+async def test_capture_stores_an_image_mislabelled_as_octet_stream(tmp_path):
+    """content.screencast.com serves live 2014 PNGs as application/octet-stream.
+
+    Trusting the label marked 45 of them 'dead' — permanently — on the first
+    live run, while every one of them downloaded fine.
+    """
+
+    async def get_bytes(url, max_bytes):
+        return 200, PNG, "application/octet-stream"
+
+    outcome = await capture_image(
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
+    )
+    assert outcome.status == "ok"
+    assert outcome.mime == "image/png", "the stored type must be the real one, not the claimed one"
+    assert image_path(tmp_path, outcome.digest).exists()
 
 
 async def test_capture_refuses_an_oversized_image(tmp_path):

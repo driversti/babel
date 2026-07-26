@@ -436,6 +436,16 @@ costs one request, a false `dead` costs the image forever. A 200 carrying a non-
 `dead` — the host answered with a page, which is what a removal notice looks like — but it is
 logged per host, because the two cases above prove that inference can be wrong at scale.
 
+**Content-Type is a hint; the bytes are the evidence.** That per-host logging immediately earned
+itself: `content.screencast.com` serves live 2014-era Jing PNGs — twelve years old, exactly what
+this archive exists to rescue — labelled `application/octet-stream`, and 45 of them were recorded
+as gone in the first batch after the fix above. So the type is resolved from the leading bytes
+(PNG, JPEG, GIF, WebP, BMP, TIFF signatures) whenever the declaration is generic or absent. A
+declared `image/*` is still trusted as-is even when no signature matches, because SVG has none and
+neither will the next format: sniffing may only ever widen what is accepted, never narrow it.
+Expect more of this. Every false `dead` so far has arrived as a batch from a single host, which is
+why the warning names the host rather than the URL.
+
 **Nothing is translated at ingest time.** Store originals; translation is a phase 3 concern and
 belongs at query time, on the handful of documents actually retrieved.
 

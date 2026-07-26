@@ -34,6 +34,48 @@ BytesGetter = Callable[[str, int], Awaitable[tuple[int, bytes, str | None]]]
 # host having a bad moment, and must stay retryable.
 GONE_STATUS_CODES = frozenset({404, 410})
 
+# Leading bytes that identify an image regardless of what the host claims in
+# Content-Type. Needed because hosts lie by omission: content.screencast.com
+# serves 2014-era Jing PNGs — twelve years old and still alive, exactly what
+# this archive exists to rescue — labelled 'application/octet-stream', and
+# trusting the label discarded all of them.
+_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+    (b"II*\x00", "image/tiff"),
+    (b"MM\x00*", "image/tiff"),
+)
+
+
+def sniff_image_mime(data: bytes) -> str | None:
+    """The image type the bytes actually are, or None if they are not an image.
+
+    RIFF containers carry their format at offset 8, so WebP needs a second look
+    rather than a prefix match.
+    """
+    for prefix, mime in _MAGIC:
+        if data.startswith(prefix):
+            return mime
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def resolve_mime(declared: str | None, data: bytes) -> str | None:
+    """Settle on a type, or None if this is not an image at all.
+
+    A declared `image/*` is trusted even when the bytes carry no signature we
+    know — SVG has none, and neither will the next format — so this only ever
+    widens what we accept. What it adds is the reverse case: a generic or absent
+    declaration over bytes that are unmistakably an image.
+    """
+    if declared and declared.split(";")[0].strip().startswith("image/"):
+        return declared
+    return sniff_image_mime(data)
+
 
 class ImageTooLarge(Exception):  # noqa: N818 — name is a fixed interface, not open to renaming
     """Raised by a getter that aborted a download past max_bytes."""
@@ -131,14 +173,15 @@ async def capture_image(
         # These used to land in 'dead', which never retries — the first live run
         # discarded every rate-limited imgur image permanently.
         return ImageOutcome(status="error")
-    if mime is None or not mime.startswith("image/"):
-        # The host answered with a page rather than an image. Usually that page
-        # says the upload was removed, so this stays permanent — but two hosts
-        # served a landing page to a request that merely looked like navigation,
-        # so log it: a run where this dominates means a header or a host changed,
-        # not that the images died.
+    resolved = resolve_mime(mime, data)
+    if resolved is None:
+        # Neither the declared type nor the bytes themselves are an image. The
+        # host answered with something else — usually a page saying the upload
+        # was removed — so this stays permanent. It is logged per host because
+        # every false 'dead' so far arrived in a batch from a single host, and
+        # silence is what let the first one run unnoticed.
         log.warning("%s answered %s, not an image", _host(source_url), mime)
         return ImageOutcome(status="dead")
 
     digest = store_bytes(root, data)
-    return ImageOutcome(status="ok", digest=digest, mime=mime, size=len(data))
+    return ImageOutcome(status="ok", digest=digest, mime=resolved, size=len(data))
