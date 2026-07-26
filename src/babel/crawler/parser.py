@@ -43,6 +43,10 @@ _COMMENTS_RE = re.compile(r"\.\s*(\d+)\s+comments?\b")
 _COUNTRY_HREF_RE = re.compile(r"^/en/main/news/latest/all/([^/]+)/")
 _CITIZEN_HREF_RE = re.compile(r"^/en/citizen/profile/(\d+)")
 _PUBLISHED_BY_RE = re.compile(r"published by (.+?) on day")
+_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_BLOCK_CLOSE_RE = re.compile(
+    r"</(?:p|div|li|ul|ol|h[1-6]|tr|table|blockquote|pre)\s*>", re.IGNORECASE
+)
 
 
 def eday_to_date(eday: int) -> datetime.date:
@@ -79,7 +83,7 @@ def parse_article(html: str, article_id: int) -> Article | None:
     return Article(
         id=article_id,
         title=title,
-        body=body_node.text(separator=" ", strip=True),
+        body=_body_text(body_node),
         author_id=author_id,
         author_name=author_name,
         country=country,
@@ -89,6 +93,36 @@ def parse_article(html: str, article_id: int) -> Article | None:
         images=images,
         comments=comments,
     )
+
+
+def _body_text(body_node: HTMLNode) -> str:
+    """The article text with block structure preserved as newlines.
+
+    selectolax joins text nodes with a single separator and knows nothing about
+    block boundaries, so `text(separator=" ")` welded a heading to the sentence
+    after it and produced bodies containing no newline at all — measured at 0
+    newlines against 41 `<br>` in one fixture. The stored column is the only copy
+    (raw HTML is deliberately not archived, see SPEC.md "Decisions"), so the
+    structure has to survive the parse or it is gone.
+
+    Breaks are injected into the markup rather than reconstructed from the text,
+    because by the time selectolax has flattened it the boundary is a space and
+    indistinguishable from the spaces inside a sentence.
+    """
+    html = body_node.html or ""
+    html = _BR_RE.sub("\n", html)
+    html = _BLOCK_CLOSE_RE.sub(lambda m: "\n" + m.group(0), html)
+
+    raw = HTMLParser(html).text(separator=" ", strip=False)
+
+    lines: list[str] = []
+    for line in raw.split("\n"):
+        stripped = " ".join(line.split())
+        # Keep at most one blank line: authors separate paragraphs with runs of
+        # <br>, and every one of them would otherwise become its own gap.
+        if stripped or (lines and lines[-1]):
+            lines.append(stripped)
+    return "\n".join(lines).strip()
 
 
 def _parse_published_at(post: HTMLNode) -> datetime.datetime | None:

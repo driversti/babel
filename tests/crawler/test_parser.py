@@ -2,14 +2,20 @@ import datetime
 import pathlib
 
 import pytest
+from selectolax.parser import HTMLParser
 
-from babel.crawler.parser import eday_to_date, parse_article
+from babel.crawler.parser import _body_text, eday_to_date, parse_article
 
 FIXTURES = pathlib.Path(__file__).parent.parent / "fixtures"
 
 
 def load(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _body(fragment: str) -> str:
+    node = HTMLParser(f"<div class='postBody'>{fragment}</div>").css_first("div.postBody")
+    return _body_text(node)
 
 
 @pytest.mark.parametrize(
@@ -122,6 +128,42 @@ def test_author_id_stays_none_when_the_author_never_commented():
     assert article.author_id is None
     # Explicitly guard against misattributing the unrelated commenter's id.
     assert article.author_id != 12345
+
+
+def test_paragraphs_become_separate_lines():
+    assert _body("<p>First.</p><p>Second.</p>") == "First.\nSecond."
+
+
+def test_br_breaks_a_line():
+    assert _body("Alpha<br>Beta") == "Alpha\nBeta"
+
+
+def test_double_br_keeps_one_blank_line():
+    assert _body("Alpha<br><br>Beta") == "Alpha\n\nBeta"
+
+
+def test_runs_of_blank_lines_collapse_to_one():
+    assert _body("<p>A</p><br><br><br><p>B</p>") == "A\n\nB"
+
+
+def test_list_items_are_separate_lines():
+    assert _body("<ul><li>one</li><li>two</li></ul>") == "one\ntwo"
+
+
+def test_heading_is_not_welded_to_the_next_sentence():
+    text = _body("<h3>Mendirikan Perusahaan</h3><p>Langkah pertama.</p>")
+    assert text == "Mendirikan Perusahaan\nLangkah pertama."
+
+
+def test_inline_markup_does_not_break_a_line():
+    assert _body("<p>A <b>bold</b> word.</p>") == "A bold word."
+
+
+def test_real_fixture_gains_line_breaks():
+    article = parse_article(load("article_indonesia.html"), 123)
+    assert article is not None
+    assert "\n" in article.body
+    assert "<" not in article.body
 
 
 def test_author_name_falls_back_to_the_title_byline_when_meta_author_is_missing():
