@@ -21,4 +21,9 @@ Phase 1 — crawler. No code yet.
 
 ## Commands
 
-To be filled in once the project has code.
+- `uv sync` — install
+- `uv run pytest` — tests (needs Docker for testcontainers)
+- `uv run ruff check src tests` — lint
+- `docker compose up -d` — run the stack
+- `docker compose run --rm crawler babel migrate` — apply migrations
+- `docker compose run --rm crawler babel probe --newest <id>` — check the exit node is not challenged
