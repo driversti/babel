@@ -81,3 +81,79 @@ async def test_image_blob_is_deduplicated_by_hash(pg):
     assert await pg.fetchval("SELECT count(*) FROM images") == 1
     await repo.record_image(pg, 1, 0, "https://x.example/a.png", "ok", digest)
     assert await pg.fetchval("SELECT status FROM article_images WHERE article_id = 1") == "ok"
+
+
+async def test_resaving_article_does_not_resurrect_dead_image_status(pg):
+    """A re-parse of an article must not undo a 'dead' verdict on its images.
+
+    `save_article`'s ON CONFLICT clause on `article_images` deliberately omits
+    `status` from the DO UPDATE SET list, so a slot that a worker already marked
+    'dead' (with sha256 cleared) stays 'dead' when the article is saved again.
+    This is intentional and irreversible-by-design: once we know a link is dead,
+    a later re-save has no way to tell whether the image came back, and
+    overwriting the verdict back to 'pending' would silently throw that
+    knowledge away, sending the crawler to re-check a link that already proved
+    dead. A regression that adds `status = EXCLUDED.status` to the upsert would
+    make this test fail while leaving every other test in this suite green.
+
+    `source_url`, by contrast, IS in the DO UPDATE SET list on purpose, so this
+    test also pins that a changed URL for the same slot does get applied on
+    re-save -- confirming the upsert still does its job for the column it is
+    supposed to touch, not just the one it must leave alone.
+    """
+    article = make_article()
+    await repo.save_article(pg, article)
+
+    # Move the slot off 'pending' the way the image worker would after
+    # discovering the source link is gone. sha256=None models "we looked and
+    # there is nothing to hash" -- the case whose loss is unrecoverable.
+    await repo.record_image(pg, article.id, 0, article.images[0].source_url, "dead", sha256=None)
+    row = await pg.fetchrow(
+        "SELECT status, sha256 FROM article_images WHERE article_id = $1 AND position = 0",
+        article.id,
+    )
+    assert row["status"] == "dead"
+    assert row["sha256"] is None
+
+    # Re-save the same article (as a re-crawl/re-parse would), but with the
+    # image's source_url changed, to prove the upsert still updates the column
+    # it is meant to update.
+    updated = make_article(images=(ImageRef(position=0, source_url="https://x.example/b.png"),))
+    await repo.save_article(pg, updated)
+
+    row = await pg.fetchrow(
+        "SELECT status, sha256, source_url FROM article_images WHERE article_id = $1 AND position = 0",
+        article.id,
+    )
+    assert row["status"] == "dead", "status must survive a re-save, or a dead link looks pending again"
+    assert row["sha256"] is None
+    assert row["source_url"] == "https://x.example/b.png"
+
+
+async def test_duplicate_comment_ids_in_one_save_are_silently_deduped(pg):
+    """Documents current behaviour, not a desired guarantee.
+
+    If a parser bug ever produces two `Comment` objects with the same `id` in
+    one `Article.comments` tuple, `save_article`'s `ON CONFLICT (id) DO NOTHING`
+    insert means the second row is dropped rather than raising. This test
+    pins that today's behaviour is "keep the first, ignore the rest, no
+    exception" -- it does not assert this is the right outcome. See the report
+    for this task for a note on whether silently dropping is desirable, versus
+    surfacing the duplicate as a parser-level error.
+    """
+    dup_id = 99
+    article = make_article(
+        comments=(
+            Comment(dup_id, 0, 0, 42, "someone", None, "first copy"),
+            Comment(dup_id, 1, 0, 43, "other", None, "second copy"),
+        ),
+    )
+    await repo.save_article(pg, article)
+
+    rows = await pg.fetch(
+        "SELECT id, author_name, body FROM comments WHERE article_id = $1", article.id
+    )
+    assert len(rows) == 1
+    assert rows[0]["id"] == dup_id
+    assert rows[0]["author_name"] == "someone"
+    assert rows[0]["body"] == "first copy"
