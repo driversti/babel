@@ -43,6 +43,22 @@ async def test_skips_ids_already_recorded(pg):
     assert seen == [100, 97]
 
 
+async def test_ingest_failure_does_not_abort_the_batch(pg):
+    seen: list[int] = []
+
+    async def ingest(article_id: int) -> str:
+        if article_id == 98:
+            raise RuntimeError("boom")
+        seen.append(article_id)
+        return "ok"
+
+    await run_backfill(pg, ingest, start_id=100, stop_at=96, batch_size=10)
+
+    assert seen == [100, 99, 97, 96]
+    assert await repo.get_cursor(pg, "backfill") == 95
+    assert await pg.fetchval("SELECT status FROM fetch_log WHERE article_id = 98") == "error"
+
+
 async def test_start_id_is_required_when_there_is_no_cursor(pg):
     async def ingest(article_id: int) -> str:
         return "ok"

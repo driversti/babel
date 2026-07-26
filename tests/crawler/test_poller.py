@@ -44,6 +44,25 @@ async def test_poll_ingests_only_unseen_ids(pg):
     assert ingested == [2797018]
 
 
+async def test_ingest_failure_does_not_stop_other_ids(pg):
+    seen: list[int] = []
+
+    async def ingest(article_id: int) -> str:
+        if article_id == 2797019:
+            raise RuntimeError("boom")
+        seen.append(article_id)
+        return "ok"
+
+    async def fetch_rss(page: int) -> str:
+        return RSS if page == 1 else "<rss><channel></channel></rss>"
+
+    ingested = await poll_once(pg, ingest, fetch_rss, pages=2)
+
+    assert seen == [2797018]
+    assert ingested == [2797018]
+    assert await pg.fetchval("SELECT status FROM fetch_log WHERE article_id = 2797019") == "error"
+
+
 async def test_poll_deduplicates_ids_appearing_on_several_pages(pg):
     seen: list[int] = []
 

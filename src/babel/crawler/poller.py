@@ -6,12 +6,15 @@ nothing. Pages beyond the fifth return an empty feed, so there is no history
 here — that is the backfill's job.
 """
 
+import logging
 import re
 from collections.abc import Awaitable, Callable
 
 import asyncpg
 
 from babel.db import repo
+
+logger = logging.getLogger(__name__)
 
 Ingest = Callable[[int], Awaitable[str]]
 RssFetcher = Callable[[int], Awaitable[str]]
@@ -46,6 +49,14 @@ async def poll_once(
 
     ingested: list[int] = []
     for article_id in await repo.filter_unseen(conn, candidates):
-        await ingest(article_id)
+        try:
+            await ingest(article_id)
+        except Exception as exc:
+            # One article's unexpected failure must not stop the rest of the poll
+            # cycle. Record it as 'error' so a future cycle can retry it via
+            # filter_unseen(retry_errors=True), instead of losing it silently.
+            logger.exception("ingest failed for article %s", article_id)
+            await repo.record_fetch(conn, article_id, "error", str(exc))
+            continue
         ingested.append(article_id)
     return ingested
