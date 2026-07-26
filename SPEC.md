@@ -249,13 +249,24 @@ Indexes on `articles(published_at)`, `articles(country)`, `articles(author_id)`,
 
 ### Date conversion
 
-Comments carry an eRepublik day number rather than a date. Verified against live data:
+Comments carry an eRepublik day number rather than a date. Day 1 is 2007-11-21:
 
 ```
-date = 2007-11-21 + eday days, in America/Los_Angeles
+date = 2007-11-21 + (eday - 1) days, in America/Los_Angeles
 ```
 
-Cross-check: eDay 6 819 → 2026-07-23, which matches the article page.
+Verified against six articles spanning 2009 to 2026, comparing the day number in `<title>` with the
+game-local date in the `<meta name="description">` text. Dropping the `- 1` puts every date one day
+late, so it is worth a test.
+
+Note that the `itemprop="datePublished"` meta tag is a genuine UTC timestamp and will disagree with
+the game-local date whenever publication falls after 16:00 PST. The day number and the description
+date are the game's own reckoning; `datePublished` is not. Use the former for `e_day`, the latter
+for `published_at`.
+
+(The monorepo's shared notes give this as `(now - epoch).days` with a 2007-11-21 epoch, which
+yields day 0 on launch day and is one behind what the game displays. Unverified whether other
+projects here depend on that convention.)
 
 ### Image storage
 
