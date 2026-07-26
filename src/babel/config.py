@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     retry_cooldown_sec: int = Field(default=3600, ge=0)
     backfill_idle_sleep_sec: float = Field(default=300.0, gt=0)
 
+    bot_token: str | None = Field(default=None, description="Telegram bot token. Never committed.")
+    chat_id: str | None = Field(default=None, description="Telegram chat id. Never committed.")
+    alert_repeat_sec: float = Field(default=3600.0, gt=0)
+
     def article_url(self, article_id: int) -> str:
         return f"{BASE_URL}/en/article/{article_id}/1/{self.comments_per_page}"
 
