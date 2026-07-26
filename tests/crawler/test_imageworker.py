@@ -108,6 +108,7 @@ async def test_a_full_disk_leaves_the_queue_untouched_and_notifies(pg, tmp_path,
 
 
 async def test_an_errored_image_is_retried_until_the_ceiling(pg, tmp_path, fake_pool):
+    """With no cooldown the ceiling still applies — that mechanism is unchanged."""
     await seed(pg, 1, ["https://a.example/flaky.png"])
     calls = {"n": 0}
 
@@ -117,13 +118,44 @@ async def test_an_errored_image_is_retried_until_the_ceiling(pg, tmp_path, fake_
 
     await run_image_worker(
         fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
-        Throttled(Recorder(), 1, now=lambda: 0.0), settings(tmp_path),
+        Throttled(Recorder(), 1, now=lambda: 0.0),
+        settings(tmp_path, image_retry_cooldown_sec=0),
         sleep=noop_sleep, max_cycles=10,
     )
     row = await pg.fetchrow("SELECT status, attempts FROM article_images WHERE article_id = 1")
     assert row["status"] == "error"
     assert row["attempts"] == repo.MAX_IMAGE_ATTEMPTS
     assert calls["n"] == repo.MAX_IMAGE_ATTEMPTS
+
+
+async def test_a_host_having_a_bad_minute_does_not_burn_every_attempt(pg, tmp_path, fake_pool):
+    """The article path guards this; the image path did not, and it is the side
+    that is actually rate-limit-prone.
+
+    A failed row stays the newest row in the queue — the backfill only ever
+    enqueues lower article ids — so it was re-claimed on the very next cycle. Five
+    cycles is under a minute at the default batch size and rate, after which the
+    row sits at the ceiling, which `claim_pending_images` excludes forever. A 429
+    storm or a brief tunnel blip therefore wrote off living images permanently,
+    with no log line, because a clean 429 raises nothing.
+    """
+    await seed(pg, 1, ["https://a.example/flaky.png"])
+    calls = {"n": 0}
+
+    async def get_bytes(url, max_bytes):
+        calls["n"] += 1
+        raise TimeoutError("slow")
+
+    await run_image_worker(
+        fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
+        Throttled(Recorder(), 1, now=lambda: 0.0),
+        settings(tmp_path, image_retry_cooldown_sec=3600),
+        sleep=noop_sleep, max_cycles=10,
+    )
+    row = await pg.fetchrow("SELECT status, attempts FROM article_images WHERE article_id = 1")
+    assert calls["n"] == 1, f"ten cycles inside the cooldown made {calls['n']} attempts"
+    assert row["attempts"] == 1
+    assert row["status"] == "error", "still retryable — just not right now"
 
 
 async def test_an_empty_queue_sleeps_rather_than_spinning(pg, tmp_path, fake_pool):

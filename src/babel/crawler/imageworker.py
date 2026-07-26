@@ -11,7 +11,7 @@ Newest article first. 66% of 2021-2026 images still resolve against 7% of
 import asyncio
 import logging
 
-from babel.crawler.images import capture_image, have_space
+from babel.crawler.images import capture_image, have_space, url_host
 from babel.db import repo
 
 log = logging.getLogger("babel.images")
@@ -47,7 +47,9 @@ async def run_image_worker(
             continue
 
         async with pool.acquire() as conn:
-            batch = await repo.claim_pending_images(conn, settings.image_batch_size)
+            batch = await repo.claim_pending_images(
+                conn, settings.image_batch_size, settings.image_retry_cooldown_sec
+            )
 
         if not batch:
             await sleep(settings.image_idle_sleep_sec)
@@ -104,6 +106,18 @@ async def _capture_one(pool, get_bytes, limiter, host_limiter, settings, item) -
     except Exception:  # noqa: BLE001 — a filesystem or transport fault is not fatal
         log.exception("capturing %s failed", item.source_url)
         outcome = None
+
+    # The last attempt this row will ever get. Without a line here a 429 storm is
+    # invisible: a clean 429 raises nothing, so nothing else logs, and the only
+    # symptom is images quietly missing months later. Named by host, because that
+    # is the unit `requeue-images --host` recovers.
+    failed = outcome is None or outcome.status != "ok"
+    if failed and item.attempts + 1 >= repo.MAX_IMAGE_ATTEMPTS:
+        log.warning(
+            "%s: giving up on %s after %d attempts — `babel requeue-images --host %s` retries it",
+            url_host(item.source_url), item.source_url,
+            repo.MAX_IMAGE_ATTEMPTS, url_host(item.source_url),
+        )
 
     async with pool.acquire() as conn:
         if outcome is None:

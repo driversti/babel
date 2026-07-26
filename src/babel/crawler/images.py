@@ -96,8 +96,9 @@ def normalise_url(src: str) -> str:
     return src
 
 
-def _host(url: str) -> str:
-    """Host alone, so a warning groups by host instead of printing 17M URLs."""
+def url_host(url: str) -> str:
+    """Host alone. Warnings group by host because that is the unit failures arrive
+    in and the unit `requeue-images --host` recovers. Shared with the worker."""
     return urlsplit(normalise_url(url)).netloc or "?"
 
 
@@ -180,7 +181,7 @@ async def capture_image(
         # was removed — so this stays permanent. It is logged per host because
         # every false 'dead' so far arrived in a batch from a single host, and
         # silence is what let the first one run unnoticed.
-        log.warning("%s answered %s, not an image", _host(source_url), mime)
+        log.warning("%s answered %s, not an image", url_host(source_url), mime)
         return ImageOutcome(status="dead")
 
     digest = store_bytes(root, data)

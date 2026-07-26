@@ -5,6 +5,8 @@ once. Both producers call this and nothing else, which is what keeps the
 backfill and the poller free of duplicated pipeline logic.
 """
 
+import logging
+
 import asyncpg
 
 from babel.config import Settings
@@ -12,6 +14,8 @@ from babel.crawler.fetcher import Getter, fetch_article
 from babel.crawler.parser import parse_article
 from babel.crawler.ratelimit import RateLimiter
 from babel.db import repo
+
+log = logging.getLogger("babel.ingest")
 
 
 class Ingestor:
@@ -48,7 +52,17 @@ class Ingestor:
             return "error"
 
         async with self._pool.acquire() as conn:
-            await repo.save_article(conn, article)
+            try:
+                await repo.save_article(conn, article)
+            except repo.CommentsVanishedError as e:
+                # 'error' rather than 'ok': retryable, bounded by the attempt
+                # ceiling, and visible in the status distribution. A parser break
+                # that only affects comments must not be sealed as a success — that
+                # is how a range of articles ends up permanently holding an empty
+                # thread the page plainly said was not empty.
+                log.warning("%s", e)
+                await repo.record_fetch(conn, article_id, "error", str(e))
+                return "error"
             await repo.record_fetch(conn, article_id, "ok")
 
         return "ok"

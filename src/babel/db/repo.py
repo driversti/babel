@@ -25,8 +25,36 @@ MAX_FETCH_ATTEMPTS = 5
 RETRYABLE_STATUSES = ("error", "stale")
 
 
+class CommentsVanishedError(Exception):
+    """The page said it has comments and the parse produced none.
+
+    Raised rather than saving, because saving would be indistinguishable from an
+    article that genuinely has no comments — and the difference is the archive.
+    """
+
+
 async def save_article(conn: asyncpg.Connection, article: Article) -> None:
-    """Insert or replace an article together with its comments and image slots."""
+    """Insert or replace an article together with its comments and image slots.
+
+    Comments are additive: existing rows are updated, never deleted. Two reasons,
+    and they are the same reason twice. A parse that stops finding comments —
+    eRepublik renames `commentWrapper`, while `postBody` keeps working, so the
+    article still parses and `fetch_article`'s gate still passes — used to delete
+    every archived comment and insert nothing. Run over the range an operator is
+    documented to sweep with `babel refetch --from/--to` after exactly that kind of
+    breakage, it would have emptied the majority of the archive's text (comments
+    carry 2054 chars against the article's 1357, per SPEC.md) with no exception, no
+    log line, and no raw HTML to reparse. And a comment deleted upstream since the
+    first fetch is precisely the thing this archive exists to still hold, so
+    pruning it on a routine re-fetch would throw away text that no longer exists
+    anywhere. The guard below catches the parser fault; not deleting covers the
+    rest, including the parser faults nobody predicted.
+    """
+    if article.comment_count > 0 and not article.comments:
+        raise CommentsVanishedError(
+            f"article {article.id} reports {article.comment_count} comments, parsed 0"
+        )
+
     async with conn.transaction():
         await conn.execute(
             """
@@ -44,13 +72,15 @@ async def save_article(conn: asyncpg.Connection, article: Article) -> None:
             article.country, article.published_at, article.e_day, article.comment_count,
         )
 
-        await conn.execute("DELETE FROM comments WHERE article_id = $1", article.id)
         if article.comments:
             await conn.executemany(
                 """INSERT INTO comments (id, article_id, position, depth, author_id,
                                          author_name, posted_at, body)
                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                   ON CONFLICT (id) DO NOTHING""",
+                   ON CONFLICT (id) DO UPDATE SET
+                       position = EXCLUDED.position, depth = EXCLUDED.depth,
+                       author_id = EXCLUDED.author_id, author_name = EXCLUDED.author_name,
+                       posted_at = EXCLUDED.posted_at, body = EXCLUDED.body""",
                 [
                     (c.id, article.id, c.position, c.depth, c.author_id,
                      c.author_name, c.posted_at, c.body)
@@ -212,7 +242,9 @@ class PendingImage:
     attempts: int
 
 
-async def claim_pending_images(conn: asyncpg.Connection, limit: int) -> list[PendingImage]:
+async def claim_pending_images(
+    conn: asyncpg.Connection, limit: int, cooldown_sec: float
+) -> list[PendingImage]:
     """Next images to fetch, newest article first.
 
     Ordering is not cosmetic: 66% of 2021-2026 images still resolve against 7%
@@ -222,6 +254,14 @@ async def claim_pending_images(conn: asyncpg.Connection, limit: int) -> list[Pen
     An 'error' row returns to 'pending' via record_image_result only implicitly —
     it is re-offered here because its status is not terminal and its attempts are
     below the ceiling.
+
+    `cooldown_sec` is the same guard `claim_retryable` applies to articles, and for
+    the same reason — a host having a bad minute would otherwise burn all five of an
+    image's attempts inside that minute and the image would be written off for good.
+    The image side needs it more: it is the rate-limit-prone one, a failed row stays
+    the newest row in the queue (the backfill only enqueues lower article ids) and so
+    was re-claimed on the very next cycle. A never-attempted 'pending' row does not
+    wait; a cooldown is for something that just failed.
     """
     rows = await conn.fetch(
         """
@@ -230,13 +270,15 @@ async def claim_pending_images(conn: asyncpg.Connection, limit: int) -> list[Pen
         -- Postgres only proves a partial index applicable from a Const; with a
         -- Param it cannot, and the planner would sequentially scan a table
         -- holding millions of rows that are almost all 'ok' or 'dead'.
+        -- The checked_at term below is a heap qualifier and does not affect that.
         SELECT article_id, position, source_url, attempts
         FROM article_images
         WHERE status IN ('pending', 'error') AND attempts < $1
+          AND (status = 'pending' OR checked_at <= now() - make_interval(secs => $2))
         ORDER BY article_id DESC, position
-        LIMIT $2
+        LIMIT $3
         """,
-        MAX_IMAGE_ATTEMPTS, limit,
+        MAX_IMAGE_ATTEMPTS, cooldown_sec, limit,
     )
     return [PendingImage(**dict(r)) for r in rows]
 

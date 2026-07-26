@@ -157,12 +157,16 @@ async def test_duplicate_comment_ids_in_one_save_are_silently_deduped(pg):
     """Documents current behaviour, not a desired guarantee.
 
     If a parser bug ever produces two `Comment` objects with the same `id` in
-    one `Article.comments` tuple, `save_article`'s `ON CONFLICT (id) DO NOTHING`
-    insert means the second row is dropped rather than raising. This test
-    pins that today's behaviour is "keep the first, ignore the rest, no
-    exception" -- it does not assert this is the right outcome. See the report
-    for this task for a note on whether silently dropping is desirable, versus
-    surfacing the duplicate as a parser-level error.
+    one `Article.comments` tuple, `save_article`'s upsert collapses them to one
+    row rather than raising. This test pins that today's behaviour is "one row,
+    no exception" -- it does not assert this is the right outcome, and whether a
+    duplicate should instead surface as a parser-level error is still open.
+
+    Which copy survives changed when the insert became `ON CONFLICT DO UPDATE`
+    (so a re-parse can correct a comment body) instead of `DO NOTHING`: last
+    write wins now, first did before. Neither is meaningfully more correct for
+    an input that should not exist, so the assertion below follows the mechanism
+    rather than claiming a guarantee.
     """
     dup_id = 99
     article = make_article(
@@ -178,8 +182,8 @@ async def test_duplicate_comment_ids_in_one_save_are_silently_deduped(pg):
     )
     assert len(rows) == 1
     assert rows[0]["id"] == dup_id
-    assert rows[0]["author_name"] == "someone"
-    assert rows[0]["body"] == "first copy"
+    assert rows[0]["author_name"] == "other"
+    assert rows[0]["body"] == "second copy"
 
 
 async def test_claim_retryable_returns_errors_and_stale_newest_first(pg):
@@ -289,7 +293,7 @@ async def test_claim_returns_newest_articles_first(pg):
                VALUES ($1, 0, 'https://x.example/a.png', 'pending')""",
             article_id,
         )
-    claimed = await repo.claim_pending_images(pg, limit=10)
+    claimed = await repo.claim_pending_images(pg, limit=10, cooldown_sec=0)
     assert [c.article_id for c in claimed] == [300, 200, 100]
 
 
@@ -305,7 +309,7 @@ async def test_claim_excludes_terminal_statuses(pg):
                VALUES (1, $1, 'https://x.example/a.png', $2)""",
             position, status,
         )
-    claimed = await repo.claim_pending_images(pg, limit=10)
+    claimed = await repo.claim_pending_images(pg, limit=10, cooldown_sec=0)
     assert [c.position for c in claimed] == [0, 3]
 
 
@@ -321,7 +325,7 @@ async def test_claim_skips_rows_at_the_attempt_ceiling(pg):
            VALUES (1, 1, 'https://x.example/b.png', 'pending', $1)""",
         repo.MAX_IMAGE_ATTEMPTS - 1,
     )
-    claimed = await repo.claim_pending_images(pg, limit=10)
+    claimed = await repo.claim_pending_images(pg, limit=10, cooldown_sec=0)
     assert [c.position for c in claimed] == [1]
 
 
@@ -333,7 +337,7 @@ async def test_claim_respects_the_limit(pg):
                VALUES (1, $1, 'https://x.example/a.png', 'pending')""",
             position,
         )
-    assert len(await repo.claim_pending_images(pg, limit=2)) == 2
+    assert len(await repo.claim_pending_images(pg, limit=2, cooldown_sec=0)) == 2
 
 
 async def test_record_result_sets_status_and_bumps_attempts(pg):
@@ -361,7 +365,7 @@ async def test_an_errored_row_is_reclaimed_below_the_ceiling(pg):
            VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
     )
     await repo.record_image_result(pg, 1, 0, "error")
-    assert [c.position for c in await repo.claim_pending_images(pg, limit=10)] == [0]
+    assert [c.position for c in await repo.claim_pending_images(pg, limit=10, cooldown_sec=0)] == [0]
 
 
 async def test_the_queue_can_actually_use_the_partial_index(pg):
@@ -405,4 +409,82 @@ async def test_a_dead_row_is_never_reclaimed(pg):
            VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
     )
     await repo.record_image_result(pg, 1, 0, "dead")
-    assert await repo.claim_pending_images(pg, limit=10) == []
+    assert await repo.claim_pending_images(pg, limit=10, cooldown_sec=0) == []
+
+
+async def test_a_just_failed_image_waits_out_the_cooldown(pg):
+    """`claim_retryable` guards the article side against a host having a bad minute.
+    The image side had no such guard, on the column that was already being written:
+    `record_image_result` maintains `checked_at` on every attempt, and nothing read it."""
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status)
+           VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
+    )
+    await repo.record_image_result(pg, 1, 0, "error")
+
+    assert await repo.claim_pending_images(pg, limit=10, cooldown_sec=3600) == []
+    assert [c.position for c in await repo.claim_pending_images(pg, limit=10, cooldown_sec=0)] == [0]
+
+
+async def test_a_never_attempted_image_does_not_wait(pg):
+    """A cooldown is for something that just failed. A fresh row must go straight out,
+    or every image would sit idle for an hour after ingest enqueued it."""
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status)
+           VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
+    )
+    claimed = await repo.claim_pending_images(pg, limit=10, cooldown_sec=86400)
+    assert [c.position for c in claimed] == [0]
+
+
+async def test_a_parse_that_lost_the_comments_cannot_empty_the_thread(pg):
+    """The archive's own recovery command was its worst threat.
+
+    `save_article` deleted every comment unconditionally and inserted only if the
+    parse produced some. eRepublik renames `commentWrapper`; articles still parse
+    (the body gate is `postBody`), so the walk keeps writing 'ok' rows with empty
+    threads. The operator fixes the article side, misses the comment selector, and
+    runs the documented `babel refetch --from --to` over 500k ids — each save then
+    deletes comments that WERE collected correctly and inserts nothing. Comments
+    are the majority of the archive's text (2054 vs 1357 chars per SPEC.md), and
+    the raw-HTML window was dropped precisely because refetch exists.
+    """
+    await repo.save_article(pg, make_article())
+    assert await pg.fetchval("SELECT count(*) FROM comments WHERE article_id = 1") == 2
+
+    # comment_count still says 2; the parse found none. That is a parser fault,
+    # not an article whose comments were all deleted upstream.
+    blinded = make_article(comments=(), comment_count=2)
+    try:
+        await repo.save_article(pg, blinded)
+    except repo.CommentsVanishedError:
+        pass
+    else:
+        raise AssertionError("expected save_article to refuse a comment_count/comments mismatch")
+
+    assert await pg.fetchval("SELECT count(*) FROM comments WHERE article_id = 1") == 2, (
+        "the archived thread must survive a parse that could not see it"
+    )
+
+
+async def test_an_article_that_genuinely_has_no_comments_saves_fine(pg):
+    """Most articles have none. Refusing those would stop the crawl dead."""
+    await repo.save_article(pg, make_article(comments=(), comment_count=0))
+    assert await pg.fetchval("SELECT count(*) FROM articles WHERE id = 1") == 1
+    assert await pg.fetchval("SELECT count(*) FROM comments WHERE article_id = 1") == 0
+
+
+async def test_comments_deleted_upstream_are_kept_not_pruned(pg):
+    """A shrinking thread is a real thing — moderators delete comments. But the
+    archive exists to hold what the game no longer will, so a re-fetch that sees
+    fewer comments must not discard the ones it can no longer see."""
+    await repo.save_article(pg, make_article())
+    shrunk = make_article(
+        comments=(Comment(1, 0, 0, 42, "someone", None, "first"),), comment_count=1
+    )
+    await repo.save_article(pg, shrunk)
+    assert await pg.fetchval("SELECT count(*) FROM comments WHERE article_id = 1") == 2, (
+        "comment 2 no longer appears upstream; that is exactly why it is archived"
+    )

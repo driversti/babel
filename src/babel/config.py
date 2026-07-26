@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     # processing measured 0.13 img/s against the 5.3 img/s the walk produces.
     image_concurrency: int = Field(default=8, ge=1, le=64)
 
+    # How long a just-failed image waits before it may be tried again. Mirrors
+    # retry_cooldown_sec on the article side: without it a host having a bad minute
+    # burns all five attempts inside that minute, and the ceiling is permanent.
+    image_retry_cooldown_sec: float = Field(default=3600.0, ge=0)
+
     image_batch_size: int = Field(default=50, ge=1)
     image_idle_sleep_sec: float = Field(default=60.0, gt=0)
     image_disk_full_sleep_sec: float = Field(default=300.0, gt=0)
