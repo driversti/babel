@@ -36,3 +36,17 @@ async def test_check_ip_leak_retries_transient_failures():
     info = await check_ip_leak(home_country="PL", lookup=flaky, retries=5, backoff_sec=0)
     assert info.ip == "9.9.9.9"
     assert calls["n"] == 3
+
+
+async def test_check_ip_leak_gives_up_after_retries_exhausted():
+    calls = {"n": 0}
+
+    async def always_fails() -> IpInfo:
+        calls["n"] += 1
+        raise RuntimeError("provider down")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await check_ip_leak(home_country="PL", lookup=always_fails, retries=3, backoff_sec=0)
+
+    assert not isinstance(exc_info.value, IpLeak)
+    assert calls["n"] == 3

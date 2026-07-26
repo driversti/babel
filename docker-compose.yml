@@ -17,6 +17,11 @@ services:
       # Lets the crawler reach Postgres on the Docker bridge without leaving
       # the tunnel. Without this the shared namespace cannot see the database.
       - FIREWALL_OUTBOUND_SUBNETS=172.16.0.0/12
+      # Gluetun runs its own DNS-over-TLS resolver by default, which shadows
+      # Docker's embedded DNS at 127.0.0.11 and makes compose service names
+      # (e.g. `db`) unresolvable from any container sharing gluetun's
+      # network namespace. Disable it so the crawler can resolve `db`.
+      - DOT=off
     volumes:
       - ./gluetun:/gluetun
     restart: unless-stopped
@@ -32,12 +37,15 @@ services:
     container_name: babel-db
     environment:
       - POSTGRES_USER=babel
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-babel}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=babel
     volumes:
       - ./pgdata:/var/lib/postgresql/data
+    # Bound to loopback only: this is published purely so the operator can
+    # run `psql` from the host. Nothing external needs it, and the compose
+    # network already lets the crawler container reach `db` internally.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U babel"]
