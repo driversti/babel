@@ -388,6 +388,44 @@ def refetch(ids: str | None, from_id: int | None, to_id: int | None, yes: bool) 
     asyncio.run(_refetch(selection))
 
 
+STUCK_HOSTS_SHOWN = 15
+
+
+@main.command("requeue-images")
+@click.option("--host", required=True, help="Image host to retry, e.g. i.imgur.com.")
+def requeue_images(host: str) -> None:
+    """Put one image host's abandoned images back in the queue.
+
+    'dead' is permanent, which is correct when the host told us the truth and
+    wrong when it did not. Use this after fixing the reason a host was
+    misjudged — the running `images` service picks the rows up on its own.
+
+    Pass a host you do not recognise (or `--host ?`) to list the hosts that
+    currently have images stuck.
+    """
+    asyncio.run(_requeue_images(host))
+
+
+async def _requeue_images(host: str) -> None:
+    settings = Settings()
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        changed = await repo.requeue_images_by_host(conn, host)
+        if changed:
+            click.echo(f"queued {changed:,} image(s) from {host} for another attempt")
+            return
+        click.echo(f"nothing stuck under {host!r} — the host must match exactly")
+        stuck = await repo.stuck_image_hosts(conn, STUCK_HOSTS_SHOWN)
+        if not stuck:
+            click.echo("no host has images stuck at all")
+            return
+        click.echo("hosts with stuck images:")
+        for name, count in stuck:
+            click.echo(f"  {count:>9,}  {name}")
+    finally:
+        await conn.close()
+
+
 async def _refetch(selection: list[int]) -> None:
     settings = Settings()
     conn = await asyncpg.connect(settings.database_url)

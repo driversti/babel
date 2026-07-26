@@ -241,6 +241,56 @@ async def claim_pending_images(conn: asyncpg.Connection, limit: int) -> list[Pen
     return [PendingImage(**dict(r)) for r in rows]
 
 
+# The host of a source_url, as SQL. Peels the authority off `scheme://…`, off a
+# protocol-relative `//…` (common in older articles, and stored verbatim), then
+# drops any `user@` and `:port` so the operator can name a host the plain way.
+# Written once here because requeue and the listing must agree on what a host is.
+_URL_HOST = """
+    lower(split_part(
+        regexp_replace(
+            substring(source_url from '^(?:[A-Za-z][A-Za-z0-9+.-]*:)?//([^/?#]+)'),
+            '^.*@', ''),
+        ':', 1))
+"""
+
+
+async def requeue_images_by_host(conn: asyncpg.Connection, host: str) -> int:
+    """Put one host's abandoned images back in the queue. Returns rows changed.
+
+    'dead' is permanent by design, which is right when the host told us the truth
+    and wrong when it did not. Every false 'dead' observed so far came as a batch
+    from a single host — a rate limit, a landing page, a mislabelled Content-Type —
+    so a host is the unit of recovery. Attempts reset too: an 'error' row sitting
+    at the ceiling is every bit as abandoned as a 'dead' one.
+
+    'ok' is never touched; requeueing a stored image would discard a good capture
+    to fetch it again for nothing.
+    """
+    result = await conn.execute(
+        f"""UPDATE article_images
+            SET status = 'pending', attempts = 0, checked_at = now()
+            WHERE status IN ('dead', 'error') AND {_URL_HOST} = lower($1)""",
+        host,
+    )
+    return int(result.split()[-1])
+
+
+async def stuck_image_hosts(conn: asyncpg.Connection, limit: int) -> list[tuple[str, int]]:
+    """Hosts with abandoned images, worst first.
+
+    Without this the requeue command is only usable by someone who already has a
+    host name from a log line, which is exactly the person least likely to need it.
+    """
+    rows = await conn.fetch(
+        f"""SELECT {_URL_HOST} AS host, count(*) AS n
+            FROM article_images
+            WHERE status IN ('dead', 'error')
+            GROUP BY 1 ORDER BY n DESC, host LIMIT $1""",
+        limit,
+    )
+    return [(r["host"], r["n"]) for r in rows]
+
+
 async def record_image_result(
     conn: asyncpg.Connection,
     article_id: int,

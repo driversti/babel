@@ -74,6 +74,11 @@ so `ip rule` is unavailable and gluetun cannot start there at all. Details in `S
 - `docker compose run --rm crawler babel refetch --ids 123,456` or
   `babel refetch --from 100 --to 200` — queue already-collected articles for re-collection after a
   parser fix or a markup change; the running service's sweep phase picks them up on its own
+- `docker compose run --rm crawler babel requeue-images --host i.imgur.com` — put one image host's
+  `dead`/`error` rows back to `pending` with attempts reset, after fixing whatever caused that host
+  to be misjudged. Pass a host you don't recognise to get a ranked list of hosts with stuck images.
+  `dead` is permanent by design, and every false `dead` so far arrived as a batch from one host —
+  this is the way back.
 - `babel images` — drain the `article_images` queue until stopped; runs as the separate `images`
   compose service, stoppable/restartable independently of `crawler` since ingest only enqueues
   image URLs and never fetches the bytes itself
