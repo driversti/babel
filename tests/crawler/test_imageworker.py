@@ -1,8 +1,10 @@
 import asyncio
+import contextlib
 
 from babel.config import Settings
 from babel.crawler.hostlimit import HostLimiter
-from babel.crawler.imageworker import run_image_worker
+from babel.crawler.images import url_host
+from babel.crawler.imageworker import _capture_one, _interleave_by_host, run_image_worker
 from babel.crawler.ratelimit import RateLimiter
 from babel.db import repo
 from babel.notify import Throttled
@@ -32,6 +34,13 @@ async def seed(pg, article_id: int, urls: list[str]) -> None:
 def settings(tmp_path, **kw):
     base = dict(_env_file=None, image_root=str(tmp_path), min_free_bytes=0)
     return Settings(**{**base, **kw})
+
+
+class _Item:
+    """Just enough of repo.PendingImage for the ordering tests."""
+
+    def __init__(self, source_url: str) -> None:
+        self.source_url = source_url
 
 
 async def noop_sleep(_seconds):
@@ -240,3 +249,85 @@ async def test_a_slow_host_does_not_idle_the_rate_budget(pg, tmp_path, fake_pool
     assert peak > 1, f"requests never overlapped (peak={peak}); a slow host still blocks the batch"
     assert peak <= 4, f"peak {peak} exceeded image_concurrency=4"
     assert await pg.fetchval("SELECT count(*) FROM article_images WHERE status='ok'") == 8
+
+
+def test_a_batch_is_interleaved_across_hosts():
+    """The queue arrives grouped by host and must not be worked that way.
+
+    Rows come back ordered by (article_id, position), and an article's images
+    almost always share a host, so a batch is runs of one host: measured live,
+    39 of 50 rows on three hosts. HostLimiter allows one in-flight request per
+    hostname, so workers taking that order in turn all pile onto the same host
+    and block — whether they own an item each (gather) or pull from a shared
+    queue, since they pull in order too. Only 1 of 8 workers makes progress.
+
+    Interleaving makes as many hosts busy at once as there are hosts, which is
+    the most one-request-per-host permits.
+    """
+    batch = [
+        _Item("https://a.example/0.png"), _Item("https://a.example/1.png"),
+        _Item("https://a.example/2.png"), _Item("https://b.example/0.png"),
+        _Item("https://b.example/1.png"), _Item("https://c.example/0.png"),
+    ]
+    order = [url_host(i.source_url) for i in _interleave_by_host(batch)]
+
+    assert order == ["a.example", "b.example", "c.example", "a.example", "b.example", "a.example"]
+
+
+def test_interleaving_keeps_every_row_exactly_once():
+    batch = [_Item(f"https://h{i % 3}.example/{i}.png") for i in range(20)]
+    assert sorted(i.source_url for i in _interleave_by_host(batch)) == sorted(
+        i.source_url for i in batch
+    )
+
+
+def test_interleaving_preserves_order_within_a_host():
+    """Newest-article-first is the drain order the survival curve requires, and
+    it must survive the shuffle for each host's own images."""
+    batch = [_Item(f"https://a.example/{i}.png") for i in range(4)]
+    assert [i.source_url for i in _interleave_by_host(batch)] == [
+        i.source_url for i in batch
+    ]
+
+
+async def test_the_rate_token_is_taken_after_the_host_slot(tmp_path):
+    """The global limiter paces requests to the fleet, so its token must be spent
+    on a request that is about to happen.
+
+    Taken before the per-host lock, a worker consumed a slot and then sat waiting
+    for a busy host — the configured rate was charged for queueing rather than
+    fetching, which is most of the wait when a batch concentrates on a few hosts.
+    Ordering, not timing, so this is deterministic.
+    """
+    events: list[str] = []
+
+    class Limiter:
+        async def acquire(self):
+            events.append("rate")
+
+    class Hosts:
+        @contextlib.asynccontextmanager
+        async def slot(self, url):
+            events.append("host")
+            yield
+
+    async def get_bytes(url, max_bytes):
+        events.append("request")
+        return 200, b"\x89PNG ok", "image/png"
+
+    class OnePool:
+        def acquire(self):
+            return contextlib.nullcontext(None)
+
+    async def noop(*a, **kw):
+        return None
+
+    item = repo.PendingImage(article_id=1, position=0, source_url="https://a.example/x.png", attempts=0)
+    original = repo.record_image_result, repo.save_image_blob
+    repo.record_image_result, repo.save_image_blob = noop, noop
+    try:
+        await _capture_one(OnePool(), get_bytes, Limiter(), Hosts(), settings(tmp_path), item)
+    finally:
+        repo.record_image_result, repo.save_image_blob = original
+
+    assert events == ["host", "rate", "request"], events

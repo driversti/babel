@@ -58,34 +58,74 @@ async def run_image_worker(
         await _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch)
 
 
-async def _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch) -> None:
-    """Fetch a batch with bounded concurrency.
+def _interleave_by_host(batch):
+    """Round-robin the batch across hosts, keeping each host's own order.
 
-    Politeness is untouched: the global limiter still caps requests per second and
-    HostLimiter still allows one in-flight request per hostname. Concurrency only
-    stops one slow host from spending everyone else's budget waiting. Sequentially
-    this measured 0.13 images/second against the 5.3 the article walk produces, so
-    the queue grew without bound.
+    Rows arrive ordered by (article_id, position) and an article's images almost
+    always share a host, so a batch is runs of one host — measured live, 39 of 50
+    rows across three. With one in-flight request permitted per hostname, workers
+    taking that order all pile onto the same host and wait: one of eight makes
+    progress. Pulling from a shared queue does not help by itself, because the
+    workers pull in that same order.
+
+    Interleaved, as many hosts are busy at once as there are hosts in the batch,
+    which is the most one-request-per-host allows. Each host's images stay in
+    their original relative order, so the newest-article-first drain the survival
+    curve calls for is preserved within a host.
     """
-    semaphore = asyncio.Semaphore(settings.image_concurrency)
+    by_host: dict[str, list] = {}
+    for item in batch:
+        by_host.setdefault(url_host(item.source_url), []).append(item)
 
-    async def guarded(item):
-        async with semaphore:
-            await _capture_one(pool, get_bytes, limiter, host_limiter, settings, item)
+    out = []
+    queues = list(by_host.values())
+    while queues:
+        queues = [q for q in queues if q]
+        for q in queues:
+            out.append(q.pop(0))
+    return out
 
-    # return_exceptions: one row's database or filesystem fault must not cancel the
-    # rest of the batch, which is what a bare gather would do.
-    for item, result in zip(
-        batch, await asyncio.gather(*(guarded(i) for i in batch), return_exceptions=True), strict=True
-    ):
-        if isinstance(result, BaseException):
-            log.exception("recording %s failed", item.source_url, exc_info=result)
+
+async def _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch) -> None:
+    """Fetch a batch through a fixed set of workers pulling from a shared queue.
+
+    Not `gather` over the batch. HostLimiter allows one in-flight request per
+    hostname, and an article's images almost always come from one host, so a
+    batch concentrates on a handful of hosts — measured live, 39 of 50 rows on
+    three of them. Under `gather` each coroutine owned its item and simply waited
+    its turn on the host lock, so the batch took as long as its slowest host's
+    whole queue while other workers sat idle: 0.05 images/second against the 5.3
+    the article walk produces.
+
+    Pulling from a queue instead, a worker blocked on a busy host is one worker,
+    and everyone else moves on to hosts that are free.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    for item in _interleave_by_host(batch):
+        queue.put_nowait(item)
+
+    async def worker() -> None:
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await _capture_one(pool, get_bytes, limiter, host_limiter, settings, item)
+            except Exception:  # noqa: BLE001 — one row's fault must not end this worker
+                log.exception("recording %s failed", item.source_url)
+
+    await asyncio.gather(*(worker() for _ in range(settings.image_concurrency)))
 
 
 async def _capture_one(pool, get_bytes, limiter, host_limiter, settings, item) -> None:
-    await limiter.acquire()
     try:
+        # The host slot first, then the rate token. The token paces requests to
+        # the fleet, so it has to be spent on a request that is about to happen —
+        # taken first, a worker consumed a slot and then waited on a busy host,
+        # charging the configured rate for queueing rather than for fetching.
         async with host_limiter.slot(item.source_url):
+            await limiter.acquire()
             outcome = await asyncio.wait_for(
                 capture_image(
                     get_bytes,
