@@ -68,10 +68,16 @@ ALTER TABLE article_images ADD COLUMN attempts smallint NOT NULL DEFAULT 0;
 UPDATE article_images SET status = 'pending' WHERE status = 'skipped_no_space';
 
 -- The drain order: newest article first, because that is where the images that
--- still resolve are. Partial, so the index stays small as rows leave 'pending'.
+-- still resolve are. Partial, so the index stays small as rows leave the queue.
+--
+-- The predicate must list exactly the statuses claim_pending_images asks for,
+-- and that query must spell them as a literal rather than a bound parameter.
+-- Postgres proves a partial index applicable only from a Const; a narrower
+-- predicate here, or a Param there, and the planner sequentially scans a table
+-- holding millions of rows that are almost all 'ok' or 'dead'.
 CREATE INDEX article_images_queue_idx
     ON article_images (article_id DESC, position)
-    WHERE status = 'pending';
+    WHERE status IN ('pending', 'error');
 ```
 
 - [ ] **Step 2: Write the failing tests**
@@ -161,6 +167,40 @@ async def test_an_errored_row_is_reclaimed_below_the_ceiling(pg):
     assert [c.position for c in await repo.claim_pending_images(pg, limit=10)] == [0]
 
 
+async def test_the_queue_can_actually_use_the_partial_index(pg):
+    # article_images_queue_idx's predicate and this query's status list must stay
+    # textually identical: Postgres proves a partial index applicable only from a
+    # Const. Disabling seqscan makes the planner take the index if -- and only if
+    # -- it can prove it applies, so this tests provability, not cost preference.
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status)
+           VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
+    )
+    await pg.execute("SET enable_seqscan = off")
+    plan = "\n".join(
+        r["QUERY PLAN"]
+        for r in await pg.fetch(
+            """EXPLAIN SELECT article_id, position, source_url, attempts FROM article_images
+               WHERE status IN ('pending', 'error') AND attempts < 5
+               ORDER BY article_id DESC, position LIMIT 50"""
+        )
+    )
+    # Control: a predicate the index does not cover must NOT reach it, or the
+    # assertion below would pass for any query at all.
+    wider = "\n".join(
+        r["QUERY PLAN"]
+        for r in await pg.fetch(
+            """EXPLAIN SELECT article_id FROM article_images
+               WHERE status IN ('pending', 'error', 'ok')
+               ORDER BY article_id DESC LIMIT 50"""
+        )
+    )
+    await pg.execute("SET enable_seqscan = on")
+    assert "article_images_queue_idx" in plan, plan
+    assert "article_images_queue_idx" not in wider, wider
+
+
 async def test_a_dead_row_is_never_reclaimed(pg):
     await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
     await pg.execute(
@@ -239,7 +279,7 @@ async def record_image_result(
 - [ ] **Step 5: Run and watch them pass**
 
 Run: `uv run pytest tests/db/test_repo.py -v`
-Expected: all pass, including the 7 new ones
+Expected: all pass, including the 8 new ones
 
 - [ ] **Step 6: Commit**
 
