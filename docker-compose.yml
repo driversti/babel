@@ -17,15 +17,6 @@ services:
       # Lets the crawler reach Postgres on the Docker bridge without leaving
       # the tunnel. Without this the shared namespace cannot see the database.
       - FIREWALL_OUTBOUND_SUBNETS=172.16.0.0/12
-      # Gluetun otherwise points /etc/resolv.conf at its own DNS-over-TLS
-      # resolver, which shadows Docker's embedded DNS at 127.0.0.11 -- and
-      # that is what resolves the `db` service name for any container
-      # sharing this namespace. Keeping the original nameserver is the
-      # supported way to leave it alone; DOT=off is deprecated and, on its
-      # own, fails startup because the upstream resolver type stays 'dot'.
-      # Cost: DNS queries travel as plaintext. They still go through the
-      # tunnel, so this is a confidentiality trade, not an identity leak.
-      - DNS_KEEP_NAMESERVER=on
     volumes:
       - ./gluetun:/gluetun
     restart: unless-stopped
