@@ -128,7 +128,11 @@ async def _run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
     info = await check_ip_leak(home_country=settings.home_country)
     log.info("egress %s (%s)", info.ip, info.country)
 
-    pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=4)
+    # Four consumers hold connections at peak: the backfill holds one for the
+    # life of its now-infinite loop, the poller one per cycle, and Ingestor
+    # nests another inside each. A max_size of 4 sat exactly on that limit, so
+    # one more consumer would block forever with no error.
+    pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=8)
     async with pool.acquire() as conn:
         await apply_migrations(conn, MIGRATIONS)
 
