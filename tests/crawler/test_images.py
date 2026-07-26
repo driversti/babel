@@ -1,4 +1,7 @@
+import asyncio
 import hashlib
+
+import pytest
 
 from babel.crawler.images import (
     capture_image,
@@ -22,6 +25,13 @@ def test_path_is_sharded_by_the_first_two_byte_pairs(tmp_path):
     assert path.name == digest.hex()
 
 
+def test_image_path_rejects_a_digest_that_is_not_32_bytes(tmp_path):
+    with pytest.raises(ValueError, match="32 bytes"):
+        image_path(tmp_path, b"")
+    with pytest.raises(ValueError, match="32 bytes"):
+        image_path(tmp_path, b"\x00" * 31)
+
+
 def test_store_bytes_writes_once_and_returns_the_digest(tmp_path):
     data = b"an image, allegedly"
     digest = store_bytes(tmp_path, data)
@@ -43,9 +53,31 @@ def test_different_bytes_get_different_files(tmp_path):
     assert len([p for p in tmp_path.rglob("*") if p.is_file()]) == 2
 
 
+async def test_concurrent_writers_of_identical_bytes_all_succeed(tmp_path):
+    """Flags, avatars and unit logos recur across thousands of articles, so concurrent
+    writers racing to store the same bytes is the normal case, not the edge case. The
+    loser of the race must not see the winner's rename as a failure.
+    """
+    data = b"same bytes, many workers"
+    expected = hashlib.sha256(data).digest()
+
+    results = await asyncio.gather(
+        *(asyncio.to_thread(store_bytes, tmp_path, data) for _ in range(16))
+    )
+
+    assert all(digest == expected for digest in results)
+    assert len([p for p in tmp_path.rglob("*") if p.is_file()]) == 1
+
+
 def test_have_space_is_false_when_the_floor_is_absurd(tmp_path):
     assert have_space(tmp_path, 0)
     assert not have_space(tmp_path, 10**18)
+
+
+def test_have_space_walks_up_to_an_existing_ancestor(tmp_path):
+    deep = tmp_path / "does" / "not" / "exist" / "yet"
+    assert have_space(deep, 0)
+    assert not have_space(deep, 10**18)
 
 
 async def test_capture_stores_a_live_image(tmp_path):
