@@ -1,3 +1,4 @@
+import asyncio
 import pathlib
 
 import asyncpg
@@ -23,19 +24,29 @@ async def pg():
 
 
 class FakePool:
-    """asyncpg.Pool.acquire() is an async context manager; one connection suffices."""
+    """asyncpg.Pool.acquire() is an async context manager; one connection suffices.
+
+    Exclusive, like the thing it imitates. A real pool never hands the same
+    connection to two borrowers at once, and asyncpg raises if two operations run
+    on one connection concurrently. Without the lock this fixture handed the same
+    connection to every caller, so it modelled a pool correctly only for code that
+    never acquired concurrently — and silently dropped writes for code that did.
+    """
 
     def __init__(self, conn):
         self._conn = conn
+        self._lock = asyncio.Lock()
 
     def acquire(self):
-        conn = self._conn
+        conn, lock = self._conn, self._lock
 
         class _Ctx:
             async def __aenter__(self):
+                await lock.acquire()
                 return conn
 
             async def __aexit__(self, *exc):
+                lock.release()
                 return False
 
         return _Ctx()

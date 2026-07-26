@@ -36,6 +36,21 @@ class Settings(BaseSettings):
     max_image_bytes: int = Field(default=8 * 1024**2, ge=1)
 
     image_requests_per_second: float = Field(default=5.0, gt=0, le=100)
+
+    # A hard deadline per image. curl's own timeout does not bound a streamed body
+    # read, so a host that accepts the connection and then sends nothing hangs the
+    # fetch forever — which stalled the whole image archive on the first live run.
+    # Generous, because a large image on a slow host is legitimate; bounded,
+    # because no single host may cost more than this.
+    image_timeout_sec: float = Field(default=60.0, gt=0)
+
+    # How many image fetches may be in flight at once. This is not a politeness
+    # setting: the global limiter (image_requests_per_second) and the one-request-
+    # per-host lock are what cap load, and both still apply. This exists so a host
+    # taking twenty seconds does not spend the whole budget waiting — sequential
+    # processing measured 0.13 img/s against the 5.3 img/s the walk produces.
+    image_concurrency: int = Field(default=8, ge=1, le=64)
+
     image_batch_size: int = Field(default=50, ge=1)
     image_idle_sleep_sec: float = Field(default=60.0, gt=0)
     image_disk_full_sleep_sec: float = Field(default=300.0, gt=0)

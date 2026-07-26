@@ -53,20 +53,54 @@ async def run_image_worker(
             await sleep(settings.image_idle_sleep_sec)
             continue
 
-        for item in batch:
+        await _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch)
+
+
+async def _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch) -> None:
+    """Fetch a batch with bounded concurrency.
+
+    Politeness is untouched: the global limiter still caps requests per second and
+    HostLimiter still allows one in-flight request per hostname. Concurrency only
+    stops one slow host from spending everyone else's budget waiting. Sequentially
+    this measured 0.13 images/second against the 5.3 the article walk produces, so
+    the queue grew without bound.
+    """
+    semaphore = asyncio.Semaphore(settings.image_concurrency)
+
+    async def guarded(item):
+        async with semaphore:
             await _capture_one(pool, get_bytes, limiter, host_limiter, settings, item)
+
+    # return_exceptions: one row's database or filesystem fault must not cancel the
+    # rest of the batch, which is what a bare gather would do.
+    for item, result in zip(
+        batch, await asyncio.gather(*(guarded(i) for i in batch), return_exceptions=True), strict=True
+    ):
+        if isinstance(result, BaseException):
+            log.exception("recording %s failed", item.source_url, exc_info=result)
 
 
 async def _capture_one(pool, get_bytes, limiter, host_limiter, settings, item) -> None:
     await limiter.acquire()
     try:
         async with host_limiter.slot(item.source_url):
-            outcome = await capture_image(
-                get_bytes,
-                settings.image_root,
-                item.source_url,
-                max_bytes=settings.max_image_bytes,
+            outcome = await asyncio.wait_for(
+                capture_image(
+                    get_bytes,
+                    settings.image_root,
+                    item.source_url,
+                    max_bytes=settings.max_image_bytes,
+                ),
+                timeout=settings.image_timeout_sec,
             )
+    except TimeoutError:
+        # Must precede the general handler: TimeoutError is an Exception. A host
+        # that stops responding mid-body says nothing about whether the image
+        # exists, so this becomes 'error' and stays retryable.
+        log.warning(
+            "%s did not finish within %.0fs", item.source_url, settings.image_timeout_sec
+        )
+        outcome = None
     except Exception:  # noqa: BLE001 — a filesystem or transport fault is not fatal
         log.exception("capturing %s failed", item.source_url)
         outcome = None

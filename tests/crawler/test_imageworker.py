@@ -1,3 +1,5 @@
+import asyncio
+
 from babel.config import Settings
 from babel.crawler.hostlimit import HostLimiter
 from babel.crawler.imageworker import run_image_worker
@@ -139,3 +141,70 @@ async def test_an_empty_queue_sleeps_rather_than_spinning(pg, tmp_path, fake_poo
         sleep=record_sleep, max_cycles=2,
     )
     assert slept == [60.0, 60.0]
+
+
+async def test_a_hanging_host_cannot_wedge_the_worker(pg, tmp_path, fake_pool):
+    """Observed live: the worker stopped for good on one host that accepted the
+    connection and then sent nothing.
+
+    curl's timeout does not bound a streamed body read, so `aiter_content` never
+    returned. Because the batch is processed one item at a time, that single
+    request stalled the entire image archive — 22,000 rows queued, CPU at 0.2%,
+    container reporting healthy, nothing collected for as long as it stayed up.
+    A stuck fetch must cost one row, not the worker.
+    """
+    await seed(pg, 1, ["https://hangs.example/1.png", "https://works.example/2.png"])
+
+    async def get_bytes(url, max_bytes):
+        if "hangs" in url:
+            await asyncio.sleep(3600)
+        return 200, b"\x89PNG ok", "image/png"
+
+    await run_image_worker(
+        fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
+        Throttled(Recorder(), 1, now=lambda: 0.0),
+        settings(tmp_path, image_timeout_sec=0.05),
+        sleep=noop_sleep, max_cycles=1,
+    )
+
+    rows = dict(await pg.fetch("SELECT source_url, status FROM article_images"))
+    assert rows["https://works.example/2.png"] == "ok", "the healthy image must still be collected"
+    assert rows["https://hangs.example/1.png"] == "error", (
+        "a timeout is not evidence the image is gone, so it must stay retryable"
+    )
+
+
+async def test_a_slow_host_does_not_idle_the_rate_budget(pg, tmp_path, fake_pool):
+    """The rate limiter permits 5 requests/second; strictly sequential processing
+    delivers that only if every fetch is instantaneous.
+
+    Measured live: 0.13 images/second against the 5.3/second the article walk
+    produces, so the queue grew without bound. The fix is concurrency within the
+    batch — the global limiter and the one-request-per-host lock still cap the
+    load, so politeness is unchanged; what changes is that a slow host no longer
+    spends everyone else's budget waiting.
+    """
+    await seed(pg, 1, [f"https://h{i}.example/x.png" for i in range(8)])
+    in_flight = 0
+    peak = 0
+
+    async def get_bytes(url, max_bytes):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.sleep(0.05)
+            return 200, b"\x89PNG " + url.encode(), "image/png"
+        finally:
+            in_flight -= 1
+
+    await run_image_worker(
+        fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
+        Throttled(Recorder(), 1, now=lambda: 0.0),
+        settings(tmp_path, image_concurrency=4),
+        sleep=noop_sleep, max_cycles=1,
+    )
+
+    assert peak > 1, f"requests never overlapped (peak={peak}); a slow host still blocks the batch"
+    assert peak <= 4, f"peak {peak} exceeded image_concurrency=4"
+    assert await pg.fetchval("SELECT count(*) FROM article_images WHERE status='ok'") == 8

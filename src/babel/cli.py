@@ -154,7 +154,11 @@ async def _images() -> None:
     info = await check_ip_leak(home_country=settings.home_country)
     log.info("egress %s (%s)", info.ip, info.country)
 
-    pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=4)
+    # Each in-flight capture takes a connection to record its outcome, so the pool
+    # has to cover the concurrency plus the batch claim and a little headroom.
+    pool = await asyncpg.create_pool(
+        settings.database_url, min_size=1, max_size=settings.image_concurrency + 3
+    )
     async with pool.acquire() as conn:
         await apply_migrations(conn, MIGRATIONS)
 
