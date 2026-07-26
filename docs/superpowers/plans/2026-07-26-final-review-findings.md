@@ -94,7 +94,7 @@ placeholders `AA`/`ZZ` throughout.
   `test_first_acquire_is_immediate`.
 - **Promote:** the orphan `article_images` rows finding understates itself — see the URL/hash remap
   above.
-- **Accepted trade:** `DOT=off`. Service-name resolution requires it and queries still leave through
+- **Accepted trade:** `DNS_KEEP_NAMESERVER=on`. Service-name resolution requires it and queries still leave through
   the tunnel; no identity leak.
 
 ## Recommended order
