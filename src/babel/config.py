@@ -40,9 +40,16 @@ class Settings(BaseSettings):
     # A hard deadline per image. curl's own timeout does not bound a streamed body
     # read, so a host that accepts the connection and then sends nothing hangs the
     # fetch forever — which stalled the whole image archive on the first live run.
-    # Generous, because a large image on a slow host is legitimate; bounded,
-    # because no single host may cost more than this.
-    image_timeout_sec: float = Field(default=60.0, gt=0)
+    #
+    # It started at 60s, on the reasoning that a large image on a slow host is
+    # legitimate. Measured against a stalling host, that reasoning was backwards:
+    # every postimg request burned the full 60s, so it took three minutes for the
+    # circuit breaker to see three failures and hold the host off — three minutes
+    # in which one worker collected roughly one image. The deadline is also the
+    # price of noticing a host is broken, so it wants to be short. A CDN that has
+    # not delivered an image in 25 seconds is not about to; the row is recorded
+    # 'error' and stays retryable either way.
+    image_timeout_sec: float = Field(default=25.0, gt=0)
 
     # How many image fetches may be in flight at once. This is not a politeness
     # setting: the global limiter (image_requests_per_second) and the one-request-
