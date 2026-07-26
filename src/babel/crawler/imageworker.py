@@ -11,6 +11,7 @@ Newest article first. 66% of 2021-2026 images still resolve against 7% of
 import asyncio
 import logging
 
+from babel.crawler.circuit import HostCircuit
 from babel.crawler.images import capture_image, have_space, url_host
 from babel.db import repo
 
@@ -27,10 +28,13 @@ async def run_image_worker(
     notifier,
     settings,
     *,
+    circuit=None,
     sleep=asyncio.sleep,
     max_cycles: int | None = None,
 ) -> None:
     """Fetch queued images until stopped. `max_cycles` bounds the loop for tests."""
+    if circuit is None:
+        circuit = HostCircuit(settings.host_failure_threshold, settings.host_open_sec)
     cycles = 0
     while max_cycles is None or cycles < max_cycles:
         cycles += 1
@@ -46,16 +50,27 @@ async def run_image_worker(
             await sleep(settings.image_disk_full_sleep_sec)
             continue
 
+        # Hosts in trouble are excluded by the claim, not skipped after it. The
+        # drain is newest-article-first and a failing host clusters at the head,
+        # so skipping in here would hand back the same rows every cycle — the
+        # worker would spin on them, or sleep, while every other host's images
+        # waited behind.
+        excluded = circuit.open_hosts()
+        if excluded:
+            log.info("holding off %d host(s): %s", len(excluded), ", ".join(excluded))
         async with pool.acquire() as conn:
             batch = await repo.claim_pending_images(
-                conn, settings.image_batch_size, settings.image_retry_cooldown_sec
+                conn,
+                settings.image_batch_size,
+                settings.image_retry_cooldown_sec,
+                excluded,
             )
 
         if not batch:
             await sleep(settings.image_idle_sleep_sec)
             continue
 
-        await _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch)
+        await _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch, circuit)
 
 
 def _interleave_by_host(batch):
@@ -86,7 +101,7 @@ def _interleave_by_host(batch):
     return out
 
 
-async def _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch) -> None:
+async def _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch, circuit) -> None:
     """Fetch a batch through a fixed set of workers pulling from a shared queue.
 
     Not `gather` over the batch. HostLimiter allows one in-flight request per
@@ -110,15 +125,19 @@ async def _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch
                 item = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
+            if circuit is not None and circuit.is_open(item.source_url):
+                # Opened partway through this batch. Leave the row untouched — a
+                # skipped image is not a failed one, and it is still queued.
+                continue
             try:
-                await _capture_one(pool, get_bytes, limiter, host_limiter, settings, item)
+                await _capture_one(pool, get_bytes, limiter, host_limiter, settings, item, circuit)
             except Exception:  # noqa: BLE001 — one row's fault must not end this worker
                 log.exception("recording %s failed", item.source_url)
 
     await asyncio.gather(*(worker() for _ in range(settings.image_concurrency)))
 
 
-async def _capture_one(pool, get_bytes, limiter, host_limiter, settings, item) -> None:
+async def _capture_one(pool, get_bytes, limiter, host_limiter, settings, item, circuit=None) -> None:
     try:
         # The host slot first, then the rate token. The token paces requests to
         # the fleet, so it has to be spent on a request that is about to happen —
@@ -152,6 +171,14 @@ async def _capture_one(pool, get_bytes, limiter, host_limiter, settings, item) -
     # symptom is images quietly missing months later. Named by host, because that
     # is the unit `requeue-images --host` recovers.
     failed = outcome is None or outcome.status != "ok"
+    if circuit is not None:
+        # 'dead' counts as an answer, not a failure: the host replied and told us
+        # the image is gone. Only a timeout or a transport fault says the host
+        # itself is in trouble.
+        if outcome is not None and outcome.status in ("ok", "dead"):
+            circuit.record_success(item.source_url)
+        else:
+            circuit.record_failure(item.source_url)
     if failed and item.attempts + 1 >= repo.MAX_IMAGE_ATTEMPTS:
         log.warning(
             "%s: giving up on %s after %d attempts — `babel requeue-images --host %s` retries it",

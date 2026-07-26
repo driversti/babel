@@ -24,6 +24,20 @@ MAX_FETCH_ATTEMPTS = 5
 # 'ok' and 'missing' are answers. 'error' and 'stale' are unfinished business.
 RETRYABLE_STATUSES = ("error", "stale")
 
+# The host of a source_url, as SQL. Peels the authority off `scheme://…`, off a
+# protocol-relative `//…` (common in older articles, and stored verbatim), then
+# drops any `user@` and `:port` so the operator can name a host the plain way.
+# Written once here because the claim, the requeue and the listing must all agree
+# on what a host is — and must agree with `images.url_host`, which the worker's
+# circuit breaker uses to decide which hosts to name.
+_URL_HOST = """
+    lower(split_part(
+        regexp_replace(
+            substring(source_url from '^(?:[A-Za-z][A-Za-z0-9+.-]*:)?//([^/?#]+)'),
+            '^.*@', ''),
+        ':', 1))
+"""
+
 
 class CommentsVanishedError(Exception):
     """The page said it has comments and the parse produced none.
@@ -249,7 +263,10 @@ class PendingImage:
 
 
 async def claim_pending_images(
-    conn: asyncpg.Connection, limit: int, cooldown_sec: float
+    conn: asyncpg.Connection,
+    limit: int,
+    cooldown_sec: float,
+    excluded_hosts: Sequence[str] = (),
 ) -> list[PendingImage]:
     """Next images to fetch, newest article first.
 
@@ -270,36 +287,27 @@ async def claim_pending_images(
     wait; a cooldown is for something that just failed.
     """
     rows = await conn.fetch(
-        """
+        f"""
         -- The status set is written as a literal, not a bound parameter, and
         -- must stay textually identical to article_images_queue_idx's predicate.
         -- Postgres only proves a partial index applicable from a Const; with a
         -- Param it cannot, and the planner would sequentially scan a table
         -- holding millions of rows that are almost all 'ok' or 'dead'.
-        -- The checked_at term below is a heap qualifier and does not affect that.
+        -- The checked_at and host terms below are heap qualifiers and do not
+        -- affect that.
         SELECT article_id, position, source_url, attempts
         FROM article_images
         WHERE status IN ('pending', 'error') AND attempts < $1
           AND (status = 'pending' OR checked_at <= now() - make_interval(secs => $2))
+          AND ({_URL_HOST}) <> ALL($3::text[])
         ORDER BY article_id DESC, position
-        LIMIT $3
+        LIMIT $4
         """,
-        MAX_IMAGE_ATTEMPTS, cooldown_sec, limit,
+        MAX_IMAGE_ATTEMPTS, cooldown_sec, list(excluded_hosts), limit,
     )
     return [PendingImage(**dict(r)) for r in rows]
 
 
-# The host of a source_url, as SQL. Peels the authority off `scheme://…`, off a
-# protocol-relative `//…` (common in older articles, and stored verbatim), then
-# drops any `user@` and `:port` so the operator can name a host the plain way.
-# Written once here because requeue and the listing must agree on what a host is.
-_URL_HOST = """
-    lower(split_part(
-        regexp_replace(
-            substring(source_url from '^(?:[A-Za-z][A-Za-z0-9+.-]*:)?//([^/?#]+)'),
-            '^.*@', ''),
-        ':', 1))
-"""
 
 
 async def requeue_images_by_host(conn: asyncpg.Connection, host: str) -> int:

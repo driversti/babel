@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 
 from babel.config import Settings
+from babel.crawler.circuit import HostCircuit
 from babel.crawler.hostlimit import HostLimiter
 from babel.crawler.images import url_host
 from babel.crawler.imageworker import _capture_one, _interleave_by_host, run_image_worker
@@ -117,7 +118,13 @@ async def test_a_full_disk_leaves_the_queue_untouched_and_notifies(pg, tmp_path,
 
 
 async def test_an_errored_image_is_retried_until_the_ceiling(pg, tmp_path, fake_pool):
-    """With no cooldown the ceiling still applies — that mechanism is unchanged."""
+    """With no cooldown the ceiling still applies — that mechanism is unchanged.
+
+    The circuit breaker is given a threshold it cannot reach, because it would
+    otherwise hold the host off after three failures and the ceiling would never
+    be exercised. That interaction is real and wanted; it is just not what this
+    test is about.
+    """
     await seed(pg, 1, ["https://a.example/flaky.png"])
     calls = {"n": 0}
 
@@ -129,6 +136,7 @@ async def test_an_errored_image_is_retried_until_the_ceiling(pg, tmp_path, fake_
         fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
         Throttled(Recorder(), 1, now=lambda: 0.0),
         settings(tmp_path, image_retry_cooldown_sec=0),
+        circuit=HostCircuit(threshold=999, open_sec=1, now=lambda: 0.0),
         sleep=noop_sleep, max_cycles=10,
     )
     row = await pg.fetchrow("SELECT status, attempts FROM article_images WHERE article_id = 1")
@@ -331,3 +339,57 @@ async def test_the_rate_token_is_taken_after_the_host_slot(tmp_path):
         repo.record_image_result, repo.save_image_blob = original
 
     assert events == ["host", "rate", "request"], events
+
+
+async def test_a_failing_host_is_held_off_while_others_keep_going(pg, tmp_path, fake_pool):
+    """The whole point: one bad host must not cost the queue its throughput.
+
+    i.postimg.cc began stalling for the full request timeout, and because the
+    drain is newest-first and those articles' images clustered there, nearly
+    every batch was postimg at 20s each — 0.04 images/second while every other
+    host answered in under a second.
+    """
+    await seed(pg, 1, [f"https://bad.example/{i}.png" for i in range(4)])
+    await seed(pg, 2, [f"https://good.example/{i}.png" for i in range(4)])
+    attempted: list[str] = []
+
+    async def get_bytes(url, max_bytes):
+        attempted.append(url)
+        if "bad.example" in url:
+            raise TimeoutError("stalled")
+        return 200, b"\x89PNG ok", "image/png"
+
+    await run_image_worker(
+        fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
+        Throttled(Recorder(), 1, now=lambda: 0.0),
+        settings(tmp_path, image_retry_cooldown_sec=0, image_concurrency=1),
+        circuit=HostCircuit(threshold=3, open_sec=900, now=lambda: 0.0),
+        sleep=noop_sleep, max_cycles=6,
+    )
+
+    bad_attempts = [u for u in attempted if "bad.example" in u]
+    assert len(bad_attempts) == 3, (
+        f"the host should be left alone after 3 consecutive failures, got {len(bad_attempts)}"
+    )
+    assert await pg.fetchval(
+        "SELECT count(*) FROM article_images WHERE status = 'ok'"
+    ) == 4, "the healthy host's images must still be collected"
+
+
+async def test_a_dead_link_is_an_answer_not_a_host_failure(pg, tmp_path, fake_pool):
+    """A 404 means the host is working and the image is gone. Counting those as
+    host failures would hold off exactly the hosts still answering — and old
+    articles are full of dead links by design."""
+    await seed(pg, 1, [f"https://alive.example/{i}.png" for i in range(5)])
+
+    async def get_bytes(url, max_bytes):
+        return 404, b"", None
+
+    await run_image_worker(
+        fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
+        Throttled(Recorder(), 1, now=lambda: 0.0),
+        settings(tmp_path, image_concurrency=1),
+        circuit=HostCircuit(threshold=3, open_sec=900, now=lambda: 0.0),
+        sleep=noop_sleep, max_cycles=2,
+    )
+    assert await pg.fetchval("SELECT count(*) FROM article_images WHERE status='dead'") == 5

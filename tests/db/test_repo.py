@@ -558,3 +558,37 @@ async def test_an_image_the_author_removed_keeps_its_captured_bytes(pg):
     )
     assert row is not None, "the row must survive, or the stored blob is orphaned"
     assert row["sha256"] == b"\x03" * 32
+
+
+async def test_claim_can_leave_a_whole_host_out(pg):
+    """Skipping inside the worker would not be enough. The drain is ordered
+    newest-article-first and a bad host clusters at the head, so the same rows
+    would come back every cycle and the worker would spin on them — or sleep,
+    while thousands of other hosts' images waited behind. The claim has to look
+    past the host entirely."""
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    for position, url in enumerate([
+        "https://bad.example/1.png",
+        "https://bad.example/2.png",
+        "https://good.example/1.png",
+    ]):
+        await pg.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status)
+               VALUES (1, $1, $2, 'pending')""",
+            position, url,
+        )
+
+    claimed = await repo.claim_pending_images(
+        pg, limit=10, cooldown_sec=0, excluded_hosts=["bad.example"]
+    )
+    assert [c.source_url for c in claimed] == ["https://good.example/1.png"]
+
+
+async def test_excluding_nothing_claims_everything(pg):
+    """The common case: no host is in trouble, and the filter must be a no-op."""
+    await pg.execute("INSERT INTO articles (id, title, body, published_at) VALUES (1,'t','b',now())")
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status)
+           VALUES (1, 0, 'https://a.example/1.png', 'pending')"""
+    )
+    assert len(await repo.claim_pending_images(pg, limit=10, cooldown_sec=0, excluded_hosts=[])) == 1

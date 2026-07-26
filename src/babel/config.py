@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     # burns all five attempts inside that minute, and the ceiling is permanent.
     image_retry_cooldown_sec: float = Field(default=3600.0, ge=0)
 
+    # A host that stops answering stops being asked. Consecutive failures, so a
+    # host that merely drops the occasional request is unaffected. Measured live:
+    # i.postimg.cc began stalling for the whole request timeout and took image
+    # capture to 0.04/s, while every other host answered in under a second.
+    host_failure_threshold: int = Field(default=3, ge=1)
+    host_open_sec: float = Field(default=900.0, gt=0)
+
     image_batch_size: int = Field(default=50, ge=1)
     image_idle_sleep_sec: float = Field(default=60.0, gt=0)
     image_disk_full_sleep_sec: float = Field(default=300.0, gt=0)
