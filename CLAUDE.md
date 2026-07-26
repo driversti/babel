@@ -116,6 +116,11 @@ mounts, so `git pull && docker compose build && docker compose up -d <service>` 
 deploy. Restarting is safe at any time — the cursor is persisted and a partial batch is re-walked
 without HTTP.
 
+**The deploy host tracks `main`, and `main` is where work happens.** Phase 1 was built on
+`feat/phase-1-crawler` and fast-forwarded in; that branch is history now. Anything pushed to `main`
+is one `git pull` away from the machine holding the archive, so `uv run pytest` before pushing is
+not a formality.
+
 One query answers "is it healthy", and is worth running first:
 
 ```sql
