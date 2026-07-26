@@ -6,10 +6,11 @@ Two producers feed one rate-limited fetcher: a 15-minute RSS poller picks up new
 articles, and a backfill worker walks article IDs downward from the newest, recording where it
 left off so an interrupted run resumes instead of restarting. Every article page is a single
 request that returns the article, all of its comments, and the URLs of its images in one shot.
-The whole stack runs inside a VPN container's network namespace — there is no network path that
-does not go through the tunnel — and the egress IP is verified at startup and on an interval, so
-a dropped or misconfigured tunnel stops the crawler rather than leaking traffic from the
-operator's own connection.
+Ingest itself only records those image URLs as a `pending` queue; a second, independent service
+(`babel images`) drains that queue at its own rate limit. The whole stack runs inside a VPN
+container's network namespace — there is no network path that does not go through the tunnel —
+and the egress IP is verified at startup and on an interval by both services, so a dropped or
+misconfigured tunnel stops them rather than leaking traffic from the operator's own connection.
 
 See [SPEC.md](SPEC.md) for the design: the measurements taken against the live site (feed
 limits, page structure, article/image volume and sizing) and the phase boundaries. Those numbers
@@ -33,6 +34,9 @@ cp .env.example .env
   detectable
 - `VPN_SERVICE_PROVIDER`, `VPN_TYPE`, `WIREGUARD_PRIVATE_KEY`, `WIREGUARD_ADDRESSES`,
   `SERVER_COUNTRIES` — Gluetun's WireGuard configuration for the VPN tunnel
+- `BOT_TOKEN`, `CHAT_ID` — Telegram bot token and chat ID for alerts. Optional: leave both blank
+  and both services log the two conditions they'd otherwise message about (disk full, egress IP
+  leak) instead of notifying
 
 ## Running
 
@@ -40,8 +44,8 @@ cp .env.example .env
 uv sync                                              # install
 docker compose up -d gluetun db                      # bring up the tunnel and the database
 docker compose run --rm crawler babel migrate        # apply migrations
-docker compose up -d crawler                         # start the long-running service
-docker compose logs -f crawler
+docker compose up -d crawler images                  # start both long-running services
+docker compose logs -f crawler images
 ```
 
 `babel run` starts both producers and the egress watchdog together, and exits — non-zero — the
@@ -53,6 +57,13 @@ than exiting. Pass `--start-id <id>` on the very first run (there is no cursor y
 cursor in `crawl_cursor` picks up where the last run stopped. Use `--no-poll` or `--no-backfill` to
 run only one producer, e.g. `babel run --start-id <id> --no-poll` for a backfill-only pass.
 
+Image capture is a second, independent service. `babel run` only records each article's image
+URLs as `pending` rows — it never fetches image bytes itself. `babel images` drains that queue on
+its own schedule and its own rate limit, sharing the same VPN tunnel (`network_mode:
+"service:gluetun"`) but nothing else in-process. Either service can be stopped, restarted or
+redeployed without touching the other: stopping `images` simply lets the queue build up, and
+`crawler` keeps ingesting articles normally in the meantime.
+
 ## Commands
 
 - `babel probe --newest <id>` — fetch a sample of article pages through the tunnel and report
@@ -60,6 +71,8 @@ run only one producer, e.g. `babel run --start-id <id> --no-poll` for a backfill
   before trusting it with a real run
 - `babel migrate` — apply any pending SQL migrations
 - `babel run [--start-id N] [--no-poll] [--no-backfill]` — run the crawler until stopped
+- `babel images` — drain the image queue until stopped; a separate long-running service from
+  `babel run`, stoppable and restartable independently
 - `babel refetch --ids 123,456` or `babel refetch --from 100 --to 200` — queue already-collected
   articles for re-collection, e.g. after fixing a parser bug or when the site's markup has changed.
   Only `ok` and `error` rows are touched — a `missing` row is a fact about the article, not about
@@ -72,5 +85,5 @@ run only one producer, e.g. `babel run --start-id <id> --no-poll` for a backfill
 ```bash
 uv run pytest             # full suite (needs Docker for testcontainers)
 uv run ruff check src tests
-docker compose build crawler
+docker compose build crawler images
 ```

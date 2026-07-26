@@ -16,11 +16,15 @@ from curl_cffi.requests import AsyncSession
 from babel.config import Settings
 from babel.crawler.backfill import run_backfill
 from babel.crawler.fetcher import curl_getter
+from babel.crawler.hostlimit import HostLimiter
+from babel.crawler.images import ImageTooLarge
+from babel.crawler.imageworker import run_image_worker
 from babel.crawler.ingest import Ingestor
 from babel.crawler.poller import poll_once
 from babel.crawler.ratelimit import RateLimiter
 from babel.db import repo
 from babel.db.migrate import apply_migrations
+from babel.notify import Throttled, build_notifier
 from babel.vpn import IpInfo, IpLeak, check_ip_leak
 
 log = logging.getLogger("babel")
@@ -89,11 +93,67 @@ async def _probe(count: int, newest: int, save_fixtures: int) -> None:
 
 
 def _bytes_getter(session: AsyncSession, timeout_sec: int):
-    async def get_bytes(url: str) -> tuple[int, bytes, str | None]:
-        response = await session.get(url, timeout=timeout_sec)
-        return response.status_code, response.content, response.headers.get("content-type")
+    """Fetch image bytes, abandoning anything past max_bytes.
+
+    Image URLs point at arbitrary author-chosen hosts. Buffering first and
+    checking the size afterwards means one bad URL can exhaust memory on a
+    machine that is also running Postgres.
+    """
+
+    async def get_bytes(url: str, max_bytes: int) -> tuple[int, bytes, str | None]:
+        response = await session.get(url, timeout=timeout_sec, stream=True)
+        try:
+            declared = response.headers.get("content-length")
+            if declared and declared.isdigit() and int(declared) > max_bytes:
+                raise ImageTooLarge(f"{url} declares {declared} bytes")
+            chunks, total = [], 0
+            async for chunk in response.aiter_content():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ImageTooLarge(f"{url} exceeded {max_bytes} bytes")
+                chunks.append(chunk)
+            return response.status_code, b"".join(chunks), response.headers.get("content-type")
+        finally:
+            await response.aclose()
 
     return get_bytes
+
+
+@main.command()
+def images() -> None:
+    """Drain the image queue until stopped."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    asyncio.run(_images())
+
+
+async def _images() -> None:
+    settings = Settings()
+    notifier = Throttled(build_notifier(settings), settings.alert_repeat_sec)
+
+    info = await check_ip_leak(home_country=settings.home_country)
+    log.info("egress %s (%s)", info.ip, info.country)
+
+    pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=4)
+    async with pool.acquire() as conn:
+        await apply_migrations(conn, MIGRATIONS)
+
+    limiter = RateLimiter(settings.image_requests_per_second)
+    async with AsyncSession(impersonate="chrome") as session:
+        await asyncio.gather(
+            _watch_egress(
+                lambda: check_ip_leak(home_country=settings.home_country),
+                settings.ip_check_interval_sec,
+                notifier,
+            ),
+            run_image_worker(
+                pool,
+                _bytes_getter(session, settings.request_timeout_sec),
+                limiter,
+                HostLimiter(),
+                notifier,
+                settings,
+            ),
+        )
 
 
 @main.command()
@@ -124,6 +184,7 @@ def run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
 
 async def _run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
     settings = Settings()
+    notifier = Throttled(build_notifier(settings), settings.alert_repeat_sec)
 
     info = await check_ip_leak(home_country=settings.home_country)
     log.info("egress %s (%s)", info.ip, info.country)
@@ -141,7 +202,6 @@ async def _run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
         ingestor = Ingestor(
             pool,
             curl_getter(session, settings.request_timeout_sec),
-            _bytes_getter(session, settings.request_timeout_sec),
             limiter,
             settings,
         )
@@ -155,7 +215,9 @@ async def _run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
 
         egress_check = functools.partial(check_ip_leak, home_country=settings.home_country)
         tasks = [
-            asyncio.create_task(_watch_egress(egress_check, settings.ip_check_interval_sec))
+            asyncio.create_task(
+                _watch_egress(egress_check, settings.ip_check_interval_sec, notifier)
+            )
         ]
         if not no_poll:
             tasks.append(asyncio.create_task(_poll_forever(pool, ingestor, fetch_rss, settings)))
@@ -176,17 +238,23 @@ async def _run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
 
 
 async def _watch_egress(
-    check: Callable[[], Awaitable[IpInfo]], interval_sec: float
+    check: Callable[[], Awaitable[IpInfo]],
+    interval_sec: float,
+    notifier: Throttled | None = None,
 ) -> None:
     """Poll egress IP on an interval.
 
     ``check`` and ``interval_sec`` are injected (rather than read from
     ``Settings`` inside the loop) so this is testable without a network or a
     real clock; production passes a `check_ip_leak` call bound to `Settings`.
+    ``notifier`` is optional so the unit tests below, which only care about
+    the retry/exit logic, do not need to construct one.
 
     `IpLeak` means the egress IP reported the operator's home country and is
     fatal on the very first occurrence — never retried, because a confirmed
-    leak is a reason to stop, not to wait.
+    leak is a reason to stop, not to wait. The spec has always called for
+    "log, alert and exit" here; an operator asleep when the tunnel fails
+    should not learn about it only from a dead container hours later.
 
     A bare `RuntimeError` out of `check` means every IP-info provider failed
     to answer after `check_ip_leak`'s own internal retries — those providers
@@ -203,8 +271,10 @@ async def _watch_egress(
         await asyncio.sleep(interval_sec)
         try:
             await check()
-        except IpLeak:
+        except IpLeak as e:
             log.exception("egress IP is in the home country — stopping")
+            if notifier is not None:
+                await notifier.send_once("egress-leak", f"babel: egress IP leak detected — {e}")
             raise
         except RuntimeError as e:
             consecutive_failures += 1

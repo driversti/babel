@@ -64,3 +64,18 @@ services:
       gluetun: {condition: service_healthy}
       db: {condition: service_healthy}
     restart: unless-stopped
+
+  images:
+    build: .
+    container_name: babel-images
+    command: ["babel", "images"]
+    env_file: .env
+    volumes:
+      - ${IMAGE_ROOT_HOST:-./data/images}:/data/images
+    # Same tunnel as the crawler. Image hosts are not eRepublik, but going
+    # direct would expose the operator's address to save nothing.
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun: {condition: service_healthy}
+      db: {condition: service_healthy}
+    restart: unless-stopped

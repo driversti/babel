@@ -8,11 +8,11 @@ expensive to obtain; do not re-derive them, and update them there if the site ch
 
 ## Status
 
-Phase 1 — crawler. All ten tasks are implemented: config, article/comment parser, DB schema +
-migration runner, repository layer, rate limiter + fetcher, content-addressed image store,
-end-to-end article ingest, RSS poller, newest-first backfill walker, and the CLI/service that
-composes them (`src/babel/cli.py`). 114 tests, all passing (`uv run pytest`, needs Docker for the
-`postgres:17` testcontainer); `uv run ruff check src tests` clean.
+Phase 1 — crawler. All ten original tasks are implemented: config, article/comment parser, DB
+schema + migration runner, repository layer, rate limiter + fetcher, content-addressed image
+store, end-to-end article ingest, RSS poller, newest-first backfill walker, and the CLI/service
+that composes them (`src/babel/cli.py`). 136 tests, all passing (`uv run pytest`, needs Docker for
+the `postgres:17` testcontainer); `uv run ruff check src tests` clean.
 
 **The probe has passed.** 100 article IDs fetched through a VPN tunnel from the target host:
 85 ok, 15 missing, zero Cloudflare challenges. Anonymous access from a VPN exit works.
@@ -23,10 +23,21 @@ article has been stored. **C1 and I4 from the whole-branch review are closed** �
 walk/sweep/idle loop instead of returning, `fetch_log` gained a `stale` status, and
 `babel refetch --ids/--from/--to` lets an operator queue already-collected articles for
 re-collection by hand. The service is expected to run indefinitely; reaching article 1 is not an
-end state, it just means the loop spends more time sweeping and idling. Still open: I1 (`pending`
-image rows stranded by an unclean shutdown), I2 (images share eRepublik's rate limit, ~7× the
-spec's crawl estimate), I6 (image bodies buffered before the size cap) — addressed by the image-
-worker plan, not this one.
+end state, it just means the loop spends more time sweeping and idling.
+
+**Image capture is now its own service, and I1/I2/I6 are closed.** `article_images` is a
+drainable queue (`pending`/`error` rows), not a side effect of ingest: `babel run` only records
+image URLs, and `babel images` — a second long-running process, `docker compose`'s `images`
+service — claims batches newest-first, retries transiently-failed rows up to a ceiling, and
+pauses (with a throttled alert) rather than touching the queue when free disk drops below the
+floor. That closes I1 (nothing is stranded by an unclean shutdown — an unfinished row is just
+still `pending`), I2 (images now run at their own configurable rate, `image_requests_per_second`,
+independent of the article crawl), and I6 (the streaming `_bytes_getter` in `cli.py` aborts a
+download via `ImageTooLarge` as soon as it passes `max_bytes`, and rejects early on an
+over-large `Content-Length`, so a hostile or oversized image can no longer be buffered whole in
+memory). The egress watchdog (`_watch_egress`) now alerts through the same Telegram notifier
+before it re-raises on `IpLeak`, in both `babel run` and `babel images` — the spec has called for
+"log, alert and exit" since the first commit.
 
 **Runs on the x86_64 host, not the Jetson.** The Tegra kernel lacks `CONFIG_IP_ADVANCED_ROUTER`,
 so `ip rule` is unavailable and gluetun cannot start there at all. Details in `SPEC.md` under
@@ -46,9 +57,13 @@ so `ip rule` is unavailable and gluetun cannot start there at all. Details in `S
 - `uv sync` — install
 - `uv run pytest` — tests (needs Docker for testcontainers)
 - `uv run ruff check src tests` — lint
-- `docker compose up -d` — run the stack
+- `docker compose up -d` — run the stack, including both long-running services, `crawler` and
+  `images`
 - `docker compose run --rm crawler babel migrate` — apply migrations
 - `docker compose run --rm crawler babel probe --newest <id>` — check the exit node is not challenged
 - `docker compose run --rm crawler babel refetch --ids 123,456` or
   `babel refetch --from 100 --to 200` — queue already-collected articles for re-collection after a
   parser fix or a markup change; the running service's sweep phase picks them up on its own
+- `babel images` — drain the `article_images` queue until stopped; runs as the separate `images`
+  compose service, stoppable/restartable independently of `crawler` since ingest only enqueues
+  image URLs and never fetches the bytes itself
