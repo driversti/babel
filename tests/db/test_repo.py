@@ -107,50 +107,47 @@ async def test_image_blob_is_deduplicated_by_hash(pg):
 
 
 async def test_resaving_article_does_not_resurrect_dead_image_status(pg):
-    """A re-parse of an article must not undo a 'dead' verdict on its images.
+    """A re-parse must not undo a 'dead' verdict on the same image.
 
     `save_article`'s ON CONFLICT clause on `article_images` deliberately omits
-    `status` from the DO UPDATE SET list, so a slot that a worker already marked
-    'dead' (with sha256 cleared) stays 'dead' when the article is saved again.
-    This is intentional and irreversible-by-design: once we know a link is dead,
-    a later re-save has no way to tell whether the image came back, and
-    overwriting the verdict back to 'pending' would silently throw that
-    knowledge away, sending the crawler to re-check a link that already proved
-    dead. A regression that adds `status = EXCLUDED.status` to the upsert would
-    make this test fail while leaving every other test in this suite green.
+    `status` from the DO UPDATE SET list, so a row a worker already marked 'dead'
+    (with sha256 cleared) stays 'dead' when the article is saved again. Once we
+    know a link is dead, a later re-save has no way to tell whether it came back,
+    and overwriting the verdict to 'pending' would throw that knowledge away.
 
-    `source_url`, by contrast, IS in the DO UPDATE SET list on purpose, so this
-    test also pins that a changed URL for the same slot does get applied on
-    re-save -- confirming the upsert still does its job for the column it is
-    supposed to touch, not just the one it must leave alone.
+    This is safe only because the row is keyed on `source_url`. The earlier
+    version of this test re-saved the article with a DIFFERENT url at the same
+    position and asserted the 'dead' verdict carried over — which was not a
+    guarantee worth having but I8 itself, written down as the contract: a URL
+    that had never been fetched, wearing another image's verdict. A different URL
+    is a different image and now gets its own row, fresh.
     """
     article = make_article()
     await repo.save_article(pg, article)
-
-    # Move the slot off 'pending' the way the image worker would after
-    # discovering the source link is gone. sha256=None models "we looked and
-    # there is nothing to hash" -- the case whose loss is unrecoverable.
     await repo.record_image(pg, article.id, 0, article.images[0].source_url, "dead", sha256=None)
+
     row = await pg.fetchrow(
-        "SELECT status, sha256 FROM article_images WHERE article_id = $1 AND position = 0",
-        article.id,
+        "SELECT status, sha256 FROM article_images WHERE article_id = $1 AND source_url = $2",
+        article.id, article.images[0].source_url,
     )
     assert row["status"] == "dead"
     assert row["sha256"] is None
 
-    # Re-save the same article (as a re-crawl/re-parse would), but with the
-    # image's source_url changed, to prove the upsert still updates the column
-    # it is meant to update.
-    updated = make_article(images=(ImageRef(position=0, source_url="https://x.example/b.png"),))
-    await repo.save_article(pg, updated)
+    # Re-saving the same article, unchanged, must not disturb the verdict.
+    await repo.save_article(pg, make_article(title="Corrected"))
+    assert await pg.fetchval(
+        "SELECT status FROM article_images WHERE article_id = $1 AND source_url = $2",
+        article.id, article.images[0].source_url,
+    ) == "dead", "status must survive a re-save, or a dead link looks pending again"
 
-    row = await pg.fetchrow(
-        "SELECT status, sha256, source_url FROM article_images WHERE article_id = $1 AND position = 0",
-        article.id,
+    # A different URL is a different image: its own row, its own fresh verdict.
+    await repo.save_article(
+        pg, make_article(images=(ImageRef(position=0, source_url="https://x.example/b.png"),))
     )
-    assert row["status"] == "dead", "status must survive a re-save, or a dead link looks pending again"
-    assert row["sha256"] is None
-    assert row["source_url"] == "https://x.example/b.png"
+    assert await pg.fetchval(
+        "SELECT status FROM article_images WHERE article_id = $1 AND source_url = $2",
+        article.id, "https://x.example/b.png",
+    ) == "pending"
 
 
 async def test_duplicate_comment_ids_in_one_save_are_silently_deduped(pg):
@@ -306,8 +303,8 @@ async def test_claim_excludes_terminal_statuses(pg):
     for position, status in enumerate(["pending", "ok", "dead", "error"]):
         await pg.execute(
             """INSERT INTO article_images (article_id, position, source_url, status)
-               VALUES (1, $1, 'https://x.example/a.png', $2)""",
-            position, status,
+               VALUES (1, $1, $2, $3)""",
+            position, f"https://x.example/{position}.png", status,
         )
     claimed = await repo.claim_pending_images(pg, limit=10, cooldown_sec=0)
     assert [c.position for c in claimed] == [0, 3]
@@ -334,8 +331,8 @@ async def test_claim_respects_the_limit(pg):
     for position in range(5):
         await pg.execute(
             """INSERT INTO article_images (article_id, position, source_url, status)
-               VALUES (1, $1, 'https://x.example/a.png', 'pending')""",
-            position,
+               VALUES (1, $1, $2, 'pending')""",
+            position, f"https://x.example/{position}.png",
         )
     assert len(await repo.claim_pending_images(pg, limit=2, cooldown_sec=0)) == 2
 
@@ -346,12 +343,12 @@ async def test_record_result_sets_status_and_bumps_attempts(pg):
         """INSERT INTO article_images (article_id, position, source_url, status)
            VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
     )
-    await repo.record_image_result(pg, 1, 0, "error")
+    await repo.record_image_result(pg, 1, "https://x.example/a.png", "error")
     row = await pg.fetchrow("SELECT status, attempts FROM article_images WHERE article_id = 1")
     assert row["status"] == "error"
     assert row["attempts"] == 1
 
-    await repo.record_image_result(pg, 1, 0, "error")
+    await repo.record_image_result(pg, 1, "https://x.example/a.png", "error")
     row = await pg.fetchrow("SELECT status, attempts FROM article_images WHERE article_id = 1")
     assert row["attempts"] == 2
 
@@ -364,7 +361,7 @@ async def test_an_errored_row_is_reclaimed_below_the_ceiling(pg):
         """INSERT INTO article_images (article_id, position, source_url, status)
            VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
     )
-    await repo.record_image_result(pg, 1, 0, "error")
+    await repo.record_image_result(pg, 1, "https://x.example/a.png", "error")
     assert [c.position for c in await repo.claim_pending_images(pg, limit=10, cooldown_sec=0)] == [0]
 
 
@@ -408,7 +405,7 @@ async def test_a_dead_row_is_never_reclaimed(pg):
         """INSERT INTO article_images (article_id, position, source_url, status)
            VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
     )
-    await repo.record_image_result(pg, 1, 0, "dead")
+    await repo.record_image_result(pg, 1, "https://x.example/a.png", "dead")
     assert await repo.claim_pending_images(pg, limit=10, cooldown_sec=0) == []
 
 
@@ -421,7 +418,7 @@ async def test_a_just_failed_image_waits_out_the_cooldown(pg):
         """INSERT INTO article_images (article_id, position, source_url, status)
            VALUES (1, 0, 'https://x.example/a.png', 'pending')"""
     )
-    await repo.record_image_result(pg, 1, 0, "error")
+    await repo.record_image_result(pg, 1, "https://x.example/a.png", "error")
 
     assert await repo.claim_pending_images(pg, limit=10, cooldown_sec=3600) == []
     assert [c.position for c in await repo.claim_pending_images(pg, limit=10, cooldown_sec=0)] == [0]
@@ -488,3 +485,76 @@ async def test_comments_deleted_upstream_are_kept_not_pruned(pg):
     assert await pg.fetchval("SELECT count(*) FROM comments WHERE article_id = 1") == 2, (
         "comment 2 no longer appears upstream; that is exactly why it is archived"
     )
+
+
+async def test_a_shifted_position_cannot_inherit_another_images_verdict(pg):
+    """I8. Positions are ordinal within the body, so inserting one image at the
+    top shifts every later slot by one.
+
+    While the row was keyed on (article_id, position), that shift handed each
+    slot a new URL welded to the previous image's status and sha256 — 'ok' with
+    the hash of a different image, for a URL that was never fetched. Nothing can
+    detect it afterwards: the queue excludes 'ok' and 'dead', and `articles.body`
+    is markup-stripped, so source_url is the only record of the URLs there were.
+    """
+    first = make_article(images=(ImageRef(position=0, source_url="https://x.example/a.png"),))
+    await repo.save_article(pg, first)
+    await repo.save_image_blob(pg, b"\x02" * 32, "image/png", 10)
+    await repo.record_image_result(pg, first.id, "https://x.example/a.png", "ok", b"\x02" * 32)
+
+    # The author adds a banner above the existing image; a.png is now position 1.
+    shifted = make_article(
+        images=(
+            ImageRef(position=0, source_url="https://x.example/banner.png"),
+            ImageRef(position=1, source_url="https://x.example/a.png"),
+        )
+    )
+    await repo.save_article(pg, shifted)
+
+    rows = {
+        r["source_url"]: r
+        for r in await pg.fetch(
+            "SELECT source_url, status, sha256 FROM article_images WHERE article_id = $1", first.id
+        )
+    }
+    assert rows["https://x.example/banner.png"]["status"] == "pending", (
+        "a URL never fetched must not inherit a verdict"
+    )
+    assert rows["https://x.example/banner.png"]["sha256"] is None, (
+        "and must certainly not inherit another image's bytes"
+    )
+    assert rows["https://x.example/a.png"]["status"] == "ok", "the captured image keeps its blob"
+    assert rows["https://x.example/a.png"]["sha256"] == b"\x02" * 32
+
+
+async def test_one_image_used_many_times_in_an_article_is_fetched_once(pg):
+    """Newspaper-style articles repeat a divider between sections. Keyed on
+    position that was one queue row and one fetch per occurrence; measured at
+    12,720 redundant rows, 43% of the live queue."""
+    divider = "https://x.example/divider.png"
+    article = make_article(
+        images=tuple(ImageRef(position=i, source_url=divider) for i in range(7))
+    )
+    await repo.save_article(pg, article)
+    assert await pg.fetchval(
+        "SELECT count(*) FROM article_images WHERE article_id = $1", article.id
+    ) == 1
+
+
+async def test_an_image_the_author_removed_keeps_its_captured_bytes(pg):
+    """Same rule as comments: the archive holds what the source no longer does."""
+    article = make_article(images=(ImageRef(position=0, source_url="https://x.example/gone.png"),))
+    await repo.save_article(pg, article)
+    await repo.save_image_blob(pg, b"\x03" * 32, "image/png", 10)
+    await repo.record_image_result(pg, article.id, "https://x.example/gone.png", "ok", b"\x03" * 32)
+
+    await repo.save_article(
+        pg, make_article(images=(ImageRef(position=0, source_url="https://x.example/new.png"),))
+    )
+
+    row = await pg.fetchrow(
+        "SELECT status, sha256 FROM article_images WHERE article_id = $1 AND source_url = $2",
+        article.id, "https://x.example/gone.png",
+    )
+    assert row is not None, "the row must survive, or the stored blob is orphaned"
+    assert row["sha256"] == b"\x03" * 32

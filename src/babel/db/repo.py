@@ -88,15 +88,21 @@ async def save_article(conn: asyncpg.Connection, article: Article) -> None:
                 ],
             )
 
-        # Image slots start as 'pending'; the image worker moves them to ok/dead/
-        # skipped_no_space. Existing rows keep their status so a re-parse does not
-        # discard the knowledge that a link was already dead.
+        # Image rows start as 'pending'; the worker moves them to ok/dead/error.
+        # Existing rows keep their status, so a re-parse does not discard the
+        # knowledge that a link was already dead — and that is safe only because
+        # the row is keyed on the URL. Keyed on position, as it was, a single
+        # image added at the top shifted every later slot and handed each one a
+        # new URL wearing the previous image's verdict and hash. See migration
+        # 004. Position is now just where the image first appears, and orders the
+        # drain. A row whose URL vanished from the article is left alone: the
+        # blob is stored, and the archive keeps what the source no longer shows.
         if article.images:
             await conn.executemany(
                 """INSERT INTO article_images (article_id, position, source_url, status)
                    VALUES ($1,$2,$3,'pending')
-                   ON CONFLICT (article_id, position) DO UPDATE
-                       SET source_url = EXCLUDED.source_url""",
+                   ON CONFLICT (article_id, source_url) DO UPDATE
+                       SET position = LEAST(article_images.position, EXCLUDED.position)""",
                 [(article.id, i.position, i.source_url) for i in article.images],
             )
 
@@ -223,7 +229,7 @@ async def record_image(
     await conn.execute(
         """INSERT INTO article_images (article_id, position, source_url, sha256, status, checked_at)
            VALUES ($1,$2,$3,$4,$5, now())
-           ON CONFLICT (article_id, position) DO UPDATE SET
+           ON CONFLICT (article_id, source_url) DO UPDATE SET
                sha256 = EXCLUDED.sha256, status = EXCLUDED.status, checked_at = now()""",
         article_id, position, source_url, sha256, status,
     )
@@ -336,14 +342,19 @@ async def stuck_image_hosts(conn: asyncpg.Connection, limit: int) -> list[tuple[
 async def record_image_result(
     conn: asyncpg.Connection,
     article_id: int,
-    position: int,
+    source_url: str,
     status: str,
     sha256: bytes | None = None,
 ) -> None:
-    """Set an image slot's outcome and count the attempt."""
+    """Set an image's outcome and count the attempt.
+
+    Addressed by URL, not position: the worker may be recording a result long
+    after a re-parse moved that image within the article, and position is not
+    identity. See migration 004.
+    """
     await conn.execute(
         """UPDATE article_images
            SET status = $3, sha256 = $4, attempts = attempts + 1, checked_at = now()
-           WHERE article_id = $1 AND position = $2""",
-        article_id, position, status, sha256,
+           WHERE article_id = $1 AND source_url = $2""",
+        article_id, source_url, status, sha256,
     )

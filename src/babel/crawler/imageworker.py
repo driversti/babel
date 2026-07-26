@@ -121,10 +121,10 @@ async def _capture_one(pool, get_bytes, limiter, host_limiter, settings, item) -
 
     async with pool.acquire() as conn:
         if outcome is None:
-            await repo.record_image_result(conn, item.article_id, item.position, "error")
+            await repo.record_image_result(conn, item.article_id, item.source_url, "error")
             return
         if outcome.digest is not None:
             await repo.save_image_blob(conn, outcome.digest, outcome.mime, outcome.size)
         await repo.record_image_result(
-            conn, item.article_id, item.position, outcome.status, outcome.digest
+            conn, item.article_id, item.source_url, outcome.status, outcome.digest
         )
