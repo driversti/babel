@@ -32,3 +32,4 @@ db_data/
 scratch/
 *.html
 !tests/fixtures/**/*.html
+.superpowers/
