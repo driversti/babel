@@ -2335,22 +2335,27 @@ from babel.web.cursor import (
 )
 
 _STATS_TTL_SEC = 300
-_stats_cache: tuple[float, browse.ArchiveStats] | None = None
 
 
-async def _stats(conn) -> browse.ArchiveStats:
+async def _stats(app, conn) -> browse.ArchiveStats:
     """Archive-wide totals, on a five-minute clock.
 
     The span is two index-only limits and costs nothing; the count is a heap
     scan at 2.8M rows, which is why this is cached rather than computed per
     request.
+
+    The cache lives on app.state, not in a module global. A module global
+    outlives the app that filled it, and the tests build one app per test
+    against a fresh database — the second test would read the first one's
+    numbers. It is also simply the truthful scope: the cache belongs to a
+    running service, not to an imported module.
     """
-    global _stats_cache
+    cached: tuple[float, browse.ArchiveStats] | None = getattr(app.state, "stats_cache", None)
     now = time.monotonic()
-    if _stats_cache is not None and now - _stats_cache[0] < _STATS_TTL_SEC:
-        return _stats_cache[1]
+    if cached is not None and now - cached[0] < _STATS_TTL_SEC:
+        return cached[1]
     stats = await browse.archive_stats(conn)
-    _stats_cache = (now, stats)
+    app.state.stats_cache = (now, stats)
     return stats
 
 
@@ -2390,7 +2395,7 @@ def register_routes(app: FastAPI) -> None:
                 conn, filters, order=order, cursor=cursor, going=going
             )
             countries = await browse.list_countries(conn)
-            stats = await _stats(conn)
+            stats = await _stats(app, conn)
             suggestions: tuple[str, ...] = ()
             if filters.author and not page.rows:
                 suggestions = await browse.suggest_authors(conn, filters.author)
@@ -2686,7 +2691,7 @@ Add to `register_routes` in `src/babel/web/routes.py`:
             detail = await browse.get_article(conn, article_id)
             if detail is None:
                 status = await browse.fetch_log_status(conn, article_id)
-                stats = await _stats(conn)
+                stats = await _stats(app, conn)
                 return templates.TemplateResponse(
                     request=request,
                     name="error.html",
