@@ -1,0 +1,46 @@
+"""Settings loaded from environment / .env.
+
+Nothing here may carry a real credential, hostname or country: this repository
+is public, and the whole point of the VPN requirement is not publishing where
+the operator lives. Defaults are placeholders.
+"""
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BASE_URL = "https://www.erepublik.com"
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
+    )
+
+    database_url: str = Field(default="postgresql://babel:babel@localhost:5432/babel")
+
+    # Two-letter ISO code of the operator's own country. The crawler refuses to
+    # run if the egress IP reports this, which is what makes a VPN failure loud.
+    home_country: str = Field(default="XX", min_length=2, max_length=2)
+    gluetun_api_url: str = Field(default="http://localhost:8000")
+
+    requests_per_second: float = Field(default=1.0, gt=0, le=20)
+    request_timeout_sec: int = Field(default=20, ge=1)
+    max_attempts: int = Field(default=3, ge=1)
+
+    # The article page takes comments-per-page in the URL; 1000 returns every
+    # comment in the same response as the article. No article has come close.
+    comments_per_page: int = Field(default=1000, ge=1)
+
+    image_root: str = Field(default="./data/images")
+    min_free_bytes: int = Field(default=20 * 1024**3, ge=0)
+    max_image_bytes: int = Field(default=8 * 1024**2, ge=1)
+
+    poll_interval_sec: int = Field(default=900, ge=60)
+    rss_pages: int = Field(default=5, ge=1, le=5)
+    ip_check_interval_sec: int = Field(default=900, ge=60)
+
+    def article_url(self, article_id: int) -> str:
+        return f"{BASE_URL}/en/article/{article_id}/1/{self.comments_per_page}"
+
+    def rss_url(self, page: int) -> str:
+        return f"{BASE_URL}/en/main/news/latest/all/all/{page}/rss"

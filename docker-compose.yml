@@ -1,0 +1,63 @@
+services:
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: babel-gluetun
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER}
+      - VPN_TYPE=${VPN_TYPE:-wireguard}
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES}
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES}
+      - TZ=America/Los_Angeles
+      - HTTP_CONTROL_SERVER_ADDRESS=:8000
+      - HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={"auth":"none"}
+      # Lets the crawler reach Postgres on the Docker bridge without leaving
+      # the tunnel. Without this the shared namespace cannot see the database.
+      - FIREWALL_OUTBOUND_SUBNETS=172.16.0.0/12
+    volumes:
+      - ./gluetun:/gluetun
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "https://www.erepublik.com"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  db:
+    image: postgres:17
+    container_name: babel-db
+    environment:
+      - POSTGRES_USER=babel
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-babel}
+      - POSTGRES_DB=babel
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U babel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  crawler:
+    build: .
+    container_name: babel-crawler
+    env_file: .env
+    volumes:
+      - ${IMAGE_ROOT_HOST:-./data/images}:/data/images
+      # So `babel probe --save-fixtures` writes onto the host, not into a
+      # layer that vanishes with the container.
+      - ./tests/fixtures:/app/tests/fixtures
+    # No network stack of its own. If gluetun dies, this container has no
+    # network — a leak is impossible rather than merely detected.
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun: {condition: service_healthy}
+      db: {condition: service_healthy}
+    restart: unless-stopped
