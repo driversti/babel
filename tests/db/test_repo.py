@@ -180,3 +180,68 @@ async def test_duplicate_comment_ids_in_one_save_are_silently_deduped(pg):
     assert rows[0]["id"] == dup_id
     assert rows[0]["author_name"] == "someone"
     assert rows[0]["body"] == "first copy"
+
+
+async def test_claim_retryable_returns_errors_and_stale_newest_first(pg):
+    await repo.record_fetch(pg, 100, "error", "boom")
+    await repo.record_fetch(pg, 300, "ok")
+    await pg.execute("UPDATE fetch_log SET status = 'stale' WHERE article_id = 300")
+    await repo.record_fetch(pg, 200, "error", "boom")
+    assert await repo.claim_retryable(pg, limit=10, cooldown_sec=0) == [300, 200, 100]
+
+
+async def test_claim_retryable_ignores_ok_and_missing(pg):
+    await repo.record_fetch(pg, 1, "ok")
+    await repo.record_fetch(pg, 2, "missing")
+    assert await repo.claim_retryable(pg, limit=10, cooldown_sec=0) == []
+
+
+async def test_claim_retryable_respects_the_attempt_ceiling(pg):
+    for _ in range(repo.MAX_FETCH_ATTEMPTS):
+        await repo.record_fetch(pg, 1, "error", "boom")
+    await repo.record_fetch(pg, 2, "error", "boom")
+    assert await repo.claim_retryable(pg, limit=10, cooldown_sec=0) == [2]
+
+
+async def test_claim_retryable_honours_the_cooldown(pg):
+    await repo.record_fetch(pg, 1, "error", "boom")
+    # Just written, so updated_at is now: a one-hour cooldown must exclude it.
+    assert await repo.claim_retryable(pg, limit=10, cooldown_sec=3600) == []
+    await pg.execute(
+        "UPDATE fetch_log SET updated_at = now() - interval '2 hours' WHERE article_id = 1"
+    )
+    assert await repo.claim_retryable(pg, limit=10, cooldown_sec=3600) == [1]
+
+
+async def test_claim_retryable_respects_the_limit(pg):
+    for article_id in range(1, 6):
+        await repo.record_fetch(pg, article_id, "error", "boom")
+    assert len(await repo.claim_retryable(pg, limit=2, cooldown_sec=0)) == 2
+
+
+async def test_mark_stale_resets_status_and_attempts(pg):
+    await repo.record_fetch(pg, 1, "ok")
+    await repo.record_fetch(pg, 1, "ok")  # attempts now 2
+    assert await repo.mark_stale(pg, [1]) == 1
+    row = await pg.fetchrow("SELECT status, attempts FROM fetch_log WHERE article_id = 1")
+    assert row["status"] == "stale"
+    assert row["attempts"] == 0
+
+
+async def test_mark_stale_makes_a_collected_article_retryable_again(pg):
+    await repo.record_fetch(pg, 1, "ok")
+    assert await repo.claim_retryable(pg, limit=10, cooldown_sec=0) == []
+    await repo.mark_stale(pg, [1])
+    assert await repo.claim_retryable(pg, limit=10, cooldown_sec=0) == [1]
+
+
+async def test_mark_stale_ignores_ids_that_were_never_fetched(pg):
+    # Nothing to re-collect: the walk will reach them on its own.
+    assert await repo.mark_stale(pg, [999]) == 0
+
+
+async def test_mark_stale_leaves_missing_rows_alone(pg):
+    # A 404 is a fact about the article, not about our collection of it.
+    await repo.record_fetch(pg, 1, "missing")
+    assert await repo.mark_stale(pg, [1]) == 0
+    assert await pg.fetchval("SELECT status FROM fetch_log WHERE article_id = 1") == "missing"

@@ -26,7 +26,7 @@
 
 ```
 babel/
-├── migrations/002_image_queue.sql        attempts column, status backfill
+├── migrations/003_image_queue.sql        attempts column, status backfill
 ├── src/babel/
 │   ├── config.py                         MODIFY — image rate, telegram, sleep intervals
 │   ├── notify.py                         NEW — Telegram, with a null implementation
@@ -48,7 +48,7 @@ Responsibility split: `imageworker.py` owns the loop and the disk decision; `ima
 ### Task 1: Queue schema and repository access
 
 **Files:**
-- Create: `babel/migrations/002_image_queue.sql`
+- Create: `babel/migrations/003_image_queue.sql`
 - Modify: `babel/src/babel/db/repo.py`
 - Modify: `babel/tests/db/test_repo.py`
 
@@ -57,7 +57,7 @@ Responsibility split: `imageworker.py` owns the loop and the disk decision; `ima
 
 - [ ] **Step 1: Write the migration**
 
-`babel/migrations/002_image_queue.sql`:
+`babel/migrations/003_image_queue.sql`:
 
 ```sql
 ALTER TABLE article_images ADD COLUMN attempts smallint NOT NULL DEFAULT 0;
@@ -244,7 +244,7 @@ Expected: all pass, including the 7 new ones
 - [ ] **Step 6: Commit**
 
 ```bash
-git add migrations/002_image_queue.sql src/babel/db/repo.py tests/db/test_repo.py
+git add migrations/003_image_queue.sql src/babel/db/repo.py tests/db/test_repo.py
 git commit -m "Turn article_images into a drainable queue"
 ```
 

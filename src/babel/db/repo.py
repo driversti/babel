@@ -20,6 +20,9 @@ from babel.models import Article
 # letting a truly bad ID fall out of rotation.
 MAX_FETCH_ATTEMPTS = 5
 
+# 'ok' and 'missing' are answers. 'error' and 'stale' are unfinished business.
+RETRYABLE_STATUSES = ("error", "stale")
+
 
 async def save_article(conn: asyncpg.Connection, article: Article) -> None:
     """Insert or replace an article together with its comments and image slots."""
@@ -123,6 +126,44 @@ async def filter_unseen(
     )
     seen = {r["article_id"] for r in rows}
     return [i for i in ids if i not in seen]
+
+
+async def claim_retryable(conn: asyncpg.Connection, limit: int, cooldown_sec: int) -> list[int]:
+    """Article IDs worth another attempt, newest first.
+
+    The cooldown matters more than it looks. Without it, a host having a bad
+    minute burns all five of an article's attempts inside that minute and the
+    article is then written off permanently.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT article_id FROM fetch_log
+        WHERE status = ANY($1::text[])
+          AND attempts < $2
+          AND updated_at <= now() - make_interval(secs => $3)
+        ORDER BY article_id DESC
+        LIMIT $4
+        """,
+        list(RETRYABLE_STATUSES), MAX_FETCH_ATTEMPTS, cooldown_sec, limit,
+    )
+    return [r["article_id"] for r in rows]
+
+
+async def mark_stale(conn: asyncpg.Connection, article_ids: Sequence[int]) -> int:
+    """Queue already-collected articles for re-collection. Returns rows changed.
+
+    Only touches 'ok' and 'error' rows. A 'missing' row records a fact about the
+    article rather than about our copy of it, and an ID with no row at all will
+    be reached by the walk anyway.
+    """
+    if not article_ids:
+        return 0
+    result = await conn.execute(
+        """UPDATE fetch_log SET status = 'stale', attempts = 0, updated_at = now()
+           WHERE article_id = ANY($1::bigint[]) AND status IN ('ok', 'error')""",
+        list(article_ids),
+    )
+    return int(result.split()[-1])
 
 
 async def save_image_blob(
