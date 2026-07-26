@@ -37,6 +37,19 @@ def parse_rss_ids(xml: str) -> list[int]:
     return ids
 
 
+async def newest_article_id(fetch_rss: RssFetcher) -> int:
+    """The highest article ID the feed currently advertises.
+
+    This is where a fresh backfill starts. `max` rather than the first entry:
+    the feed is newest-first in practice, but relying on that would silently
+    skip everything above the first item the one time it is not.
+    """
+    ids = parse_rss_ids(await fetch_rss(1))
+    if not ids:
+        raise ValueError("the RSS feed returned no article IDs, so there is no start to pick")
+    return max(ids)
+
+
 async def poll_once(
     conn: asyncpg.Connection, ingest: Ingest, fetch_rss: RssFetcher, pages: int
 ) -> list[int]:

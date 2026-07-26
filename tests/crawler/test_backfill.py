@@ -54,7 +54,10 @@ async def test_skips_ids_already_recorded(pg):
     assert seen == [100, 97]
 
 
-async def test_start_id_is_required_when_there_is_no_cursor(pg):
+async def test_a_start_is_required_when_there_is_no_cursor_and_no_way_to_find_one(pg):
+    """A caller that supplies neither a start nor a way to discover one is a
+    programming error, not an operator one, and must still be loud."""
+
     async def ingest(article_id: int) -> str:
         return "ok"
 
@@ -64,6 +67,73 @@ async def test_start_id_is_required_when_there_is_no_cursor(pg):
         assert "start_id" in str(e)
     else:
         raise AssertionError("expected ValueError")
+
+
+async def test_discovers_a_start_when_no_cursor_is_stored(pg):
+    """A fresh database must not need operator surgery.
+
+    The first real deployment crash-looped under `restart: unless-stopped`
+    because `babel run` takes no --start-id and the backfill refused to guess.
+    It was unblocked by hand-inserting a crawl_cursor row.
+    """
+    seen: list[int] = []
+
+    async def ingest(article_id: int) -> str:
+        seen.append(article_id)
+        await repo.record_fetch(pg, article_id, "ok")
+        return "ok"
+
+    async def discover() -> int:
+        return 100
+
+    await run_backfill(pg, ingest, discover_start=discover, stop_at=98, batch_size=1,
+                       sleep=noop_sleep, max_cycles=3)
+    assert seen == [100, 99, 98]
+    assert await repo.get_cursor(pg, "backfill") == 97
+
+
+async def test_an_explicit_start_id_beats_discovery(pg):
+    """--start-id is the operator overriding the default, so it must win."""
+    seen: list[int] = []
+    discovered = False
+
+    async def ingest(article_id: int) -> str:
+        seen.append(article_id)
+        await repo.record_fetch(pg, article_id, "ok")
+        return "ok"
+
+    async def discover() -> int:
+        nonlocal discovered
+        discovered = True
+        return 500
+
+    await run_backfill(pg, ingest, start_id=100, discover_start=discover, stop_at=99,
+                       batch_size=1, sleep=noop_sleep, max_cycles=2)
+    assert seen == [100, 99]
+    assert not discovered, "discovery must not even be attempted when a start is given"
+
+
+async def test_a_stored_cursor_beats_discovery(pg):
+    """Otherwise every restart would jump back to the newest article and the walk
+    would never reach the archive."""
+    await repo.set_cursor(pg, "backfill", 100)
+    seen: list[int] = []
+    discovered = False
+
+    async def ingest(article_id: int) -> str:
+        seen.append(article_id)
+        await repo.record_fetch(pg, article_id, "ok")
+        return "ok"
+
+    async def discover() -> int:
+        nonlocal discovered
+        discovered = True
+        return 500
+
+    await run_backfill(pg, ingest, discover_start=discover, stop_at=99, batch_size=1,
+                       sleep=noop_sleep, max_cycles=2)
+    assert seen == [100, 99]
+    assert not discovered, "a stored cursor is the resume point; the feed is irrelevant"
 
 
 async def test_a_failing_ingest_does_not_abort_the_walk(pg):

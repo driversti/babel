@@ -20,7 +20,7 @@ from babel.crawler.hostlimit import HostLimiter
 from babel.crawler.images import ImageTooLarge
 from babel.crawler.imageworker import run_image_worker
 from babel.crawler.ingest import Ingestor
-from babel.crawler.poller import poll_once
+from babel.crawler.poller import newest_article_id, poll_once
 from babel.crawler.ratelimit import RateLimiter
 from babel.db import repo
 from babel.db.migrate import apply_migrations
@@ -244,7 +244,9 @@ async def _run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
             tasks.append(asyncio.create_task(_poll_forever(pool, ingestor, fetch_rss, settings)))
         if not no_backfill:
             tasks.append(
-                asyncio.create_task(_backfill_forever(pool, ingestor, start_id, settings))
+                asyncio.create_task(
+                    _backfill_forever(pool, ingestor, start_id, fetch_rss, settings)
+                )
             )
 
         # Any task exiting means something is wrong — an IP leak, a crash. Bring
@@ -327,13 +329,17 @@ async def _poll_forever(pool, ingestor: Ingestor, fetch_rss, settings: Settings)
 
 
 async def _backfill_forever(
-    pool, ingestor: Ingestor, start_id: int | None, settings: Settings
+    pool, ingestor: Ingestor, start_id: int | None, fetch_rss, settings: Settings
 ) -> None:
     async with pool.acquire() as conn:
         await run_backfill(
             conn,
             ingestor.ingest,
             start_id=start_id,
+            # On an empty database the walk starts at the newest article the feed
+            # knows about. `babel run` takes no --start-id, so without this a
+            # fresh deployment crash-loops under `restart: unless-stopped`.
+            discover_start=functools.partial(newest_article_id, fetch_rss),
             stop_at=1,
             cooldown_sec=settings.retry_cooldown_sec,
             idle_sleep_sec=settings.backfill_idle_sleep_sec,

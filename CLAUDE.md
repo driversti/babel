@@ -11,7 +11,7 @@ expensive to obtain; do not re-derive them, and update them there if the site ch
 Phase 1 — crawler. All ten original tasks are implemented: config, article/comment parser, DB
 schema + migration runner, repository layer, rate limiter + fetcher, content-addressed image
 store, end-to-end article ingest, RSS poller, newest-first backfill walker, and the CLI/service
-that composes them (`src/babel/cli.py`). 160 tests, all passing (`uv run pytest`, needs Docker for
+that composes them (`src/babel/cli.py`). 175 tests, all passing (`uv run pytest`, needs Docker for
 the `postgres:17` testcontainer); `uv run ruff check src tests` clean.
 
 **The probe has passed.** 100 article IDs fetched through a VPN tunnel from the target host:
@@ -27,6 +27,13 @@ and "`dead` requires positive evidence". 64% of images on same-day articles were
 permanently gone while being perfectly alive. Both are fixed and pinned by tests. **If you touch
 image fetching, read those two spec entries first** — the failure is silent, and the status it
 writes is the one that never gets retried.
+
+**A fresh deployment bootstraps itself.** On an empty database the backfill starts at the newest
+article the RSS feed advertises; `--start-id` remains an explicit override, and a stored cursor
+still beats both, so a restart resumes rather than jumping back to the top. Before this, `babel run`
+(which passes no `--start-id`) raised on an empty `crawl_cursor` and the container crash-looped
+under `restart: unless-stopped` until a row was inserted by hand — which is how the first real
+deployment went.
 
 **C1 and I4 from the whole-branch review are closed** — see
 `docs/superpowers/plans/2026-07-26-final-review-findings.md`: the backfill now cycles through a

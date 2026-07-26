@@ -1,5 +1,13 @@
-from babel.crawler.poller import parse_rss_ids, poll_once
+from babel.crawler.poller import newest_article_id, parse_rss_ids, poll_once
 from babel.db import repo
+
+
+def _rss(article_ids: list[int]) -> str:
+    items = "".join(
+        f"<item><link>https://www.erepublik.com/en/article/slug-{i}/1/20</link></item>"
+        for i in article_ids
+    )
+    return f"<rss><channel><link>https://erepublik.com/rss</link>{items}</channel></rss>"
 
 RSS = """<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0"><channel>
@@ -104,3 +112,30 @@ async def test_poll_deduplicates_ids_appearing_on_several_pages(pg):
 
     await poll_once(pg, ingest, fetch_rss, pages=3)
     assert sorted(seen) == [2797018, 2797019]
+
+
+async def test_newest_article_id_is_the_highest_in_the_feed():
+    """The feed is ordered newest-first in practice, but the backfill's starting
+    point must not depend on that — an out-of-order feed would silently skip
+    every article above the first entry."""
+
+    async def fetch_rss(page: int) -> str:
+        assert page == 1, "only the first page is needed to find the newest article"
+        return _rss([2797020, 2797025, 2797011])
+
+    assert await newest_article_id(fetch_rss) == 2797025
+
+
+async def test_newest_article_id_refuses_an_empty_feed():
+    """Returning 0 or None here would seed the cursor below every article and the
+    walk would idle forever having collected nothing."""
+
+    async def fetch_rss(page: int) -> str:
+        return "<rss><channel></channel></rss>"
+
+    try:
+        await newest_article_id(fetch_rss)
+    except ValueError as e:
+        assert "no article" in str(e).lower()
+    else:
+        raise AssertionError("expected ValueError")
