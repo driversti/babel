@@ -33,7 +33,7 @@ import zoneinfo
 from selectolax.parser import HTMLParser
 from selectolax.parser import Node as HTMLNode
 
-from babel.models import Article, ImageRef
+from babel.models import Article, Comment, ImageRef
 
 GAME_TZ = zoneinfo.ZoneInfo("America/Los_Angeles")
 GAME_EPOCH = datetime.date(2007, 11, 21)  # day 1, not day 0
@@ -74,6 +74,7 @@ def parse_article(html: str, article_id: int) -> Article | None:
     e_day = _parse_eday(title_text)
     comment_count = _parse_comment_count(tree)
     images = _parse_images(body_node)
+    comments = parse_comments(html)
 
     return Article(
         id=article_id,
@@ -86,6 +87,7 @@ def parse_article(html: str, article_id: int) -> Article | None:
         e_day=e_day,
         comment_count=comment_count,
         images=images,
+        comments=comments,
     )
 
 
@@ -149,3 +151,77 @@ def _parse_images(body_node: HTMLNode) -> tuple[ImageRef, ...]:
     # <img> carries no src.
     sources = [src for src in (img.attributes.get("src") for img in body_node.css("img")) if src]
     return tuple(ImageRef(position=i, source_url=src) for i, src in enumerate(sources))
+
+
+_COMMENT_ID_RE = re.compile(r"comment(\d+)")
+_PADDING_RE = re.compile(r"padding-left:\s*(\d+)px")
+_COMMENT_TIME_RE = re.compile(r"Day\s+([\d,]+),\s*(\d{1,2}):(\d{2})")
+
+# Each nesting level is indented by a fixed 30px in the rendered thread.
+_INDENT_PX_PER_LEVEL = 30
+
+
+def parse_comments(html: str) -> tuple[Comment, ...]:
+    """Extract the comment thread in document order.
+
+    Removed comments render as "[removed]" and are kept with a NULL body: the
+    slot existing is itself information, and dropping it would renumber the
+    thread.
+    """
+    tree = HTMLParser(html)
+    out: list[Comment] = []
+    for position, node in enumerate(tree.css("div.commentWrapper")):
+        id_m = _COMMENT_ID_RE.fullmatch(node.attributes.get("id") or "")
+        if not id_m:
+            continue
+
+        depth = 0
+        for child in node.css("div[style]"):
+            pad_m = _PADDING_RE.search(child.attributes.get("style") or "")
+            if pad_m:
+                depth = int(pad_m.group(1)) // _INDENT_PX_PER_LEVEL
+                break
+
+        author_id, author_name = None, None
+        link = node.css_first('a[href^="/en/citizen/profile/"]')
+        if link is not None:
+            m = _CITIZEN_HREF_RE.match(link.attributes.get("href") or "")
+            author_id = int(m.group(1)) if m else None
+            author_name = link.attributes.get("title") or link.text(strip=True) or None
+
+        posted_at = None
+        time_node = node.css_first("div.details span")
+        if time_node is not None:
+            posted_at = _parse_comment_time(time_node.text(strip=True))
+
+        body_node = node.css_first("div.details p")
+        # text(strip=True) only strips each individual text fragment before
+        # joining with the separator -- an HTML comment (present on every
+        # comment <p>) plus surrounding newlines still leaves whitespace
+        # around the joined result, so the final string needs its own strip.
+        body = body_node.text(separator=" ", strip=True).strip() if body_node else ""
+        if not body or body == "[removed]":
+            body = None
+
+        out.append(
+            Comment(
+                id=int(id_m.group(1)),
+                position=position,
+                depth=depth,
+                author_id=author_id,
+                author_name=author_name,
+                posted_at=posted_at,
+                body=body,
+            )
+        )
+    return tuple(out)
+
+
+def _parse_comment_time(text: str) -> datetime.datetime | None:
+    """"Day 6,819, 21:34" → an aware datetime in game time."""
+    m = _COMMENT_TIME_RE.search(text)
+    if not m:
+        return None
+    day = eday_to_date(int(m.group(1).replace(",", "")))
+    hour, minute = int(m.group(2)), int(m.group(3))
+    return datetime.datetime(day.year, day.month, day.day, hour, minute, tzinfo=GAME_TZ)
