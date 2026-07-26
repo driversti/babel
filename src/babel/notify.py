@@ -75,4 +75,12 @@ class Throttled:
 def build_notifier(settings) -> Notifier:
     if settings.bot_token and settings.chat_id:
         return TelegramNotifier(settings.bot_token, settings.chat_id)
+    # Half-configured is the likely operator mistake, and its symptom is silence:
+    # both alerts exist precisely because a log line will not reach a human in
+    # time, so falling back without a word defeats the point of configuring it.
+    # No Telegram at all is a legitimate choice and says nothing.
+    if settings.bot_token:
+        log.warning("BOT_TOKEN is set but CHAT_ID is not — alerts will only be logged")
+    elif settings.chat_id:
+        log.warning("CHAT_ID is set but BOT_TOKEN is not — alerts will only be logged")
     return NullNotifier()

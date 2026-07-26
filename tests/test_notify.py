@@ -1,3 +1,5 @@
+import logging
+
 from babel.config import Settings
 from babel.notify import NullNotifier, TelegramNotifier, Throttled, build_notifier
 
@@ -81,3 +83,24 @@ async def test_a_failed_send_is_retried_rather_than_throttled():
 async def test_build_falls_back_when_only_one_credential_is_set():
     assert isinstance(build_notifier(Settings(_env_file=None, bot_token="t")), NullNotifier)
     assert isinstance(build_notifier(Settings(_env_file=None, chat_id="c")), NullNotifier)
+
+
+def test_half_configured_telegram_warns(caplog):
+    """Filling one of the two and not the other is the likely operator mistake,
+    and the result is silence — no alerts, and nothing saying so. Both alerts
+    exist to escalate off-host, so a half-configuration must be loud."""
+    with caplog.at_level(logging.WARNING, logger="babel.notify"):
+        build_notifier(Settings(_env_file=None, bot_token="t"))
+    assert "chat_id" in caplog.text.lower()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="babel.notify"):
+        build_notifier(Settings(_env_file=None, chat_id="c"))
+    assert "bot_token" in caplog.text.lower()
+
+
+def test_no_telegram_at_all_does_not_warn(caplog):
+    """Running without Telegram is a legitimate choice, not a mistake."""
+    with caplog.at_level(logging.WARNING, logger="babel.notify"):
+        build_notifier(Settings(_env_file=None))
+    assert caplog.text == ""
