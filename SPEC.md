@@ -38,6 +38,16 @@ recorded rather than re-derived.
 - Feed completeness: 50 of the 53 article IDs in the sampled range appeared, i.e. ~94%. The
   missing ones are deleted articles.
 
+### Cloudflare, from behind the VPN
+
+Ran 2026-07-26 from the target host through a WireGuard tunnel exiting in France: 100 random
+article IDs at 1 req/s returned **85 `ok`, 15 `missing`, and zero Cloudflare challenges**. The
+missing ones are deleted articles and gaps in the ID sequence, consistent with the ~94% feed
+coverage measured separately.
+
+This was the assumption the whole design rested on, and it is the one thing that could not be
+established by reading code. It is now measured rather than reasoned.
+
 ### Article pages
 
 - `GET /en/article/{id}` works with **no slug and no session**. The slug in real URLs is
@@ -313,19 +323,31 @@ a different process.
 
 ### Target host
 
-An NVIDIA Jetson Orin Nano Super dev kit: 6 cores, 7.4 GiB of unified memory, a 465 GB NVMe with
-~388 GB free, JetPack 6 (L4T R36.4.7), Docker 29.6. Bare metal, so `/dev/net/tun` is available for
-the VPN.
+Phase 1 runs on the x86_64 box, not the Jetson: 16 cores, 30 GiB RAM, a 1.9 TB NVMe with ~1.7 TB
+free, bare metal, Docker 29.4. Roomy enough that the disk stops being a design constraint at all —
+the full unreduced image set is under a fifth of what is free.
 
-Notes that follow from this:
+**The Jetson cannot run this.** Its Tegra kernel (5.15.148-tegra) is built without
+`CONFIG_IP_ADVANCED_ROUTER`, so policy routing is unavailable — `ip rule` fails on the host and in
+every container regardless of capabilities. Gluetun sets up routing rules unconditionally and has
+no option to skip it, so it exits at startup there. Verified directly, including with a minimal
+gluetun carrying none of this project's settings. WireGuard itself is fine: `/dev/net/tun` exists
+and the userspace implementation works; only the routing blocks it.
 
-- Text, metadata and vectors total roughly 15 GB. The disk is not a constraint for them.
-- Images are, eventually. 388 GB does not comfortably hold the full ~410 GB unreduced set on a
-  partition it shares with the OS, hence the free-space floor and the relocatable `IMAGE_ROOT`.
-- Memory is unified between CPU and GPU; the 3.7 GiB of zram swap is compressed RAM and adds no
-  real capacity, so it should not be counted toward an index budget.
-- The NVIDIA container runtime is **not** currently configured — `docker info` reports only `runc`.
-  Irrelevant to phase 1, a prerequisite for phase 3.
+That reshapes where the Jetson fits rather than removing it. Its value was always the GPU and
+always-on operation, not proximity to eRepublik. Phase 3 embeddings still belong there, reading
+from Postgres over the LAN.
+
+Notes that follow:
+
+- x86_64 means the standard amd64 build applies. The ARM64 build path this document previously
+  called out as friction does not exist for phase 1; it returns only if phase 3 containerises the
+  embedding work on the Jetson.
+- Text, metadata and vectors total roughly 15 GB, images 250-300 GB after deduplication. Against
+  1.7 TB free, the free-space floor is a safety net rather than an operating constraint — but it
+  stays, because the image tree still shares a filesystem with Postgres and the OS root.
+- The host already runs eleven unrelated containers. Nothing conflicts: no VPN container, and
+  port 5432 was free.
 
 ### Decisions
 
