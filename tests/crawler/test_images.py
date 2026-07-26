@@ -4,6 +4,7 @@ import hashlib
 import pytest
 
 from babel.crawler.images import (
+    ImageTooLarge,
     capture_image,
     have_space,
     image_path,
@@ -81,11 +82,11 @@ def test_have_space_walks_up_to_an_existing_ancestor(tmp_path):
 
 
 async def test_capture_stores_a_live_image(tmp_path):
-    async def get_bytes(url):
+    async def get_bytes(url, max_bytes):
         return 200, b"\x89PNG fake", "image/png"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/a.png", min_free_bytes=0, max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
     )
     assert outcome.status == "ok"
     assert outcome.mime == "image/png"
@@ -93,55 +94,41 @@ async def test_capture_stores_a_live_image(tmp_path):
 
 
 async def test_capture_marks_a_404_as_dead(tmp_path):
-    async def get_bytes(url):
+    async def get_bytes(url, max_bytes):
         return 404, b"", None
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/gone.png", min_free_bytes=0, max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/gone.png", max_bytes=10_000
     )
     assert outcome.status == "dead"
     assert outcome.digest is None
 
 
 async def test_capture_marks_a_non_image_response_as_dead(tmp_path):
-    async def get_bytes(url):
+    async def get_bytes(url, max_bytes):
         return 200, b"<html>parked domain</html>", "text/html"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/a.png", min_free_bytes=0, max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
     )
     assert outcome.status == "dead"
 
 
-async def test_capture_skips_when_below_the_free_space_floor(tmp_path):
-    called = {"n": 0}
-
-    async def get_bytes(url):
-        called["n"] += 1
-        return 200, b"\x89PNG", "image/png"
-
-    outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/a.png", min_free_bytes=10**18, max_bytes=10_000
-    )
-    assert outcome.status == "skipped_no_space"
-    assert called["n"] == 0  # the floor is checked before the network call
-
-
 async def test_capture_refuses_an_oversized_image(tmp_path):
-    async def get_bytes(url):
-        return 200, b"x" * 5000, "image/png"
+    async def get_bytes(url, max_bytes):
+        raise ImageTooLarge
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/big.png", min_free_bytes=0, max_bytes=1000
+        get_bytes, tmp_path, "https://x.example/big.png", max_bytes=1000
     )
     assert outcome.status == "error"
 
 
 async def test_transport_failure_is_an_error_not_a_dead_link(tmp_path):
-    async def get_bytes(url):
+    async def get_bytes(url, max_bytes):
         raise TimeoutError("slow host")
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/a.png", min_free_bytes=0, max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
     )
     assert outcome.status == "error"

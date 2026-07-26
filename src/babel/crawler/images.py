@@ -17,12 +17,16 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-BytesGetter = Callable[[str], Awaitable[tuple[int, bytes, str | None]]]
+BytesGetter = Callable[[str, int], Awaitable[tuple[int, bytes, str | None]]]
+
+
+class ImageTooLarge(Exception):  # noqa: N818 — name is a fixed interface, not open to renaming
+    """Raised by a getter that aborted a download past max_bytes."""
 
 
 @dataclass(frozen=True, slots=True)
 class ImageOutcome:
-    status: str  # ok | dead | error | skipped_no_space
+    status: str  # ok | dead | error
     digest: bytes | None = None
     mime: str | None = None
     size: int = 0
@@ -84,13 +88,18 @@ async def capture_image(
     root: pathlib.Path,
     source_url: str,
     *,
-    min_free_bytes: int,
     max_bytes: int,
 ) -> ImageOutcome:
-    if not have_space(root, min_free_bytes):
-        return ImageOutcome(status="skipped_no_space")
+    """Fetch and store one image.
+
+    Free space is deliberately not checked here. The worker checks it, because
+    the correct response to a full disk is to sleep with the row still queued,
+    and only the loop can do that.
+    """
     try:
-        status_code, data, mime = await get_bytes(normalise_url(source_url))
+        status_code, data, mime = await get_bytes(normalise_url(source_url), max_bytes)
+    except ImageTooLarge:
+        return ImageOutcome(status="error")
     except Exception:  # noqa: BLE001 — could not determine, so not 'dead'
         return ImageOutcome(status="error")
 
@@ -99,8 +108,6 @@ async def capture_image(
     if mime is None or not mime.startswith("image/"):
         # Parked domains and "file removed" pages answer 200 with HTML.
         return ImageOutcome(status="dead")
-    if len(data) > max_bytes:
-        return ImageOutcome(status="error", size=len(data))
 
     digest = store_bytes(root, data)
     return ImageOutcome(status="ok", digest=digest, mime=mime, size=len(data))
