@@ -44,8 +44,16 @@ recorded rather than re-derived.
   decorative. `/en/article/{id}/1/1000` returns the article and all its comments in one request.
 - Missing/deleted IDs return HTTP 404.
 - Body lives in `div.postBody`, inside `div.postContent[itemType="schema.org/Article"]`.
-- Metadata available logged-out: title, author name + citizen ID, country, `itemprop="datePublished"`,
-  eRepublik day, comment count (in the `<meta name="description">` text).
+- Metadata available logged-out: title, author name, country, `itemprop="datePublished"`, eRepublik
+  day, comment count (in the `<meta name="description">` text).
+- **The author's citizen ID is not on the page.** The header carries only the name, in
+  `itemprop="author"` and the `<title>` byline. Citizen IDs appear solely inside the comment thread,
+  so an author's ID is recoverable only when they also commented on their own article — matching the
+  byline name against a commenter's profile link. Otherwise `author_id` is NULL and `author_name` is
+  all there is. Resolving the rest would mean a `citizen-search?name=` lookup per unique author,
+  cacheable and cheap since authors repeat heavily, but that is phase-2 work and not worth blocking
+  ingestion for. Do not guess: attaching the first citizen link on the page attributes articles to
+  whoever commented first.
 - Vote counts are **not** rendered logged-out. Ranking by votes would need an `erpk` cookie.
   Comment count is a free substitute and is what "most discussed" should use.
 
