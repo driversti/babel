@@ -8,7 +8,17 @@ expensive to obtain; do not re-derive them, and update them there if the site ch
 
 ## Status
 
-Phase 1 — crawler. No code yet.
+Phase 1 — crawler. All ten tasks are implemented: config, article/comment parser, DB schema +
+migration runner, repository layer, rate limiter + fetcher, content-addressed image store,
+end-to-end article ingest, RSS poller, newest-first backfill walker, and the CLI/service that
+composes them (`src/babel/cli.py`). The suite is 90 tests, all passing (`uv run pytest`, needs
+Docker for the `postgres:17` testcontainer) and `uv run ruff check src tests` is clean.
+
+**Not yet run against the live site.** Every measurement in SPEC.md was taken from a residential
+connection, and the crawler has never been exercised through the VPN. Task 1 Step 12 — fetch a
+hundred articles through the tunnel and confirm Cloudflare isn't challenging the exit node — is
+still blocked on VPN credentials and has not happened. Do not assume the crawler works end to end
+against the real site until that probe has run clean.
 
 ## Key facts
 

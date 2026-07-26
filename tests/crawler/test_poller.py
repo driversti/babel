@@ -63,6 +63,35 @@ async def test_ingest_failure_does_not_stop_other_ids(pg):
     assert await pg.fetchval("SELECT status FROM fetch_log WHERE article_id = 2797019") == "error"
 
 
+async def test_errored_id_is_retried_on_a_later_poll(pg):
+    # Successes must record 'ok' the way the real Ingestor does (poll_once
+    # itself only writes fetch_log on failure), or the second poll would treat
+    # every ID as never-seen instead of exercising the retry-only-errors path.
+    async def failing_ingest(article_id: int) -> str:
+        if article_id == 2797019:
+            raise RuntimeError("boom")
+        await repo.record_fetch(pg, article_id, "ok")
+        return "ok"
+
+    async def fetch_rss(page: int) -> str:
+        return RSS if page == 1 else "<rss><channel></channel></rss>"
+
+    await poll_once(pg, failing_ingest, fetch_rss, pages=2)
+    assert await pg.fetchval("SELECT status FROM fetch_log WHERE article_id = 2797019") == "error"
+
+    seen: list[int] = []
+
+    async def ingest(article_id: int) -> str:
+        seen.append(article_id)
+        return "ok"
+
+    # A later poll cycle over the same feed page must bring the previously
+    # errored article back; 2797018 already succeeded and must not repeat.
+    ingested = await poll_once(pg, ingest, fetch_rss, pages=2)
+    assert seen == [2797019]
+    assert ingested == [2797019]
+
+
 async def test_poll_deduplicates_ids_appearing_on_several_pages(pg):
     seen: list[int] = []
 

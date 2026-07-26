@@ -39,7 +39,7 @@ async def run_backfill(
 
     while current >= stop_at:
         batch = list(range(current, max(stop_at - 1, current - batch_size), -1))
-        for article_id in await repo.filter_unseen(conn, batch):
+        for article_id in await repo.filter_unseen(conn, batch, retry_errors=True):
             try:
                 await ingest(article_id)
             except Exception as exc:

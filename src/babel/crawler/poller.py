@@ -48,7 +48,7 @@ async def poll_once(
                 candidates.append(article_id)
 
     ingested: list[int] = []
-    for article_id in await repo.filter_unseen(conn, candidates):
+    for article_id in await repo.filter_unseen(conn, candidates, retry_errors=True):
         try:
             await ingest(article_id)
         except Exception as exc:

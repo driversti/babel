@@ -11,6 +11,15 @@ import asyncpg
 
 from babel.models import Article
 
+# A row stuck at 'error' forever would mean a single transient failure (a
+# timeout, a flaky 5xx) permanently drops an article from the archive. But
+# retrying forever is just as wrong: a genuinely broken ID (malformed page,
+# permanently gone article) would be re-offered on every backfill pass and
+# the month-long walk would never converge. Five attempts gives transient
+# failures several chances across independent crawl passes while still
+# letting a truly bad ID fall out of rotation.
+MAX_FETCH_ATTEMPTS = 5
+
 
 async def save_article(conn: asyncpg.Connection, article: Article) -> None:
     """Insert or replace an article together with its comments and image slots."""
@@ -88,15 +97,29 @@ async def set_cursor(conn: asyncpg.Connection, name: str, next_id: int) -> None:
 
 
 async def filter_unseen(
-    conn: asyncpg.Connection, ids: Sequence[int], *, retry_errors: bool = False
+    conn: asyncpg.Connection,
+    ids: Sequence[int],
+    *,
+    retry_errors: bool = False,
+    max_attempts: int = MAX_FETCH_ATTEMPTS,
 ) -> list[int]:
-    """Drop IDs already fetched. With retry_errors, previous failures come back."""
+    """Drop IDs already fetched.
+
+    With retry_errors, rows logged as 'error' are offered again, but only
+    while their attempts count stays below max_attempts -- once a row hits
+    the ceiling it is treated as seen, same as 'ok' or 'missing'. Those two
+    statuses are final answers and are never re-offered regardless of the
+    flag.
+    """
     if not ids:
         return []
-    predicate = "status <> 'error'" if retry_errors else "TRUE"
     rows = await conn.fetch(
-        f"SELECT article_id FROM fetch_log WHERE article_id = ANY($1::bigint[]) AND {predicate}",
-        list(ids),
+        """
+        SELECT article_id FROM fetch_log
+        WHERE article_id = ANY($1::bigint[])
+          AND ($2::boolean IS FALSE OR NOT (status = 'error' AND attempts < $3::smallint))
+        """,
+        list(ids), retry_errors, max_attempts,
     )
     seen = {r["article_id"] for r in rows}
     return [i for i in ids if i not in seen]

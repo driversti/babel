@@ -73,6 +73,29 @@ async def test_error_rows_are_offered_again(pg):
     assert await repo.filter_unseen(pg, [200], retry_errors=False) == []
 
 
+async def test_errored_row_below_attempt_ceiling_is_reoffered(pg):
+    await repo.record_fetch(pg, 210, "error", "boom")  # attempts = 1
+    assert await repo.filter_unseen(pg, [210], retry_errors=True, max_attempts=3) == [210]
+
+
+async def test_errored_row_at_attempt_ceiling_is_not_reoffered(pg):
+    for _ in range(3):
+        await repo.record_fetch(pg, 211, "error", "boom")  # attempts = 3
+    assert await repo.filter_unseen(pg, [211], retry_errors=True, max_attempts=3) == []
+
+
+async def test_ok_and_missing_rows_are_never_reoffered(pg):
+    # Bump attempts well past any plausible ceiling to prove ok/missing rows
+    # are excluded on status alone, not because their attempts count happens
+    # to be low.
+    for _ in range(10):
+        await repo.record_fetch(pg, 212, "ok")
+    await repo.record_fetch(pg, 213, "missing")
+
+    assert await repo.filter_unseen(pg, [212, 213], retry_errors=True, max_attempts=1) == []
+    assert await repo.filter_unseen(pg, [212, 213], retry_errors=False, max_attempts=1) == []
+
+
 async def test_image_blob_is_deduplicated_by_hash(pg):
     await repo.save_article(pg, make_article())
     digest = b"\x01" * 32
