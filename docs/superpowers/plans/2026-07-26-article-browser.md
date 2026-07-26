@@ -40,7 +40,30 @@
 | `src/babel/web/static/style.css` | styling |
 | `tests/web/test_*.py`, `tests/db/test_browse*.py` | tests |
 
-**Modified:** `src/babel/crawler/parser.py` (block boundaries), `src/babel/crawler/images.py` (address filter), `src/babel/config.py` (web settings), `src/babel/cli.py` (`serve`, `hide`), `src/babel/db/repo.py` (docstring pointer), `pyproject.toml`, `docker-compose.yml`, `.gitignore`, `.dockerignore`, `.env.example`, `README.md`, `CLAUDE.md`.
+**Modified:** `src/babel/crawler/parser.py` (block boundaries), `src/babel/crawler/images.py` (address filter), `src/babel/config.py` (web settings), `src/babel/cli.py` (`serve`, `hide`), `src/babel/db/repo.py` (docstring pointer), `tests/conftest.py` (one added fixture), `pyproject.toml`, `docker-compose.yml`, `.gitignore`, `.dockerignore`, `.env.example`, `README.md`, `CLAUDE.md`.
+
+## Test Fixtures
+
+`tests/conftest.py` currently provides exactly two fixtures, and every task below depends on knowing what they actually are:
+
+- **`pg`** — an `asyncpg.Connection` against a **fresh `postgres:17` container with all migrations applied, per test**. It is function-scoped, so each test starts with an empty schema; tests never need to clean up after each other or worry about colliding ids.
+- **`fake_pool`** — a *builder*: `fake_pool(conn)` returns an object exposing `acquire()` as an async context manager over that one connection, serialised by a lock.
+
+Task 4 adds one more, and every later task uses it:
+
+```python
+@pytest.fixture
+def pool(pg, fake_pool):
+    """A pool-shaped façade over the per-test connection.
+
+    Application code takes an asyncpg.Pool and calls `async with pool.acquire()`.
+    Handing it this keeps the tests' database access identical to production's
+    without a second container per test.
+    """
+    return fake_pool(pg)
+```
+
+There is **no** DSN fixture and none is added. The web tests inject this `pool` into `create_app` rather than letting it dial out, which is why `create_app` takes an optional pool (Task 9). The two tests that exercise `open_pool`'s refusal paths (Task 13) need no database at all — both raise before connecting.
 
 ## Task Order
 
@@ -699,7 +722,7 @@ def test_builder_emits_a_distinct_text_per_filter_combination():
     assert len(texts) == 4
 ```
 
-`pool` is the existing migrated-database fixture in `tests/conftest.py`. Use it as-is; if each test needs a clean `articles` table, add a `TRUNCATE articles CASCADE` to that fixture's teardown rather than seeding overlapping ids.
+`pool` does not exist yet. Add it to `tests/conftest.py` as the first step of this task, exactly as given in the "Test Fixtures" section near the top of this plan — it is a three-line façade over the existing `pg` and `fake_pool` fixtures. Because `pg` builds a fresh container per test, every test above starts against an empty schema; no truncation or id-collision handling is needed anywhere in this plan.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1765,7 +1788,7 @@ This is where templates first exist, so it is also where `.gitignore` must be fi
 **Interfaces:**
 - Consumes: `Settings`
 - Produces:
-  - `def create_app(settings: Settings) -> FastAPI` — app with `app.state.pool` (asyncpg) and `app.state.templates` (Jinja2Templates)
+  - `def create_app(settings: Settings, pool: object | None = None) -> FastAPI` — app with `app.state.pool` and `app.state.templates` (Jinja2Templates). When `pool` is passed it is used as-is and **not** closed on shutdown; the caller owns it. That seam is what lets the tests drive the app against the per-test connection without a second container, and it never weakens production, where `pool` is omitted and `open_pool` runs.
   - `async def open_pool(settings: Settings) -> asyncpg.Pool`
   - `TEMPLATE_DIR: pathlib.Path`, `STATIC_DIR: pathlib.Path`
 
@@ -1816,15 +1839,31 @@ from babel.config import Settings
 from babel.web.app import create_app
 
 
-@pytest.fixture
-async def client(pool_dsn):
-    """pool_dsn is the testcontainer DSN from tests/conftest.py."""
-    settings = Settings(database_url=pool_dsn, web_database_url=pool_dsn, contact="a@b.c")
-    app = create_app(settings)
+@pytest_asyncio.fixture
+async def client(pool, image_root):
+    """The app driven over ASGI, with the per-test pool injected.
+
+    The DSNs below are never dialled — the injected pool is the database. They
+    are still two different strings, because open_pool refuses to start when
+    they are equal and that refusal is production behaviour worth not
+    accidentally disabling in the fixture.
+    """
+    settings = Settings(
+        database_url="postgresql://babel@unused/babel",
+        web_database_url="postgresql://babel_web@unused/babel",
+        contact="archive@example.invalid",
+        image_root=str(image_root),
+    )
+    app = create_app(settings, pool=pool)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             yield c
+
+
+@pytest.fixture
+def image_root(tmp_path):
+    return tmp_path
 
 
 async def test_healthz_is_ok(client):
@@ -1994,9 +2033,16 @@ async def open_pool(settings: Settings) -> asyncpg.Pool:
     return await asyncpg.create_pool(dsn, min_size=1, max_size=settings.web_pool_size)
 
 
-def create_app(settings: Settings) -> FastAPI:
+def create_app(settings: Settings, pool: object | None = None) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # An injected pool belongs to the caller: used as-is, never closed here.
+        # That is the seam the tests drive the app through, and it leaves the
+        # production path — pool omitted, open_pool runs — exactly as strict.
+        if pool is not None:
+            app.state.pool = pool
+            yield
+            return
         app.state.pool = await open_pool(settings)
         try:
             yield
@@ -2110,7 +2156,7 @@ def register_routes(app: FastAPI) -> None:
 - [ ] **Step 8: Run the tests**
 
 Run: `uv run pytest tests/web/ -v`
-Expected: PASS. If `pool_dsn` does not exist in `tests/conftest.py`, add a fixture exposing the testcontainer's DSN alongside the existing `pool` fixture rather than starting a second container.
+Expected: PASS. Put the `client` and `image_root` fixtures above in `tests/web/conftest.py`; they build on the `pool` fixture Task 4 added to `tests/conftest.py`. Import `pytest_asyncio` there — `client` is an async fixture and needs `@pytest_asyncio.fixture`, not `@pytest.fixture`.
 
 - [ ] **Step 9: Run the full suite, lint, commit**
 
@@ -2863,7 +2909,7 @@ async def test_cache_is_revalidatable_not_immutable(client, pool, image_root):
     assert "must-revalidate" in cache
 ```
 
-Add an `image_root` fixture to `tests/web/conftest.py` returning a `tmp_path` directory, and make the app fixture build `Settings(..., image_root=str(image_root))`.
+The `image_root` fixture already exists in `tests/web/conftest.py` from Task 9, and the `client` fixture there already passes it as `Settings(image_root=...)`. Nothing new to add — these tests just request both.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -3022,14 +3068,18 @@ from babel.config import Settings
 from babel.web.app import open_pool
 
 
-async def test_serve_refuses_to_run_as_the_owner_role(pool_dsn):
-    settings = Settings(database_url=pool_dsn, web_database_url=pool_dsn)
+DSN = "postgresql://babel:babel@db:5432/babel"
+
+
+async def test_serve_refuses_to_run_as_the_owner_role():
+    # No database needed: both refusals raise before any connection is opened.
+    settings = Settings(database_url=DSN, web_database_url=DSN)
     with pytest.raises(RuntimeError, match="must not connect"):
         await open_pool(settings)
 
 
-async def test_serve_refuses_without_a_web_dsn(pool_dsn):
-    settings = Settings(database_url=pool_dsn, web_database_url=None)
+async def test_serve_refuses_without_a_web_dsn():
+    settings = Settings(database_url=DSN, web_database_url=None)
     with pytest.raises(RuntimeError, match="WEB_DATABASE_URL is not set"):
         await open_pool(settings)
 
