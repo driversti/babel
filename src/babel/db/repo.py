@@ -138,13 +138,18 @@ async def claim_retryable(conn: asyncpg.Connection, limit: int, cooldown_sec: in
     rows = await conn.fetch(
         """
         SELECT article_id FROM fetch_log
-        WHERE status = ANY($1::text[])
-          AND attempts < $2
-          AND updated_at <= now() - make_interval(secs => $3)
+        -- The status set is written as a literal, not a bound parameter, and
+        -- must stay textually identical to fetch_log_retryable_idx's predicate.
+        -- Postgres only proves a partial index applicable from a Const; with a
+        -- Param it cannot, and a cached generic plan would then sequentially
+        -- scan ~2.8M rows that are almost all 'ok'.
+        WHERE status IN ('error', 'stale')
+          AND attempts < $1
+          AND updated_at <= now() - make_interval(secs => $2)
         ORDER BY article_id DESC
-        LIMIT $4
+        LIMIT $3
         """,
-        list(RETRYABLE_STATUSES), MAX_FETCH_ATTEMPTS, cooldown_sec, limit,
+        MAX_FETCH_ATTEMPTS, cooldown_sec, limit,
     )
     return [r["article_id"] for r in rows]
 

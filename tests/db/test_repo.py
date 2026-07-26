@@ -245,3 +245,34 @@ async def test_mark_stale_leaves_missing_rows_alone(pg):
     await repo.record_fetch(pg, 1, "missing")
     assert await repo.mark_stale(pg, [1]) == 0
     assert await pg.fetchval("SELECT status FROM fetch_log WHERE article_id = 1") == "missing"
+
+
+async def test_the_sweep_can_actually_use_the_partial_index(pg):
+    # claim_retryable's status set must stay a literal, textually matching
+    # fetch_log_retryable_idx's predicate: Postgres only proves a partial index
+    # applicable from a Const, never from a bound parameter. Disabling seqscan
+    # makes the planner take the index if -- and only if -- it can prove it
+    # applies, so this tests provability rather than cost preference.
+    await repo.record_fetch(pg, 1, "error", "boom")
+    await pg.execute("SET enable_seqscan = off")
+    plan = "\n".join(
+        r["QUERY PLAN"]
+        for r in await pg.fetch(
+            """EXPLAIN SELECT article_id FROM fetch_log
+               WHERE status IN ('error', 'stale') AND attempts < 5
+                 AND updated_at <= now() - make_interval(secs => 0)
+               ORDER BY article_id DESC LIMIT 50"""
+        )
+    )
+    # Control: a predicate the index does not cover must NOT reach it, or the
+    # assertion above would pass for any query at all.
+    wider = "\n".join(
+        r["QUERY PLAN"]
+        for r in await pg.fetch(
+            """EXPLAIN SELECT article_id FROM fetch_log
+               WHERE status IN ('error', 'stale', 'ok') ORDER BY article_id DESC LIMIT 50"""
+        )
+    )
+    await pg.execute("SET enable_seqscan = on")
+    assert "fetch_log_retryable_idx" in plan, plan
+    assert "fetch_log_retryable_idx" not in wider, wider
