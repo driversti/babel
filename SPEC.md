@@ -103,6 +103,39 @@ global rate limiter. Fetches `/en/article/{id}/1/1000`, parses, writes.
 
 **Parser.** Pure functions over HTML strings, tested against saved fixtures. No network, no DB.
 
+### Network egress
+
+**All outbound traffic must leave through a VPN.** The operator's own IP is never to appear in
+eRepublik's logs, and a crawl that runs for a month gives a leak plenty of opportunities.
+
+Periodic IP checks are not sufficient, because they only notice a leak after it has happened.
+Instead the crawler runs with no network stack of its own:
+
+```yaml
+crawler:
+  network_mode: "service:gluetun"
+  depends_on:
+    gluetun:
+      condition: service_healthy
+```
+
+Gluetun holds the only network namespace. If the tunnel drops or the VPN container dies, the
+crawler loses connectivity entirely rather than falling back to the host route. A leak is not
+merely detected, it is impossible.
+
+On top of that, belt and braces:
+
+- Verify the exit IP at startup and every 15 minutes. If the reported country equals
+  `HOME_COUNTRY`, log, alert and exit immediately.
+- Gluetun's HTTP control server allows stop/start, so the exit node can be rotated on a schedule
+  or in response to 429/403.
+- Provider, credentials, exit countries and `HOME_COUNTRY` live in `.env`, which is gitignored.
+  None of them belong in this repository.
+
+Constraints worth remembering: an LXC container cannot run a VPN, since it has no `/dev/net/tun` —
+this needs bare metal or a VM, which the Jetson satisfies. Gluetun's DNS blocks some IP-lookup
+services, so pick one known to work and pin it.
+
 ### Rate limiting
 
 Start at **1 request/second** globally and watch for 429/403. The monorepo notes a ~3000 req/hr
@@ -216,6 +249,19 @@ tests and the 30-day raw HTML window.
 
 **A month-long crawl invites trouble** — restarts, IP throttling, transient 5xx. Handled by the
 resumability design above; correctness here is worth more than speed.
+
+**Cloudflare may treat VPN exit nodes differently from residential addresses.** Every measurement
+in this document was taken from a residential connection; none of it has been confirmed from
+behind a tunnel. An earlier crawler in this monorepo did hit Cloudflare blocks. This is the
+cheapest risk to retire and the most expensive to discover late, so the first task of phase 1 is
+to fetch a hundred articles through the VPN and confirm the responses are clean — before any
+other code is written.
+
+**Sharing a network namespace complicates reaching Postgres.** A container with
+`network_mode: "service:gluetun"` has no bridge interface, so the database cannot simply be
+addressed by service name. Either the database joins the same namespace and is reached on
+localhost, or Gluetun is configured to route local subnets outside the tunnel. To be settled in
+the implementation plan.
 
 **ARM64.** The rest of the monorepo builds amd64 images for Proxmox. Jetson needs arm64 builds on
 an `nvcr.io/nvidia/l4t-*` base plus the NVIDIA container runtime. Not hard, but it is a separate
