@@ -11,15 +11,21 @@ expensive to obtain; do not re-derive them, and update them there if the site ch
 Phase 1 — crawler. All ten original tasks are implemented: config, article/comment parser, DB
 schema + migration runner, repository layer, rate limiter + fetcher, content-addressed image
 store, end-to-end article ingest, RSS poller, newest-first backfill walker, and the CLI/service
-that composes them (`src/babel/cli.py`). 176 tests, all passing (`uv run pytest`, needs Docker for
+that composes them (`src/babel/cli.py`). 204 tests, all passing (`uv run pytest`, needs Docker for
 the `postgres:17` testcontainer); `uv run ruff check src tests` clean.
+
+**The crawler is running live right now** on the deploy host, and has been since 2026-07-26. It
+works: articles, authors, e-days and full comment threads in Persian, Serbian, Hungarian,
+Indonesian, Bulgarian, Polish, Spanish and English. Where it stood at the last handoff — 10,093
+articles, 161,155 comments, 2,193 images (1,795 blobs, 735 MB), walking down from 2797025 and
+reached 2785850, 1.7 TB free. Telegram alerts are configured and a real message was delivered.
+
+**Read [docs/superpowers/plans/2026-07-26-review-2-findings.md](docs/superpowers/plans/2026-07-26-review-2-findings.md)
+before changing anything.** It is the second whole-branch review, and five of its findings are
+still open — see "What is still open" below.
 
 **The probe has passed.** 100 article IDs fetched through a VPN tunnel from the target host:
 85 ok, 15 missing, zero Cloudflare challenges. Anonymous access from a VPN exit works.
-
-**The crawler has now run for real**, on the target host, collecting articles and comments at
-1 req/s from article 2797025 downward. It works: articles, authors, e-days, and full comment
-threads in Persian, Serbian, Hungarian, Indonesian, Bulgarian, Polish, Spanish and English.
 
 That run also found two image-capture defects that no test could have caught, because both were
 about what real hosts do — see SPEC.md under "Image requests must be shaped like an `<img>` load"
@@ -59,6 +65,78 @@ before it re-raises on `IpLeak`, in both `babel run` and `babel images` — the 
 **Runs on the x86_64 host, not the Jetson.** The Tegra kernel lacks `CONFIG_IP_ADVANCED_ROUTER`,
 so `ip rule` is unavailable and gluetun cannot start there at all. Details in `SPEC.md` under
 "Target host". The Jetson keeps phase 3.
+
+## What is still open
+
+From the second whole-branch review, in the order it recommends. Its Criticals (C2, C3) and I8 are
+already fixed and deployed; these are not.
+
+- **I9 — the image size cap saves nothing.** `ImageTooLarge` raises early, but the `finally:
+  await response.aclose()` then waits for the *entire* transfer: curl_cffi's async `aclose()` is
+  `await self.astream_task` and never sets `quit_now`, which is the only thing that aborts the
+  connection. Measured with this venv against a 300 MB stream and an 8 MiB cap: raised at 0.13 s,
+  all 300 MB still transferred, RSS 60 → 462 MB. **CLAUDE.md previously claimed I6 was closed on
+  exactly this basis; it was not.** Fix: set `response.quit_now` before `await response.aclose()`
+  in `_bytes_getter`, and give `tests/test_bytes_getter.py`'s fake `_Response` a `quit_now` — its
+  absence is why the suite cannot see this.
+- **I10 — the poller burns five attempts in an hour and those IDs are then unreachable.**
+  `poll_once` re-offers `error` rows with no cooldown every `poll_interval_sec`; after five cycles
+  `filter_unseen` reports them seen forever and `claim_retryable` excludes them. They sit *above*
+  the backfill cursor, which only descends, so the walk never covers them either. The trigger is an
+  asymmetric failure — a markup change, where the feed keeps working while `parse_article` returns
+  None. Fix: give the poller the cooldown the sweep has.
+- **M1 — the sweep is unreachable for the whole ~32-day walk**, so `babel refetch` looks inert.
+  `run_backfill` only reaches `claim_retryable` once the cursor passes `stop_at`. Nothing is lost
+  (waiting does not burn attempts), but README.md and CLAUDE.md both say the running service
+  "picks the queued IDs up on its own", which reads as immediacy. Either interleave the phases or
+  correct the docs.
+- **M2 — image URLs get no scheme or address filter.** `source_url` is raw `img@src` from untrusted
+  article HTML. `file:///etc/passwd` returns the file's bytes (recorded `error`, bytes discarded —
+  but the read happens), and the worker runs inside gluetun's namespace with
+  `FIREWALL_OUTBOUND_SUBNETS=172.16.0.0/12` open. Blind and read-only, hence Minor, but the control
+  is missing. Fix in `capture_image` so the image tests cover it.
+- **M3 — both partial-index EXPLAIN tests EXPLAIN a copy of the SQL, not the code's query.** They
+  build their own string and EXPLAIN that, proving only that Postgres can use a partial index from a
+  `Const`. The invariant they exist to guard is the one this project has broken twice. Also
+  `RETRYABLE_STATUSES` (repo.py) is used nowhere and reads as an invitation to make the literal a
+  bound parameter — the exact change the tests are meant to block. Use it or delete it.
+
+Not from the review, found live and unresolved: **image throughput is the thing to watch.** It ran
+at 0.04 img/s at its worst and 1.35 img/s after the circuit breaker, against the ~5.3 img/s the
+article walk produces, so `article_images` still grows. Four separate causes were found and fixed
+(see the commits) and the queue is no longer growing for a *broken* reason — but whether the drain
+keeps up over a month is unmeasured. Watch the pending count and `docker compose logs images`.
+
+## Operating the live run
+
+It runs as four compose services on the deploy host (see SPEC.md "Target host"; the address is not
+in this repo). `gluetun` is the tunnel, `db` is Postgres, `crawler` walks and polls, `images`
+drains the image queue. All state is in Postgres plus `data/images`; both are gitignored bind
+mounts, so `git pull && docker compose build && docker compose up -d <service>` is the whole
+deploy. Restarting is safe at any time — the cursor is persisted and a partial batch is re-walked
+without HTTP.
+
+One query answers "is it healthy", and is worth running first:
+
+```sql
+SELECT (SELECT count(*) FROM articles)                                    AS articles,
+       (SELECT min(id) FROM articles)                                     AS reached,
+       (SELECT count(*) FROM comments)                                    AS comments,
+       (SELECT string_agg(status || '=' || n, ' ')
+          FROM (SELECT status, count(*) n FROM article_images GROUP BY 1) x) AS images,
+       (SELECT count(*) FROM fetch_log WHERE status = 'error')            AS fetch_errors;
+```
+
+Rising `error` on `article_images` with a flat `ok` means a host is misbehaving —
+`docker compose logs images | grep "holding off"` names the ones the circuit breaker is sitting
+out, and `babel requeue-images --host <h>` brings back anything already written off. A stalled walk
+looks identical to a healthy one from the outside: the containers stay `Up` and the logs stay quiet,
+so **check that `count(*) FROM articles` is actually rising** rather than trusting `docker ps`.
+
+Four image defects were found by watching this run, not by reasoning, and every one of them looked
+like success from the outside. If image behaviour ever seems wrong, measure a single fetch against
+the real host before changing code — twice in this project the obvious hypothesis was wrong and the
+measurement was cheap.
 
 ## Key facts
 
