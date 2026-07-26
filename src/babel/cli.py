@@ -2,10 +2,12 @@
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import pathlib
 import random
+from collections.abc import Awaitable, Callable
 
 import asyncpg
 import click
@@ -18,10 +20,15 @@ from babel.crawler.ingest import Ingestor
 from babel.crawler.poller import poll_once
 from babel.crawler.ratelimit import RateLimiter
 from babel.db.migrate import apply_migrations
-from babel.vpn import IpLeak, check_ip_leak
+from babel.vpn import IpInfo, IpLeak, check_ip_leak
 
 log = logging.getLogger("babel")
 MIGRATIONS = pathlib.Path(__file__).parent.parent.parent / "migrations"
+
+# A failed egress lookup is not evidence of a leak (see _watch_egress below),
+# but it must not be tolerated forever either — this bounds how long the
+# watchdog runs blind before treating persistent lookup failure as fatal.
+MAX_CONSECUTIVE_LOOKUP_FAILURES = 5
 
 
 @click.group()
@@ -136,7 +143,10 @@ async def _run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
             )
             return response.text
 
-        tasks = [asyncio.create_task(_watch_egress(settings))]
+        egress_check = functools.partial(check_ip_leak, home_country=settings.home_country)
+        tasks = [
+            asyncio.create_task(_watch_egress(egress_check, settings.ip_check_interval_sec))
+        ]
         if not no_poll:
             tasks.append(asyncio.create_task(_poll_forever(pool, ingestor, fetch_rss, settings)))
         if not no_backfill:
@@ -153,14 +163,52 @@ async def _run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
             task.result()  # re-raise
 
 
-async def _watch_egress(settings: Settings) -> None:
+async def _watch_egress(
+    check: Callable[[], Awaitable[IpInfo]], interval_sec: float
+) -> None:
+    """Poll egress IP on an interval.
+
+    ``check`` and ``interval_sec`` are injected (rather than read from
+    ``Settings`` inside the loop) so this is testable without a network or a
+    real clock; production passes a `check_ip_leak` call bound to `Settings`.
+
+    `IpLeak` means the egress IP reported the operator's home country and is
+    fatal on the very first occurrence — never retried, because a confirmed
+    leak is a reason to stop, not to wait.
+
+    A bare `RuntimeError` out of `check` means every IP-info provider failed
+    to answer after `check_ip_leak`'s own internal retries — those providers
+    rate-limit aggressively and Gluetun's DNS has been observed to block some
+    outright. That is a failed lookup, not evidence of a leak: the crawler's
+    shared network namespace with the VPN container already makes a real leak
+    architecturally impossible. Treating every failed lookup as fatal would
+    take down a month-long crawl over provider flakiness, so consecutive
+    failures are tolerated up to MAX_CONSECUTIVE_LOOKUP_FAILURES; any
+    successful check resets the count.
+    """
+    consecutive_failures = 0
     while True:
-        await asyncio.sleep(settings.ip_check_interval_sec)
+        await asyncio.sleep(interval_sec)
         try:
-            await check_ip_leak(home_country=settings.home_country)
+            await check()
         except IpLeak:
             log.exception("egress IP is in the home country — stopping")
             raise
+        except RuntimeError as e:
+            consecutive_failures += 1
+            log.warning(
+                "egress lookup failed (%d/%d consecutive): %s",
+                consecutive_failures,
+                MAX_CONSECUTIVE_LOOKUP_FAILURES,
+                e,
+            )
+            if consecutive_failures >= MAX_CONSECUTIVE_LOOKUP_FAILURES:
+                log.error(
+                    "egress lookup failed %d times in a row — stopping", consecutive_failures
+                )
+                raise
+        else:
+            consecutive_failures = 0
 
 
 async def _poll_forever(pool, ingestor: Ingestor, fetch_rss, settings: Settings) -> None:

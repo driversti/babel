@@ -13,11 +13,6 @@ from curl_cffi.requests import AsyncSession
 
 Getter = Callable[[str], Awaitable[tuple[int, str]]]
 
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-
 
 @dataclass(frozen=True, slots=True)
 class FetchResult:
@@ -69,13 +64,16 @@ def curl_getter(session: AsyncSession, timeout_sec: int) -> Getter:
     """Adapt a curl-cffi session to the Getter shape.
 
     curl-cffi impersonates a real Chrome TLS fingerprint, which is what keeps
-    Cloudflare uninterested.
+    Cloudflare uninterested. Do NOT pass a `headers={"User-Agent": ...}`
+    override here: `impersonate="chrome"` already generates a full header set
+    (User-Agent included) matched to the specific Chrome build whose TLS and
+    HTTP/2 fingerprint it is presenting. Supplying our own, different
+    User-Agent would make that header disagree with the fingerprint — a
+    stronger bot-detection signal than sending no impersonation at all.
     """
 
     async def get(url: str) -> tuple[int, str]:
-        response = await session.get(
-            url, timeout=timeout_sec, headers={"User-Agent": USER_AGENT}
-        )
+        response = await session.get(url, timeout=timeout_sec)
         return response.status_code, response.text
 
     return get

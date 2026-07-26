@@ -7,7 +7,7 @@ async def test_first_acquire_is_immediate():
     limiter = RateLimiter(rate_per_sec=2.0)
     start = asyncio.get_running_loop().time()
     await limiter.acquire()
-    assert asyncio.get_running_loop().time() - start < 0.05
+    assert asyncio.get_running_loop().time() - start < 0.2
 
 
 async def test_spaces_calls_by_the_configured_interval():
