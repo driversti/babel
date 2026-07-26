@@ -86,8 +86,10 @@ The conclusion is the opposite of the intuitive one. Old images are not worth ru
 being lost**: a third of 2021–2026 has already rotted, and the rest is decaying now. Every month of
 delay permanently costs part of the only layer still recoverable.
 
-So image capture belongs in phase 1, in the same pass as the article, in the same newest-first
-order. A later pass over 2024's articles will find strictly less than a pass today.
+So image capture belongs in phase 1, and it must work newest-first, for the same reason the
+backfill does. What matters is the delay, measured in minutes or hours — a sweep run months later
+recovers strictly less. It does not have to happen in the same pass as the article, and an earlier
+draft of this document over-specified that; see "Image capture runs as its own worker" below.
 
 | Depth | Images surviving | Bytes |
 |-------|-----------------:|------:|
@@ -127,8 +129,8 @@ Per article: body averages 1 357 characters, comments average 2 054 characters a
 
 ## Phase 1 scope
 
-A service that ends up holding every eRepublik article and its comments in Postgres, and stays
-current from then on. No AI, no web UI, no Telegram.
+A service that ends up holding every eRepublik article, its comments and its still-living images in
+Postgres, and stays current from then on. No AI, no web UI, no digests.
 
 ### Components
 
@@ -143,6 +145,15 @@ deeper, and the most useful years arrive first.
 global rate limiter. Fetches `/en/article/{id}/1/1000`, parses, writes.
 
 **Parser.** Pure functions over HTML strings, tested against saved fixtures. No network, no DB.
+
+**Image worker.** A separate process draining `article_images WHERE status = 'pending'`,
+newest-article-first, behind its own rate limit. Sleeps rather than consuming the queue when disk
+space runs low. See "Image capture runs as its own worker" below.
+
+**Notifier.** Telegram, for the two events where a human has to know and a log line will not reach
+them: the disk filling, and an egress IP in the home country. Deliberately narrow — this is not a
+digest, and adding routine notifications here would teach the operator to ignore it. Credentials
+live in `.env`.
 
 ### Network egress
 
@@ -232,7 +243,8 @@ CREATE TABLE article_images (
     position   int         NOT NULL,            -- order within the article body
     source_url text        NOT NULL,            -- as written by the author
     sha256     bytea       REFERENCES images(sha256),   -- NULL when not retrieved
-    status     text        NOT NULL,            -- ok | dead | skipped_no_space | error
+    status     text        NOT NULL,            -- pending | ok | dead | error
+    attempts   smallint    NOT NULL DEFAULT 0,
     checked_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (article_id, position)
 );
@@ -289,11 +301,15 @@ moving it must not require touching code.
 link is a recorded fact rather than an absence. `status = dead` is permanent knowledge: it says
 this image was already gone when we looked, which is worth keeping.
 
-**A free-space floor is mandatory.** Before each batch the crawler checks available space and
-stops fetching images below the threshold, recording `skipped_no_space` and continuing with text.
-On the intended host the image tree shares a filesystem with both Postgres and the OS root, so
-filling it takes down the machine and not merely the crawl. Text ingestion must never be blocked
-by image storage.
+**A free-space floor is mandatory.** On the intended host the image tree shares a filesystem with
+both Postgres and the OS root, so filling it takes down the machine and not merely the crawl. The
+image worker checks free space before each batch and, below the threshold, **sleeps with the queue
+untouched** and sends one notification. It does not mark the rows.
+
+Marking them would be the tempting move and it is wrong: a marked row has left the queue, and when
+space is freed — or `IMAGE_ROOT` is moved to a larger disk — nothing would go back for it. Leaving
+them `pending` makes recovery automatic. Text ingestion is unaffected either way, since it runs in
+a different process.
 
 ### Target host
 
@@ -324,16 +340,34 @@ made up front. Stopping at any point still leaves the most relevant years collec
 this ordering matter more, not less: the newest are both the most numerous survivors and the ones
 still actively disappearing.
 
-**Images are fetched in the same pass as the article.** Not a later sweep. The survival curve means
-a deferred pass recovers strictly less, and the loss is permanent.
+**Image capture runs as its own worker, draining a queue.** `save_article` writes each image
+reference as a `pending` row; a separate process — its own container, sharing the same VPN
+namespace — drains them newest-article-first. Three things follow, and each fixes a defect the
+original same-pass design had:
+
+- A kill mid-download strands nothing. `pending` is a queue state, not a lost row.
+- Images stop sharing eRepublik's politeness budget. That budget exists for erepublik.com; imgur
+  neither needs nor notices it. At 6.2 images per article, one shared 1 req/s limiter turns a
+  32-day crawl into roughly 234 days. Separate limits put article collection back at ~32 days.
+- Image capture can be paused without stopping article collection — which the free-space floor
+  above makes a certainty, not a hypothetical.
+
+The survival curve still governs the *order*: newest first, because that is where the living images
+are. What it never actually required was doing the work in the same pass.
+
+**Image fetches are rate-limited separately and politely per host.** A global limit distinct from
+eRepublik's, plus at most one concurrent request per hostname. Articles cite CDNs and someone's
+personal server side by side; the CDN will not notice either way, and the personal server should
+not be handed CDN-shaped load.
 
 **Nothing is translated at ingest time.** Store originals; translation is a phase 3 concern and
 belongs at query time, on the handful of documents actually retrieved.
 
 ### Out of scope
 
-Web UI, embeddings, search, translation, summarisation, Telegram, vote counts, newspaper metadata,
-author profiles.
+Web UI, embeddings, search, translation, summarisation, digests, vote counts, newspaper metadata,
+author profiles. Telegram is in scope only for the two alerts named under Components — nothing
+routine, nothing scheduled.
 
 ## Later phases, in brief
 
