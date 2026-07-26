@@ -138,6 +138,33 @@ def test_br_breaks_a_line():
     assert _body("Alpha<br>Beta") == "Alpha\nBeta"
 
 
+def test_br_with_an_attribute_still_breaks_a_line():
+    """Nineteen years of hand-written and WYSIWYG-generated markup includes
+    <br> tags carrying attributes, e.g. <br clear="all"> to clear a float.
+    A regex anchored on an immediate '>' misses these and silently welds
+    the surrounding text back together -- the exact defect this function
+    exists to fix, just on a shape none of the three fixtures happen to
+    contain.
+    """
+    assert _body('Alpha<br clear="all">Beta') == "Alpha\nBeta"
+
+
+def test_self_closing_br_with_an_attribute_still_breaks_a_line():
+    assert _body('Alpha<br class="clear" />Beta') == "Alpha\nBeta"
+
+
+def test_br_is_matched_case_insensitively():
+    assert _body("Alpha<BR>Beta") == "Alpha\nBeta"
+
+
+def test_a_tag_merely_starting_with_br_is_not_treated_as_a_break():
+    """<br\\b...> must not match <brand> or <broken> -- only a real <br>
+    tag, bare or with attributes, counts as a line break.
+    """
+    assert _body("Alpha<brand>Beta</brand>") == "Alpha Beta"
+    assert _body("Alpha<broken>Beta</broken>") == "Alpha Beta"
+
+
 def test_double_br_keeps_one_blank_line():
     assert _body("Alpha<br><br>Beta") == "Alpha\n\nBeta"
 
