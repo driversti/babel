@@ -19,6 +19,7 @@ from babel.crawler.fetcher import curl_getter
 from babel.crawler.ingest import Ingestor
 from babel.crawler.poller import poll_once
 from babel.crawler.ratelimit import RateLimiter
+from babel.db import repo
 from babel.db.migrate import apply_migrations
 from babel.vpn import IpInfo, IpLeak, check_ip_leak
 
@@ -29,6 +30,11 @@ MIGRATIONS = pathlib.Path(__file__).parent.parent.parent / "migrations"
 # but it must not be tolerated forever either — this bounds how long the
 # watchdog runs blind before treating persistent lookup failure as fatal.
 MAX_CONSECUTIVE_LOOKUP_FAILURES = 5
+
+# Marking a range stale means re-crawling it at 1 req/s. Ten thousand articles
+# is already the better part of a day, so anything larger asks for confirmation
+# rather than trusting a typed range.
+REFETCH_CONFIRM_THRESHOLD = 10_000
 
 
 @click.group()
@@ -227,3 +233,61 @@ async def _backfill_forever(pool, ingestor: Ingestor, start_id: int | None) -> N
     async with pool.acquire() as conn:
         await run_backfill(conn, ingestor.ingest, start_id=start_id, stop_at=1)
     log.info("backfill reached article 1 — archive complete")
+
+
+def parse_id_selection(ids: str | None, from_id: int | None, to_id: int | None) -> list[int]:
+    """Turn --ids or --from/--to into a sorted, deduplicated list of article IDs."""
+    if ids and (from_id is not None or to_id is not None):
+        raise ValueError("give either --ids or --from/--to, not both")
+    if ids:
+        out = set()
+        for part in ids.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if not part.isdigit():
+                raise ValueError(f"{part!r} is not a number")
+            out.add(int(part))
+        if not out:
+            raise ValueError("either --ids or --from/--to is required")
+        return sorted(out)
+    if from_id is None and to_id is None:
+        raise ValueError("either --ids or --from/--to is required")
+    if from_id is None or to_id is None:
+        raise ValueError("give both --from and --to")
+    if from_id > to_id:
+        raise ValueError("--from must not exceed --to")
+    return list(range(from_id, to_id + 1))
+
+
+@main.command()
+@click.option("--ids", default=None, help="Comma-separated article IDs.")
+@click.option("--from", "from_id", type=int, default=None, help="Range start, inclusive.")
+@click.option("--to", "to_id", type=int, default=None, help="Range end, inclusive.")
+@click.option("--yes", is_flag=True, help="Skip confirmation for large selections.")
+def refetch(ids: str | None, from_id: int | None, to_id: int | None, yes: bool) -> None:
+    """Queue already-collected articles for re-collection.
+
+    Use after fixing a parser bug, or when the site's markup has changed. Only
+    'ok' and 'error' rows are touched: a 404 says something about the article,
+    not about our copy of it, and an ID never fetched will be reached by the
+    walk anyway.
+    """
+    selection = parse_id_selection(ids, from_id, to_id)
+    if len(selection) > REFETCH_CONFIRM_THRESHOLD and not yes:
+        click.confirm(
+            f"This queues {len(selection):,} articles for re-collection, "
+            f"roughly {len(selection) / 86400:.1f} days at 1 request/second. Continue?",
+            abort=True,
+        )
+    asyncio.run(_refetch(selection))
+
+
+async def _refetch(selection: list[int]) -> None:
+    settings = Settings()
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        changed = await repo.mark_stale(conn, selection)
+    finally:
+        await conn.close()
+    click.echo(f"queued {changed:,} of {len(selection):,} selected article(s) for re-collection")
