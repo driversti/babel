@@ -11,14 +11,20 @@ expensive to obtain; do not re-derive them, and update them there if the site ch
 Phase 1 — crawler. All ten tasks are implemented: config, article/comment parser, DB schema +
 migration runner, repository layer, rate limiter + fetcher, content-addressed image store,
 end-to-end article ingest, RSS poller, newest-first backfill walker, and the CLI/service that
-composes them (`src/babel/cli.py`). The suite is 90 tests, all passing (`uv run pytest`, needs
-Docker for the `postgres:17` testcontainer) and `uv run ruff check src tests` is clean.
+composes them (`src/babel/cli.py`). 93 tests, all passing (`uv run pytest`, needs Docker for the
+`postgres:17` testcontainer); `uv run ruff check src tests` clean.
 
-**Not yet run against the live site.** Every measurement in SPEC.md was taken from a residential
-connection, and the crawler has never been exercised through the VPN. Task 1 Step 12 — fetch a
-hundred articles through the tunnel and confirm Cloudflare isn't challenging the exit node — is
-still blocked on VPN credentials and has not happened. Do not assume the crawler works end to end
-against the real site until that probe has run clean.
+**The probe has passed.** 100 article IDs fetched through a VPN tunnel from the target host:
+85 ok, 15 missing, zero Cloudflare challenges. Anonymous access from a VPN exit works.
+
+**The crawler itself has still never run.** The probe validates reachability, nothing more. No
+article has been stored, and one Critical plus four Important findings from the whole-branch review
+are open — see `docs/superpowers/plans/2026-07-26-final-review-findings.md`. The largest is C1:
+there is no way to re-visit an article once recorded, so a transient failure loses it permanently.
+
+**Runs on the x86_64 host, not the Jetson.** The Tegra kernel lacks `CONFIG_IP_ADVANCED_ROUTER`,
+so `ip rule` is unavailable and gluetun cannot start there at all. Details in `SPEC.md` under
+"Target host". The Jetson keeps phase 3.
 
 ## Key facts
 
