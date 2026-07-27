@@ -111,3 +111,25 @@ async def test_hidden_article_falls_through_to_the_404(client, pool):
     async with pool.acquire() as conn:
         await conn.execute("UPDATE articles SET hidden_at = now() WHERE id = 2103")
     assert (await client.get("/article/2103")).status_code == 404
+
+
+async def test_an_id_too_big_for_the_column_is_a_404_not_an_outage(client):
+    """`articles.id` is `bigint`, so a larger id cannot name a row we hold.
+
+    Binding one anyway makes asyncpg raise `DataError`, which is a
+    `PostgresError` — so it landed in the app's database-down handler and the
+    site answered 503 "The database is not answering", logging a traceback per
+    request. Any scanner could make a public archive report itself unavailable
+    on demand. Both ends of the range, because a sufficiently negative id
+    overflows the same way a positive one does.
+    """
+    for path in (
+        "/article/9223372036854775808",           # bigint max + 1
+        "/article/99999999999999999999999",
+        "/article/-9223372036854775809",          # bigint min - 1
+    ):
+        response = await client.get(path)
+        assert response.status_code == 404, path
+        assert "<html" in response.text.lower()
+        assert "not answering" not in response.text
+        assert "Traceback" not in response.text

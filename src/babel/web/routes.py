@@ -23,6 +23,10 @@ log = logging.getLogger(__name__)
 
 _STATS_TTL_SEC = 300
 
+# `articles.id` is `bigint` (migrations/001_initial.sql), so this is the largest
+# id the archive could ever hold — and the largest asyncpg will bind at all.
+MAX_ARTICLE_ID = 2**63 - 1
+
 
 class _ImageFileResponse(FileResponse):
     """A FileResponse scoped to the blob route.
@@ -240,10 +244,20 @@ def register_routes(app: FastAPI) -> None:
 
     @app.get("/article/{article_id}", response_class=HTMLResponse)
     async def article(request: Request, article_id: int):
+        # An id outside `articles.id`'s own range is not a lookup that can miss,
+        # it is one asyncpg refuses to bind: DataError, which is a PostgresError,
+        # which is the database-down handler — so a scanner's
+        # `/article/99999999999999999999999` made the site answer 503 "The
+        # database is not answering" and log a traceback per request. Such an id
+        # cannot name a row we hold, so it belongs in the same 404 as every other
+        # article we do not have. Checked here rather than with `Path(le=...)`,
+        # whose rejection is a raw FastAPI 422 JSON body instead of this
+        # archive's own page.
+        storable = 0 < article_id <= MAX_ARTICLE_ID
         async with app.state.pool.acquire() as conn:
-            detail = await browse.get_article(conn, article_id)
+            detail = await browse.get_article(conn, article_id) if storable else None
             if detail is None:
-                status = await browse.fetch_log_status(conn, article_id)
+                status = await browse.fetch_log_status(conn, article_id) if storable else None
                 stats = await _stats(app, conn)
                 return templates.TemplateResponse(
                     request=request,
