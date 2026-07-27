@@ -309,3 +309,55 @@ def test_thousands_of_dropped_elements_render_well_under_a_second():
     elapsed = time.perf_counter() - started
     assert "x0" not in out and "x3999" not in out
     assert elapsed < 1.0, f"took {elapsed:.2f}s -- DROPPED removal may have regressed to O(n^2)"
+
+
+def test_a_double_br_starts_a_new_paragraph():
+    out = html("<p>Alpha<br><br>Beta</p>")
+    assert out.count("<p>") == 2
+    assert "<p>Alpha</p>" in out
+    assert "<p>Beta</p>" in out
+
+
+def test_a_single_br_stays_a_line_break_inside_one_paragraph():
+    out = html("<p>Alpha<br>Beta</p>")
+    assert out.count("<p>") == 1
+    assert "Alpha<br>Beta" in out
+
+
+def test_a_longer_run_of_br_is_still_one_paragraph_break():
+    out = html("<p>Alpha<br><br><br><br>Beta</p>")
+    assert out.count("<p>") == 2
+
+
+def test_leading_and_trailing_breaks_produce_no_empty_paragraphs():
+    out = html("<p><br><br>Alpha<br><br></p>")
+    assert out == "<p>Alpha</p>"
+
+
+def test_whitespace_only_paragraphs_are_dropped():
+    out = html("<p>Alpha<br><br>   <br><br>Beta</p>")
+    assert out.count("<p>") == 2
+
+
+def test_emphasis_survives_the_paragraph_split():
+    out = html("<p><b>A</b><br><br>B</p>")
+    assert "<p><strong>A</strong></p>" in out
+
+
+def test_a_real_block_element_ends_the_paragraph():
+    out = html("<p>Alpha</p><ul><li>one</li><li>two</li></ul><p>Beta</p>")
+    assert "<ul><li>one</li><li>two</li></ul>" in out
+    assert "<p>Alpha</p>" in out
+    assert "<p>Beta</p>" in out
+
+
+def test_the_real_fixture_gains_paragraphs():
+    raw = (
+        '<div class="postBody"><p>Aziz eTürkiyem o/<br><br>'
+        "Meclis seçimleri.<br><br>"
+        "<u>30 ve üstü</u> oyu geçebilirsek <b>1000 Q7</b>.<br><br>"
+        "Turan Parisi Yönetimi</p></div>"
+    )
+    out = html(raw)
+    assert out.count("<p>") == 4
+    assert "<u>30 ve üstü</u>" in out

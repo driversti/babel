@@ -17,7 +17,7 @@ body, `<br>` for line breaks, a run of two or more for a paragraph, and `<q
 class="emoji ...">` around emoji. See SPEC.md.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -175,6 +175,36 @@ def _convert(node: Node, depth: int) -> tuple[object, ...]:
     if kept is None:
         return tuple(children)  # unwrap: keep the content, drop the wrapper
     if kept in BLOCKS:
+        # `li` is excluded: wrapping a list item's text in a <p> changes its
+        # spacing for no benefit.
+        #
+        # A source <p> -- the game's single body wrapper, or one an author
+        # nested -- dissolves directly into _paragraphs's own groups rather
+        # than being wrapped a second time: each group _paragraphs returns
+        # is already tagged "p", so wrapping it again in Block("p", ...)
+        # would nest <p> inside <p>. (A literal port of this branch that
+        # always did `Block(kept, tuple(_paragraphs(children)))` regardless
+        # of kept produced exactly that double-<p> for every source <p>,
+        # including the no-<br>-at-all case -- caught by
+        # test_a_single_br_stays_a_line_break_inside_one_paragraph, which a
+        # literal `out.count("<p>") == 1` cannot pass for the wrong reason.)
+        #
+        # Any other block -- blockquote, ul, ol, a heading -- keeps its own
+        # tag as the wrapper, so a <blockquote> holding a double <br> reads
+        # the same as the body does. But it only pays for the grouping pass,
+        # and only gains an inner <p>, when its children actually contain a
+        # paragraph boundary; content with none stays exactly as flat as
+        # Task 3 left it. Skipping that check and always grouping broke
+        # test_h1_becomes_h2_so_the_article_title_keeps_h1 -- a heading with
+        # no <br> at all still produces "<h2><p>Head</p></h2>" instead of
+        # "<h2>Head</h2>", because _paragraphs always wraps whatever it
+        # accumulates in Block("p", ...), break or no break.
+        if kept == "li":
+            return (Block("li", tuple(children)),)
+        if kept == "p":
+            return _paragraphs(children)
+        if _has_paragraph_break(children):
+            return (Block(kept, _paragraphs(children)),)
         return (Block(kept, tuple(children)),)
     if kept == "a":
         href = _href(node.attributes.get("href"))
@@ -183,6 +213,75 @@ def _convert(node: Node, depth: int) -> tuple[object, ...]:
         # what the author wrote either way.
         return (Inline("a", tuple(children), href),) if href else tuple(children)
     return (Inline(kept, tuple(children)),)
+
+
+def _is_blank(items: Sequence[object]) -> bool:
+    return all(
+        isinstance(i, (Text, Break)) and not str(getattr(i, "value", "")).strip()
+        for i in items
+    )
+
+
+def _has_paragraph_break(items: Sequence[object]) -> bool:
+    """True if grouping `items` through `_paragraphs` would actually change
+    anything: a run of two or more Breaks, or a nested Block that must stand
+    apart from the inline content around it. A single Break, or plain text
+    and inline elements with no Block among them, is content _paragraphs
+    would return as one untouched group -- so a caller that only wants to
+    know whether it needs to pay for grouping (and gains an inner <p> from
+    it) can skip the call entirely when this is False.
+    """
+    run = 0
+    for item in items:
+        if isinstance(item, Break):
+            run += 1
+            if run >= 2:
+                return True
+        elif isinstance(item, Block):
+            return True
+        else:
+            run = 0
+    return False
+
+
+def _paragraphs(items: Sequence[object]) -> tuple[object, ...]:
+    """Group a flat item stream into blocks.
+
+    A run of two or more Breaks is a paragraph boundary; a single Break stays a
+    <br>. The game writes the whole body as one <p> and separates paragraphs
+    with a double <br>, so this is where an article stops being a wall of text.
+    """
+    out: list[object] = []
+    current: list[object] = []
+    pending_breaks = 0
+
+    def flush() -> None:
+        while current and isinstance(current[-1], Break):
+            current.pop()
+        if current and not _is_blank(current):
+            out.append(Block("p", tuple(current)))
+        current.clear()
+
+    for item in items:
+        if isinstance(item, Block):
+            flush()
+            pending_breaks = 0
+            out.append(item)
+            continue
+        if isinstance(item, Break):
+            pending_breaks += 1
+            continue
+        if isinstance(item, Text) and not item.value.strip() and not current:
+            continue  # leading whitespace between breaks starts nothing
+        if pending_breaks >= 2:
+            flush()
+        elif pending_breaks == 1 and current:
+            current.append(Break())
+        pending_breaks = 0
+        current.append(item)
+
+    flush()
+    return tuple(out)
 
 
 def _emit(item: object) -> Markup:
@@ -234,7 +333,8 @@ def render_body(raw: str, images: Mapping[str, object]) -> RenderedBody:
     items: list[object] = []
     for child in root.iter(include_text=True):
         items.extend(_convert(child, 0))
+    blocks = _paragraphs(items)
     return RenderedBody(
-        html=Markup("").join(_emit(item) for item in items),
+        html=Markup("").join(_emit(item) for item in blocks),
         image_urls=frozenset(),
     )
