@@ -5,12 +5,15 @@ output alphabet, not the implementation: the invariant test at the bottom is
 the one that catches a case nobody thought of.
 """
 
+import pathlib
 import time
 
 import pytest
 from selectolax.parser import HTMLParser
 
 from babel.web.markup import ALLOWED_ATTRIBUTES, EMITTED_TAGS, Image, _convert, render_body
+
+FIXTURES = pathlib.Path(__file__).parent.parent / "fixtures"
 
 
 def html(raw: str) -> str:
@@ -352,12 +355,63 @@ def test_a_real_block_element_ends_the_paragraph():
 
 
 def test_the_real_fixture_gains_paragraphs():
-    raw = (
-        '<div class="postBody"><p>Aziz eTürkiyem o/<br><br>'
-        "Meclis seçimleri.<br><br>"
-        "<u>30 ve üstü</u> oyu geçebilirsek <b>1000 Q7</b>.<br><br>"
-        "Turan Parisi Yönetimi</p></div>"
-    )
-    out = html(raw)
-    assert out.count("<p>") == 4
+    """Read the actual fixture, not a hand-inlined stand-in for it.
+
+    The game writes "<br>" newline newline "<br>", not "<br><br>" --
+    selectolax parses that newline-newline gap into its own whitespace Text
+    node sitting *between* the two Break items. A hand-inlined "<br><br>"
+    skips exactly the shape that defeats a naive run-of-Breaks count, so this
+    test used to pass against an implementation that could not split a real
+    article at all -- it asserted `out.count("<p>") == 4` against input that
+    happened to already avoid the bug.
+
+    `body_node.html` (selectolax's outer-HTML property, div wrapper
+    included) mirrors `_capture_raw` in crawler/parser.py exactly:
+    `body_raw = node.html`. So this is the same string a real `body_raw`
+    column value would be.
+    """
+    fixture_html = (FIXTURES / "article_with_images.html").read_text(encoding="utf-8")
+    body_node = HTMLParser(fixture_html).css_first("div.postBody")
+    out = html(body_node.html)
+    # Six paragraphs by eye: greeting, list announcement, the <u>30 ve
+    # üstü</u> offer, and one each for the two image links and the sign-off.
+    assert out.count("<p>") == 6
     assert "<u>30 ve üstü</u>" in out
+
+
+def test_a_nested_block_gets_the_same_paragraph_treatment():
+    """Regression guard: replacing _has_paragraph_break's body with `return
+    False` leaves the whole 67-test suite green, because nothing else calls
+    it and nothing else exercises a non-p, non-li block with a real
+    paragraph boundary in its own children. Uses the real "<br>\\n\\n<br>"
+    shape, not an adjacent "<br><br>", so this also can't pass by accident
+    the way test_the_real_fixture_gains_paragraphs used to.
+    """
+    out = html("<blockquote>A<br>\n\n<br>B</blockquote>")
+    assert out == "<blockquote><p>A</p><p>B</p></blockquote>"
+
+
+def test_li_is_excluded_from_paragraph_grouping():
+    """Regression guard: deleting the `if kept == "li"` branch in _convert
+    leaves the whole suite green while a list item with a double <br> in it
+    gains `<li><p>A</p><p>B</p></li>` -- the exact spacing change the task's
+    own constraint forbids ("wrapping a list item's text in a <p> changes
+    its spacing for no benefit"). li never calls _paragraphs at all, so its
+    children are untouched: unlike the top-level and other-block cases, a
+    double <br> inside an <li> stays two literal <br> tags either way.
+    """
+    out = html("<ul><li>A<br><br>B</li></ul>")
+    assert out == "<ul><li>A<br><br>B</li></ul>"
+
+
+def test_a_block_boundary_flushes_pending_text_before_it_not_after():
+    """Regression guard: deleting the `flush()` call at the top of
+    _paragraphs's `Block` branch leaves the whole suite green while
+    reordering content. Without it, text accumulated in `current` before a
+    nested Block is only flushed by the loop's final, unconditional flush()
+    -- so it lands in `out` *after* the Block that structurally follows it,
+    silently reordering an archive's content rather than merely losing or
+    mis-wrapping it.
+    """
+    out = html("<blockquote>Alpha<ul><li>one</li></ul></blockquote>")
+    assert out == "<blockquote><p>Alpha</p><ul><li>one</li></ul></blockquote>"

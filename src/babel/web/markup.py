@@ -230,6 +230,11 @@ def _has_paragraph_break(items: Sequence[object]) -> bool:
     would return as one untouched group -- so a caller that only wants to
     know whether it needs to pay for grouping (and gains an inner <p> from
     it) can skip the call entirely when this is False.
+
+    Whitespace-only Text between two Breaks is transparent to the run count,
+    the same way `_paragraphs` itself treats it: the game writes
+    "<br>\\n\\n<br>", not "<br><br>", so a whitespace Text node sitting
+    between the pair must not look like it ends the run.
     """
     run = 0
     for item in items:
@@ -239,6 +244,8 @@ def _has_paragraph_break(items: Sequence[object]) -> bool:
                 return True
         elif isinstance(item, Block):
             return True
+        elif isinstance(item, Text) and not item.value.strip():
+            continue  # whitespace between two <br>s doesn't end the run either
         else:
             run = 0
     return False
@@ -271,8 +278,21 @@ def _paragraphs(items: Sequence[object]) -> tuple[object, ...]:
         if isinstance(item, Break):
             pending_breaks += 1
             continue
-        if isinstance(item, Text) and not item.value.strip() and not current:
-            continue  # leading whitespace between breaks starts nothing
+        if isinstance(item, Text) and not item.value.strip() and (pending_breaks or not current):
+            # Whitespace between the two <br>s of a real boundary, or leading
+            # whitespace before any content, starts nothing and must not
+            # reset pending_breaks: the game writes "<br>\n\n<br>", not
+            # "<br><br>" -- selectolax parses that newline-newline gap into
+            # its own Text node sitting *between* the two Break items, and
+            # this module walks nodes in document order, so that node is
+            # seen mid-run. Without the `pending_breaks` half of this guard,
+            # that whitespace fell through to the same path as ordinary
+            # text, which appended a lone Break and zeroed pending_breaks --
+            # so a genuine two-<br> boundary was counted as two runs of one,
+            # and no paragraph was ever created. Confirmed against all three
+            # fixtures in tests/fixtures/: zero of their 35 <br> pairs are
+            # strictly adjacent; every one has this exact whitespace gap.
+            continue
         if pending_breaks >= 2:
             flush()
         elif pending_breaks == 1 and current:
