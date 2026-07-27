@@ -85,8 +85,32 @@ async def verify_schema(conn: asyncpg.Connection) -> None:
     looking at Postgres. Crash-looping with this message instead is the same
     answer the two crawler commands already give, and what
     `restart: unless-stopped` is for.
+
+    `applied_migrations` itself only tells "the ledger is absent" from "the
+    ledger has rows" — it cannot tell "the ledger is unreadable" apart from
+    either, because a SELECT that fails on a permissions error never gets far
+    enough to see rows or their absence. Reproduced against a role granted
+    SELECT on the archive tables but not on `schema_migrations` (an easy gap:
+    `.env.example`'s `ALTER DEFAULT PRIVILEGES` line is what closes it, and a
+    stricter, hand-rolled grant list can omit a deploy-internal ledger table
+    without anyone intending to hide it): the read raises
+    `asyncpg.InsufficientPrivilegeError`, which is caught below and turned into
+    its own refusal — naming the permissions gap, not the migration, because an
+    unreadable ledger is not the same fact as a missing one and saying
+    `005_browse.sql is not in schema_migrations` here would be a claim this
+    function never actually checked.
     """
-    applied = await applied_migrations(conn)
+    try:
+        applied = await applied_migrations(conn)
+    except asyncpg.InsufficientPrivilegeError as exc:
+        raise RuntimeError(
+            "cannot verify the browse schema: the web role has no SELECT on "
+            "schema_migrations, so this check cannot tell an applied migration "
+            "from a missing one — it only knows the ledger could not be read. "
+            "Grant SELECT on schema_migrations (see .env.example's "
+            "`ALTER DEFAULT PRIVILEGES ... GRANT SELECT ON TABLES`, which covers "
+            "a ledger table created after the grant runs) and restart."
+        ) from exc
     missing = [name for name in REQUIRED_MIGRATIONS if name not in applied]
     if missing:
         raise RuntimeError(

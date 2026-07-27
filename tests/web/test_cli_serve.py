@@ -66,6 +66,33 @@ async def test_verify_schema_treats_a_database_with_no_ledger_as_unmigrated(pg):
         await verify_schema(pg)
 
 
+async def test_verify_schema_names_the_permission_gap_not_a_missing_migration(pg):
+    """An unreadable ledger is a different fact from a missing migration, and the
+    refusal must not conflate them.
+
+    Reproduced against a role that was never granted SELECT on
+    schema_migrations — an easy gap to leave, since `.env.example`'s
+    `ALTER DEFAULT PRIVILEGES` line is what closes it, and a stricter,
+    hand-rolled grant list can omit a deploy-internal ledger table without
+    anyone intending to hide it. Before this fix, `InsufficientPrivilegeError`
+    propagated straight out of `verify_schema` and crash-looped `babel serve`
+    against a database whose schema was, in fact, fully applied.
+    """
+    await pg.execute("CREATE ROLE verify_schema_unpriv LOGIN")
+    try:
+        await pg.execute("SET ROLE verify_schema_unpriv")
+        try:
+            with pytest.raises(RuntimeError, match="no SELECT on schema_migrations") as exc_info:
+                await verify_schema(pg)
+        finally:
+            await pg.execute("RESET ROLE")
+    finally:
+        await pg.execute("DROP ROLE verify_schema_unpriv")
+    # The honest fact is "unreadable", not "missing" — the message must not
+    # name a migration it never actually got to check.
+    assert REQUIRED_MIGRATIONS[0] not in str(exc_info.value)
+
+
 async def test_verify_schema_never_writes(pg):
     """It runs as the SELECT-only role, so it may only read.
 
