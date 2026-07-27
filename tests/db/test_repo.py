@@ -592,3 +592,43 @@ async def test_excluding_nothing_claims_everything(pg):
            VALUES (1, 0, 'https://a.example/1.png', 'pending')"""
     )
     assert len(await repo.claim_pending_images(pg, limit=10, cooldown_sec=0, excluded_hosts=[])) == 1
+
+
+async def test_save_article_round_trips_the_raw_markup(pg):
+    article = make_article(
+        article_id=9101, title="T", body="text only",
+        body_raw='<div class="postBody"><p>A<br><br><b>B</b></p></div>',
+        author_id=None, author_name="ann", country="Poland",
+        published_at=datetime.datetime(2026, 7, 21, 5, 53, tzinfo=datetime.UTC),
+        e_day=6817, comment_count=1,
+        comments=(Comment(id=55, position=0, depth=0, author_id=None,
+                          author_name="bob", posted_at=None,
+                          body="hi", body_raw="<p>hi<br>there</p>"),),
+    )
+    await repo.save_article(pg, article)
+
+    row = await pg.fetchrow("SELECT body, body_raw FROM articles WHERE id = 9101")
+    assert row["body"] == "text only"
+    assert row["body_raw"] == '<div class="postBody"><p>A<br><br><b>B</b></p></div>'
+    comment = await pg.fetchrow("SELECT body_raw FROM comments WHERE id = 55")
+    assert comment["body_raw"] == "<p>hi<br>there</p>"
+
+
+async def test_a_refetch_replaces_the_raw_markup(pg):
+    """The update branch is a separate SQL path and has been wrong before."""
+    def build(raw):
+        return make_article(
+            article_id=9102, title="T", body="text", body_raw=raw,
+            author_id=None, author_name="ann", country="Poland",
+            published_at=datetime.datetime(2026, 7, 21, 5, 53, tzinfo=datetime.UTC),
+            e_day=6817, comment_count=1,
+            comments=(Comment(id=56, position=0, depth=0, author_id=None,
+                              author_name="bob", posted_at=None,
+                              body="hi", body_raw=raw),),
+        )
+
+    await repo.save_article(pg, build("<p>first</p>"))
+    await repo.save_article(pg, build("<p>second</p>"))
+
+    assert await pg.fetchval("SELECT body_raw FROM articles WHERE id = 9102") == "<p>second</p>"
+    assert await pg.fetchval("SELECT body_raw FROM comments WHERE id = 56") == "<p>second</p>"

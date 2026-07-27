@@ -74,32 +74,35 @@ async def save_article(conn: asyncpg.Connection, article: Article) -> None:
     async with conn.transaction():
         await conn.execute(
             """
-            INSERT INTO articles (id, title, body, author_id, author_name, country,
-                                  published_at, e_day, comment_count, fetched_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())
+            INSERT INTO articles (id, title, body, body_raw, author_id, author_name,
+                                  country, published_at, e_day, comment_count, fetched_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
             ON CONFLICT (id) DO UPDATE SET
                 title = EXCLUDED.title, body = EXCLUDED.body,
+                body_raw = EXCLUDED.body_raw,
                 author_id = EXCLUDED.author_id, author_name = EXCLUDED.author_name,
                 country = EXCLUDED.country, published_at = EXCLUDED.published_at,
                 e_day = EXCLUDED.e_day, comment_count = EXCLUDED.comment_count,
                 fetched_at = now()
             """,
-            article.id, article.title, article.body, article.author_id, article.author_name,
-            article.country, article.published_at, article.e_day, article.comment_count,
+            article.id, article.title, article.body, article.body_raw,
+            article.author_id, article.author_name, article.country,
+            article.published_at, article.e_day, article.comment_count,
         )
 
         if article.comments:
             await conn.executemany(
                 """INSERT INTO comments (id, article_id, position, depth, author_id,
-                                         author_name, posted_at, body)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                                         author_name, posted_at, body, body_raw)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                    ON CONFLICT (id) DO UPDATE SET
                        position = EXCLUDED.position, depth = EXCLUDED.depth,
                        author_id = EXCLUDED.author_id, author_name = EXCLUDED.author_name,
-                       posted_at = EXCLUDED.posted_at, body = EXCLUDED.body""",
+                       posted_at = EXCLUDED.posted_at, body = EXCLUDED.body,
+                       body_raw = EXCLUDED.body_raw""",
                 [
                     (c.id, article.id, c.position, c.depth, c.author_id,
-                     c.author_name, c.posted_at, c.body)
+                     c.author_name, c.posted_at, c.body, c.body_raw)
                     for c in article.comments
                 ],
             )
