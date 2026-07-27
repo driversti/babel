@@ -1,5 +1,8 @@
 import datetime
+import re
 import urllib.parse
+
+from babel.web.cursor import game_date_to_utc
 
 UTC = datetime.UTC
 
@@ -99,3 +102,77 @@ async def test_pager_link_appears_only_when_there_is_another_page(client, pool):
 async def test_empty_result_explains_coverage_instead_of_showing_nothing(client):
     body = (await client.get("/", params={"country": "Nowhere"})).text
     assert "not in the archive yet" in body
+
+
+async def test_date_jump_includes_the_whole_day_newest_first(client, pool):
+    """A `?on=` jump must not drop the day it names.
+
+    Regression for a direction mismatch: `game_date_to_utc(jump)` is the
+    *start* of the day, but the descending page fetches rows strictly
+    *before* the cursor, so anchoring there put every article on `jump`
+    itself on the wrong side of "<" — the reader asked for this day and got
+    the one before it instead.
+    """
+    day = datetime.date(2026, 8, 10)
+    start = game_date_to_utc(day)
+    next_start = game_date_to_utc(day + datetime.timedelta(days=1))
+    await _seed(pool, [
+        (400, "PrevDay", "ann", "Poland", start - datetime.timedelta(minutes=1)),
+        (401, "FirstMinute", "ann", "Poland", start),
+        (402, "LastMinute", "ann", "Poland", next_start - datetime.timedelta(minutes=1)),
+        (403, "NextDay", "ann", "Poland", next_start),
+    ])
+    body = (await client.get("/", params={"on": "2026-08-10"})).text
+    assert "FirstMinute" in body
+    assert "LastMinute" in body
+    assert "NextDay" not in body
+    # Newest-first: the requested day leads, most recent first, then earlier
+    # days continue below it.
+    assert body.index("LastMinute") < body.index("FirstMinute") < body.index("PrevDay")
+
+
+async def test_date_jump_includes_the_whole_day_oldest_first(client, pool):
+    """The same jump, sorted the other way — already correct, guarded here too."""
+    day = datetime.date(2026, 8, 10)
+    start = game_date_to_utc(day)
+    next_start = game_date_to_utc(day + datetime.timedelta(days=1))
+    await _seed(pool, [
+        (410, "PrevDay", "ann", "Poland", start - datetime.timedelta(minutes=1)),
+        (411, "FirstMinute", "ann", "Poland", start),
+        (412, "LastMinute", "ann", "Poland", next_start - datetime.timedelta(minutes=1)),
+        (413, "NextDay", "ann", "Poland", next_start),
+    ])
+    body = (await client.get("/", params={"on": "2026-08-10", "order": "old"})).text
+    assert "FirstMinute" in body
+    assert "LastMinute" in body
+    assert "PrevDay" not in body
+    # Oldest-first: the requested day leads, earliest first, then later days
+    # continue below it.
+    assert body.index("FirstMinute") < body.index("LastMinute") < body.index("NextDay")
+
+
+async def test_pager_labels_track_the_chosen_order(client, pool):
+    """`order=old` continues towards newer articles, and the label must say so.
+
+    Previously hardcoded to "older →" / "← newer", which is only true
+    under `order=new` — under `order=old` the labels pointed the reader the
+    wrong way.
+    """
+    await _seed(pool, [
+        (500 + i, f"P{i}", "ann", "Poland",
+         datetime.datetime(2026, 9, 1, tzinfo=UTC) + datetime.timedelta(seconds=i))
+        for i in range(55)
+    ])
+
+    first = (await client.get("/", params={"order": "old"})).text
+    assert "P0" in first
+    assert "P54" not in first
+    assert "newer →" in first
+    assert "older →" not in first
+
+    match = re.search(r'href="(/\?after=[^"]+)"', first)
+    assert match, "expected a next-page link on the first oldest-first page"
+    second = (await client.get(match.group(1))).text
+    assert "P54" in second
+    assert "P0" not in second
+    assert "← older" in second

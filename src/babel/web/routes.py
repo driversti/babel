@@ -1,5 +1,6 @@
 """Route handlers. No SQL here — everything comes from babel.db.browse."""
 
+import datetime
 import time
 
 from fastapi import FastAPI, Request
@@ -65,7 +66,41 @@ def register_routes(app: FastAPI) -> None:
 
         jump = parse_game_date(on)
         if jump is not None:
-            cursor = browse.Cursor(published_at=game_date_to_utc(jump), article_id=0)
+            # The boundary a date jump lands on depends on which way the page
+            # is sorted, not just on the date itself.
+            #
+            # Oldest-first fetches rows strictly *after* the cursor, so
+            # anchoring at midnight of `jump` is already correct: the first
+            # page starts right after that instant, which is the first
+            # instant of the requested day.
+            #
+            # Newest-first fetches rows strictly *before* the cursor. Anchoring
+            # at midnight of `jump` itself would put every article published
+            # that day on the wrong side of "<" — the reported bug. The fix is
+            # to anchor at midnight of the *next* day instead, so the whole of
+            # `jump` satisfies "< next midnight" and only later days are
+            # excluded.
+            #
+            # `jump + timedelta(days=1)` is calendar arithmetic on a `date`,
+            # not instant arithmetic on a `datetime` — a game day is not
+            # always 24 hours across a DST transition in America/Los_Angeles,
+            # and `game_date_to_utc` re-resolves whichever calendar date
+            # results to its own correct UTC offset.
+            #
+            # Both branches use article_id=0 as the cursor's row component,
+            # for opposite reasons, both resting on ids always being positive:
+            # - Oldest-first's ">" needs a tie (a row published at exactly
+            #   midnight of `jump`) to be *included*: `id > 0` holds for every
+            #   real id, so it is.
+            # - Newest-first's "<" needs a tie (a row published at exactly
+            #   midnight of the *next* day — i.e. actually the following day,
+            #   not `jump`) to be *excluded*: `id < 0` holds for no real id,
+            #   so it is.
+            if order == "old":
+                cursor = browse.Cursor(published_at=game_date_to_utc(jump), article_id=0)
+            else:
+                next_day = jump + datetime.timedelta(days=1)
+                cursor = browse.Cursor(published_at=game_date_to_utc(next_day), article_id=0)
 
         going = "prev" if before else "next"
         filters = browse.ListFilters(country=country or None, author=author or None)
@@ -91,6 +126,19 @@ def register_routes(app: FastAPI) -> None:
             else None
         )
 
+        # The pager's words, not just its plumbing, have to follow `order`.
+        # "next" (after=) always continues in the direction the reader is
+        # already travelling, but which calendar direction that *is* flips
+        # with the sort: newest-first's "next" moves to older articles,
+        # oldest-first's "next" moves to newer ones. Chosen fix: flip the
+        # words themselves rather than switch to direction-neutral labels
+        # ("next page"/"previous page") — "older"/"newer" is the more useful
+        # thing for a reader of a date-sorted archive to know, as long as it
+        # is never wrong, so the label has to track `order` instead of being
+        # hardcoded to what is only true for one of the two sort orders.
+        next_label = "newer" if order == "old" else "older"
+        prev_label = "older" if order == "old" else "newer"
+
         return templates.TemplateResponse(
             request=request,
             name="list.html",
@@ -103,6 +151,8 @@ def register_routes(app: FastAPI) -> None:
                 "suggestions": suggestions,
                 "next_cursor": next_cursor,
                 "prev_cursor": prev_cursor,
+                "next_label": next_label,
+                "prev_label": prev_label,
                 "game_time": to_game_time,
                 "settings": app.state.settings,
             },

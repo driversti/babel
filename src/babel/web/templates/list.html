@@ -53,8 +53,8 @@
 </ol>
 
 <nav class="pager">
-  {% if prev_cursor %}<a href="/?before={{ prev_cursor|urlencode }}{% if filters.country %}&country={{ filters.country|urlencode }}{% endif %}{% if filters.author %}&author={{ filters.author|urlencode }}{% endif %}&order={{ order }}">← newer</a>{% endif %}
-  {% if next_cursor %}<a href="/?after={{ next_cursor|urlencode }}{% if filters.country %}&country={{ filters.country|urlencode }}{% endif %}{% if filters.author %}&author={{ filters.author|urlencode }}{% endif %}&order={{ order }}">older →</a>{% endif %}
+  {% if prev_cursor %}<a href="/?before={{ prev_cursor|urlencode }}{% if filters.country %}&country={{ filters.country|urlencode }}{% endif %}{% if filters.author %}&author={{ filters.author|urlencode }}{% endif %}&order={{ order }}">← {{ prev_label }}</a>{% endif %}
+  {% if next_cursor %}<a href="/?after={{ next_cursor|urlencode }}{% if filters.country %}&country={{ filters.country|urlencode }}{% endif %}{% if filters.author %}&author={{ filters.author|urlencode }}{% endif %}&order={{ order }}">{{ next_label }} →</a>{% endif %}
 </nav>
 {% else %}
 <p class="empty">Nothing here.
