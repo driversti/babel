@@ -15,6 +15,8 @@ from dataclasses import dataclass
 
 import asyncpg
 
+from babel.db.repo import MAX_IMAGE_ATTEMPTS
+
 PAGE_SIZE = 50
 
 
@@ -118,3 +120,178 @@ async def list_articles(
     if not forward:
         rows.reverse()
     return ListPage(rows=tuple(rows), has_more=has_more)
+
+
+@dataclass(frozen=True, slots=True)
+class ArticleDetail:
+    id: int
+    title: str
+    body: str
+    author_name: str | None
+    author_id: int | None
+    country: str | None
+    published_at: datetime.datetime
+    e_day: int | None
+    comment_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class CommentRow:
+    id: int
+    position: int
+    depth: int
+    author_id: int | None
+    author_name: str | None
+    posted_at: datetime.datetime | None
+    body: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveStats:
+    articles: int
+    oldest: datetime.datetime | None
+    newest: datetime.datetime | None
+    frontier: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class BlobRow:
+    sha256: bytes
+    withheld_at: datetime.datetime | None
+
+
+async def get_article(conn: asyncpg.Connection, article_id: int) -> ArticleDetail | None:
+    row = await conn.fetchrow(
+        """SELECT id, title, body, author_name, author_id, country,
+                  published_at, e_day, comment_count
+             FROM articles
+            WHERE id = $1 AND hidden_at IS NULL""",
+        article_id,
+    )
+    return ArticleDetail(**dict(row)) if row else None
+
+
+async def get_comments(conn: asyncpg.Connection, article_id: int) -> tuple[CommentRow, ...]:
+    rows = await conn.fetch(
+        """SELECT id, position, depth, author_id, author_name, posted_at, body
+             FROM comments WHERE article_id = $1 ORDER BY position""",
+        article_id,
+    )
+    return tuple(CommentRow(**dict(r)) for r in rows)
+
+
+async def get_ok_image_digests(conn: asyncpg.Connection, article_id: int) -> tuple[bytes, ...]:
+    rows = await conn.fetch(
+        """SELECT ai.sha256
+             FROM article_images ai
+             JOIN images i ON i.sha256 = ai.sha256
+            WHERE ai.article_id = $1 AND ai.status = 'ok'
+              AND ai.sha256 IS NOT NULL AND i.withheld_at IS NULL
+            ORDER BY ai.position""",
+        article_id,
+    )
+    return tuple(r["sha256"] for r in rows)
+
+
+async def image_status_counts(conn: asyncpg.Connection, article_id: int) -> dict[str, int]:
+    """Four buckets, because 'not captured yet' is not 'gone'.
+
+    The drain runs slower than the walk produces work, so `pending` is the normal
+    state for a recently crawled article, not an edge case. Counting
+    `total - ok` would render "6 of 6 images were already gone when we looked"
+    above an empty gallery on the newest articles — the inverse of the truth, on
+    the project's central claim about itself.
+    """
+    row = await conn.fetchrow(
+        """SELECT
+             count(*) FILTER (WHERE status = 'ok')                              AS ok,
+             count(*) FILTER (WHERE status = 'dead')                            AS dead,
+             count(*) FILTER (WHERE status = 'pending'
+                                 OR (status = 'error' AND attempts < $2))       AS waiting,
+             count(*) FILTER (WHERE status = 'error' AND attempts >= $2)        AS exhausted
+           FROM article_images WHERE article_id = $1""",
+        article_id, MAX_IMAGE_ATTEMPTS,
+    )
+    return {k: int(v) for k, v in dict(row).items()}
+
+
+# A loose index scan: ~70 probes into articles_country_list_idx rather than a
+# scan of the table. Postgres has no native skip scan, so the recursion is how
+# you ask for one.
+_COUNTRIES_SQL = """
+WITH RECURSIVE t AS (
+    (SELECT country FROM articles
+      WHERE country IS NOT NULL AND hidden_at IS NULL
+      ORDER BY country LIMIT 1)
+    UNION ALL
+    SELECT (SELECT country FROM articles
+             WHERE country > t.country AND country IS NOT NULL AND hidden_at IS NULL
+             ORDER BY country LIMIT 1)
+      FROM t WHERE t.country IS NOT NULL
+)
+SELECT country FROM t WHERE country IS NOT NULL
+"""
+
+
+async def list_countries(conn: asyncpg.Connection) -> tuple[str, ...]:
+    rows = await conn.fetch(_COUNTRIES_SQL)
+    return tuple(r["country"] for r in rows)
+
+
+def _prefix_upper_bound(prefix: str) -> str:
+    """The smallest string greater than every string starting with `prefix`."""
+    return prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+
+async def suggest_authors(
+    conn: asyncpg.Connection, prefix: str, limit: int = 8
+) -> tuple[str, ...]:
+    """Up to `limit` author names starting with `prefix`, case-insensitively.
+
+    A range scan, not `LIKE` with `DISTINCT`. DISTINCT is a blocking aggregate
+    that LIMIT cannot push through, so that form costs O(matching articles):
+    measured on 600k rows, `?author=a` aggregated 50,990 rows to return 8, reading
+    95MB, and `?author=%` became a 938MB sequential scan. This form reads 127
+    buffers in 0.10ms and is O(limit). It also means no LIKE ever sees user
+    input, so `%` and `_` need no escaping — they are ordinary characters.
+    """
+    lowered = prefix.lower()
+    if not lowered:
+        return ()
+    rows = await conn.fetch(
+        """SELECT DISTINCT ON (lower(author_name)) author_name
+             FROM articles
+            WHERE lower(author_name) >= $1 AND lower(author_name) < $2
+              AND hidden_at IS NULL
+            ORDER BY lower(author_name), published_at DESC, id DESC
+            LIMIT $3""",
+        lowered, _prefix_upper_bound(lowered), limit,
+    )
+    return tuple(r["author_name"] for r in rows)
+
+
+async def archive_stats(conn: asyncpg.Connection) -> ArchiveStats:
+    """What the archive holds and how far collection has reached.
+
+    The span is two InitPlan limits over articles_list_idx — 8 buffers, 0.105ms
+    at 2.8M rows — so it is not the expensive part. The count is; the caller
+    caches this whole result.
+    """
+    row = await conn.fetchrow(
+        """SELECT (SELECT count(*) FROM articles WHERE hidden_at IS NULL)      AS articles,
+                  (SELECT min(published_at) FROM articles WHERE hidden_at IS NULL) AS oldest,
+                  (SELECT max(published_at) FROM articles WHERE hidden_at IS NULL) AS newest,
+                  (SELECT next_id FROM crawl_cursor WHERE name = 'backfill')   AS frontier"""
+    )
+    return ArchiveStats(**dict(row))
+
+
+async def get_blob(conn: asyncpg.Connection, digest: bytes) -> BlobRow | None:
+    row = await conn.fetchrow(
+        "SELECT sha256, withheld_at FROM images WHERE sha256 = $1", digest
+    )
+    return BlobRow(**dict(row)) if row else None
+
+
+async def fetch_log_status(conn: asyncpg.Connection, article_id: int) -> str | None:
+    return await conn.fetchval("SELECT status FROM fetch_log WHERE article_id = $1", article_id)
