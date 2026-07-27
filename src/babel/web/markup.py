@@ -88,11 +88,18 @@ MAX_DEPTH = 100
 # route falls back to `articles.body`, which holds every word regardless.
 MAX_NESTING = 1000
 
-# Below this the scan is skipped, because nesting cannot cost anything at this
-# size: a 32 KiB body nested as deeply as its own length permits (depth 2,978)
-# parses in 19.5 ms, and 16 KiB in 5.3 ms. The average archived body is 3.4 KB
-# (SPEC.md), so in practice the scan never runs. It is not free -- 79 ms over a
-# flat 1 MB document -- which is exactly why it is gated on size.
+# Below this the scan is skipped, because nesting cannot cost *much* at this
+# size, not because it costs nothing: a 32 KiB body of plain <div>...</div>,
+# nested as deeply as its own length permits (depth 2,978), parses in 19.5 ms
+# -- but that is the cheap shape, not the worst one this size can hold. A
+# tag-dense shape wastes fewer bytes per level: "<b></x>" * 4,681 also fits in
+# 32 KiB (the close never matches, so it costs nothing but bytes) and reaches
+# depth 4,666, measured at 62 ms to parse. Still comfortably inside the 1 s
+# budget this guard exists to protect, which is what makes the floor safe --
+# just not free. 16 KiB nested (div) is 5.3 ms. The average archived body is
+# 3.4 KB (SPEC.md), so in practice the scan never runs. The scan itself is
+# not free either -- 79 ms over a flat 1 MB document -- which is exactly why
+# it is gated on size rather than run unconditionally.
 GUARD_MIN_BYTES = 32 * 1024
 
 # HTML5's void elements. A naive counter that treats every `<tag` as a descent
@@ -110,8 +117,44 @@ def _too_deeply_nested(raw: str) -> bool:
 
     Deliberately approximate: it counts what the markup *says*, not what an
     HTML5 tree builder would make of it. Over-counting only costs a body the
-    plain-text fallback; under-counting is impossible, because every descent the
-    parser makes is an open tag here too.
+    plain-text fallback; under-counting is the dangerous direction, because it
+    is what lets a hostile body reach the real parser unbounded -- so every
+    choice below is made to never under-count, even at the cost of sometimes
+    over-counting a body that would actually have parsed cheaply.
+
+    A running balance -- +1 on an open, -1 on any close -- is NOT enough, and
+    an earlier version of this function used one. selectolax (like any HTML5
+    tree builder) ignores a close tag that names no open element currently in
+    scope: it is simply skipped, not applied to whatever happens to be on
+    top. A running balance does not know that -- it decrements on every close
+    regardless of its name -- so pairing each open with a close that names
+    something else (`"<div></x>" * 90000`, 810 KB, inside crawler/parser.py's
+    1,000,000-character ceiling) drops the balance back down after every
+    pair while the real parser, finding no open `<x>` to match, ignores the
+    close and keeps genuinely nesting the `<div>`. Measured directly: that
+    input parsed in 18,157 ms -- worse than the 17,662 ms balanced attack
+    this guard exists to stop -- while the running balance never tripped.
+    Reproduced the same way with `<div></p>`, `<x></y>`, `<b></x>`,
+    `<div></br>`, `<DIV></X>`, `<div\\n></x>`, and `<div a=">"></x>`.
+
+    The fix models the one part of HTML5 tree construction this guard
+    actually needs: a stack of open tag names, plus a name -> count map so
+    "is this name open anywhere right now" is an O(1) check rather than a
+    stack scan. An open pushes and increments; the stack's own length is
+    the true nesting depth, so the MAX_NESTING check reads it directly
+    instead of trusting a separately-tracked number that could drift from
+    it. A close whose name has a zero count is ignored outright, exactly as
+    the real parser ignores it. A close whose name IS open pops the stack
+    down to and including the matching entry, decrementing each popped
+    name's count as it goes -- this is also deliberate, not incidental: it
+    mirrors the real parser force-closing any unclosed descendants when an
+    ancestor's end tag arrives (`<div><span></div>` closes both, because
+    nothing else could `</span>` refer to once the `<div>` that contains it
+    is gone), so an attacker cannot use an unclosed inner tag to keep extra
+    stack entries around under a name this function has already popped.
+    Every push is popped at most once across the whole scan, so the total
+    cost stays linear in the number of tags -- the same amortised-O(1)-per-
+    tag shape the previous, wrong version had, not a quadratic one.
 
     A trailing "/" on the tag (`<div/>`) is NOT treated as self-closing here,
     on purpose, for anything outside `_VOID_ELEMENTS`. HTML5 has no general
@@ -122,22 +165,36 @@ def _too_deeply_nested(raw: str) -> bool:
     tags at all) parse to an actual tree 2,000 levels deep, identically to
     the same input without the slashes -- so treating the slash as closing
     the tag here would have under-counted exactly the shape this guard
-    exists to catch, silently reopening the DoS this task closes for any
-    tag an attacker writes with a trailing "/". `<img src="x"/>` still
-    costs nothing, because `img` is void regardless of how it is spelled --
-    confirmed the same way, depth 2 either with or without the slash -- so
-    this is not a case the archive's own image markup depends on.
+    exists to catch. `<img src="x"/>` still costs nothing, because `img` is
+    void regardless of how it is spelled -- confirmed the same way, depth 2
+    either with or without the slash.
+
+    HTML5's *implicit* closes are deliberately NOT modelled -- `<p><p><p>`
+    does not nest three deep; the parser closes the previous `<p>` the
+    moment the next one opens. Teaching this function that rule would only
+    ever REDUCE the depth it counts for such input, which moves error onto
+    the dangerous side (under-counting) to fix a case that only ever costs
+    the safe one (a paragraph-heavy body over-counted into the plain-text
+    fallback it didn't strictly need). Do not add it.
     """
     if len(raw) < GUARD_MIN_BYTES:
         return False
-    depth = 0
+    stack: list[str] = []
+    open_counts: dict[str, int] = {}
     for match in _TAG_RE.finditer(raw):
         closing, name = match.group(1), match.group(2).lower()
         if closing:
-            depth = max(0, depth - 1)
+            if not open_counts.get(name):
+                continue  # no matching open tag in scope -- the parser ignores this too
+            while stack:
+                popped = stack.pop()
+                open_counts[popped] -= 1
+                if popped == name:
+                    break
         elif name not in _VOID_ELEMENTS:
-            depth += 1
-            if depth > MAX_NESTING:
+            stack.append(name)
+            open_counts[name] = open_counts.get(name, 0) + 1
+            if len(stack) > MAX_NESTING:
                 return True
     return False
 

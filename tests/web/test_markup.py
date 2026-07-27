@@ -768,6 +768,44 @@ def test_a_self_closed_non_void_tag_still_counts_toward_depth():
     assert render_body(raw, {}) is None
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "<div></x>" * 20_000,
+        "<div></p>" * 20_000,
+        "<x></y>" * 20_000,
+        "<b></x>" * 20_000,
+    ],
+    ids=["div-x", "div-p", "x-y", "b-x"],
+)
+def test_a_mismatched_close_tag_cannot_defeat_the_depth_counter(raw):
+    """Found in review: a running balance -- +1 on open, -1 on ANY close --
+    is defeated by pairing every open with a close that names something
+    else. The balance drops back to 0 (or oscillates 0/1) after every pair,
+    so it never crosses MAX_NESTING, while selectolax's real parser ignores
+    the mismatched close -- there is no open <x>, <p>, or <y> in scope for
+    it to match -- and keeps the outer tag genuinely open, nesting tens of
+    thousands of levels deep.
+
+    Reproduced directly (this exact table, before the fix): "<div></x>" *
+    90000 (810 KB, inside crawler/parser.py's 1,000,000-character ceiling)
+    parsed in 18,157 ms -- worse than the 17,662 ms balanced attack this
+    guard was written to stop -- while the running-balance counter never
+    tripped on it. Also reproduced with `<div></br>`, `<DIV></X>`,
+    `<div\\n></x>`, and `<div a=">"></x>`; not exercised individually here
+    because the fix -- a real stack that ignores a close with no matching
+    open, per HTML5 tree construction -- closes all of them the same way,
+    by construction, not by pattern-matching this specific list.
+
+    N=20,000 here (not the worst-case 90,000 above) because refusal, once
+    fixed, is a fast early-exit -- the size only matters for how long the
+    *unfixed* counter takes to falsely clear it, which this test does not
+    need to demonstrate again.
+    """
+    assert len(raw) > GUARD_MIN_BYTES
+    assert render_body(raw, {}) is None
+
+
 def test_the_pathological_body_renders_in_well_under_a_second():
     """The whole point. Without the guard this exact input takes ~17.7 s."""
     n = 1_000_000 // 11
