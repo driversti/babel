@@ -1,0 +1,96 @@
+/* Minimal readable sheet. Not the deliverable — legible in both colour schemes
+   is the whole bar. */
+
+:root {
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #5b5b5b;
+  --link: #0b5fae;
+  --border: #dddddd;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --fg: #e7e7e7;
+    --muted: #a3a3a3;
+    --link: #7db8ff;
+    --border: #333640;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem;
+  background: var(--bg);
+  color: var(--fg);
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    Helvetica,
+    Arial,
+    sans-serif;
+  line-height: 1.5;
+}
+
+header,
+main,
+footer {
+  max-width: 46rem;
+  margin: 0 auto;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding-bottom: 1rem;
+  margin-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+header .home {
+  font-weight: 700;
+  font-size: 1.25rem;
+  color: var(--fg);
+  text-decoration: none;
+}
+
+header .tag {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+a {
+  color: var(--link);
+}
+
+h1 {
+  font-size: 1.5rem;
+}
+
+.body-text {
+  white-space: pre-wrap;
+}
+
+footer {
+  margin-top: 3rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+footer p {
+  margin: 0.25rem 0;
+}

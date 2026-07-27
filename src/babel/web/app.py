@@ -1,0 +1,129 @@
+"""The public read-only site.
+
+Deliberately not in gluetun's network namespace: it needs inbound connections,
+which that namespace cannot accept, and its only outbound dependency is
+Postgres on the bridge. The site therefore stays up when the tunnel is down.
+"""
+
+import contextlib
+import logging
+import pathlib
+from collections.abc import AsyncIterator
+
+import asyncpg
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from babel.config import Settings
+
+log = logging.getLogger(__name__)
+
+TEMPLATE_DIR = pathlib.Path(__file__).parent / "templates"
+STATIC_DIR = pathlib.Path(__file__).parent / "static"
+
+# Article pages are crawlable so the noindex on them is actually seen: a crawler
+# blocked by robots.txt never fetches the page and therefore never reads the
+# header, which leaves the URL indexable as a bare entry that noindex can never
+# remove. The parameterised list space is refused because filter combinations
+# are a crawl trap carrying no content of their own.
+ROBOTS_TXT = "User-agent: *\nDisallow: /?\nAllow: /\n"
+
+CSP = (
+    "default-src 'self'; script-src 'none'; img-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+)
+
+
+async def open_pool(settings: Settings) -> asyncpg.Pool:
+    """The read-only pool.
+
+    The read-only guarantee is a property of the ROLE, not of this call. asyncpg
+    runs `RESET ALL` on every connection release, which returns
+    default_transaction_read_only to the role default — measured against
+    postgres:17, a pool built with `init=` had acquire #1 blocked and acquire #2
+    writing successfully. So `ALTER ROLE babel_web SET
+    default_transaction_read_only = on` is the control, and it is an operator
+    step because the role's password does not belong in this repository. See
+    README.md.
+    """
+    dsn = settings.web_database_url
+    if not dsn:
+        raise RuntimeError(
+            "WEB_DATABASE_URL is not set. The public site connects as a SELECT-only "
+            "role; falling back to DATABASE_URL would run it as the database owner."
+        )
+    if dsn == settings.database_url:
+        raise RuntimeError(
+            "WEB_DATABASE_URL equals DATABASE_URL. The public site must not connect "
+            "as the crawler's own role. See README.md for the role setup."
+        )
+    return await asyncpg.create_pool(dsn, min_size=1, max_size=settings.web_pool_size)
+
+
+def create_app(settings: Settings, pool: object | None = None) -> FastAPI:
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # An injected pool belongs to the caller: used as-is, never closed here.
+        # That is the seam the tests drive the app through, and it leaves the
+        # production path — pool omitted, open_pool runs — exactly as strict.
+        if pool is not None:
+            app.state.pool = pool
+            yield
+            return
+        app.state.pool = await open_pool(settings)
+        try:
+            yield
+        finally:
+            await app.state.pool.close()
+
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.settings = settings
+    app.state.templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next) -> Response:
+        response = await call_next(request)
+        response.headers["X-Robots-Tag"] = "noindex, nofollow"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers.setdefault("Content-Security-Policy", CSP)
+        return response
+
+    @app.get("/robots.txt", response_class=PlainTextResponse)
+    async def robots() -> str:
+        return ROBOTS_TXT
+
+    @app.get("/healthz", response_class=PlainTextResponse)
+    async def healthz() -> str:
+        return "ok"
+
+    def render_error(request: Request, status: int, heading: str, detail: str) -> HTMLResponse:
+        return app.state.templates.TemplateResponse(
+            request=request,
+            name="error.html",
+            context={"heading": heading, "detail": detail, "settings": settings},
+            status_code=status,
+        )
+
+    @app.exception_handler(404)
+    async def not_found(request: Request, exc: Exception) -> HTMLResponse:
+        return render_error(request, 404, "Not here", "There is no such page in this archive.")
+
+    @app.exception_handler(asyncpg.PostgresError)
+    @app.exception_handler(OSError)
+    async def database_down(request: Request, exc: Exception) -> HTMLResponse:
+        # A traceback on a public page tells a stranger about the schema. The log
+        # gets the detail; the reader gets a sentence.
+        log.exception("database error serving %s", request.url.path)
+        return render_error(
+            request, 503, "The archive is unavailable",
+            "The database is not answering. This is usually brief.",
+        )
+
+    from babel.web.routes import register_routes  # noqa: PLC0415 — avoids a cycle
+
+    register_routes(app)
+    return app

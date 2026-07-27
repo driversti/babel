@@ -85,6 +85,17 @@ class Settings(BaseSettings):
     chat_id: str | None = Field(default=None, description="Telegram chat id. Never committed.")
     alert_repeat_sec: float = Field(default=3600.0, gt=0)
 
+    # The web service connects as a SELECT-only role. There is deliberately no
+    # working default: falling back to `database_url` would run the public site
+    # as the database owner, and that failure is silent.
+    web_database_url: str | None = Field(default=None)
+
+    # Shown in the footer so a player whose article is archived here has
+    # somewhere to write. Never hardcoded — this repository is public.
+    contact: str | None = Field(default=None)
+
+    web_pool_size: int = Field(default=10, ge=1, le=50)
+
     def article_url(self, article_id: int) -> str:
         return f"{BASE_URL}/en/article/{article_id}/1/{self.comments_per_page}"
 

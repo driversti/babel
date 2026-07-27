@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{% block title %}babel{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header><a class="home" href="/">babel</a> <span class="tag">eRepublik article archive</span></header>
+  <main>{% block content %}{% endblock %}</main>
+  <footer>
+    <p>An archive of articles published on eRepublik, kept because the originals
+       are deleted and the images they link to stop resolving. Every article is
+       the work of its author and links back to the original.</p>
+    {% if settings.contact %}<p>Wrote something here and want it removed? {{ settings.contact }}</p>{% endif %}
+  </footer>
+</body>
+</html>

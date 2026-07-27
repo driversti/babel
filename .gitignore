@@ -38,4 +38,9 @@ gluetun/
 scratch/
 *.html
 !tests/fixtures/**/*.html
+# Jinja templates are source, and the *.html rule above would silently drop them:
+# `git add -A` exits 0 without mentioning the file, the suite still passes because
+# pythonpath reads the working tree, and the deploy host raises TemplateNotFound
+# on every route. Verified with `git check-ignore -v`.
+!src/babel/**/*.html
 .superpowers/
