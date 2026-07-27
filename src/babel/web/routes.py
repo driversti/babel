@@ -18,6 +18,7 @@ from babel.web.cursor import (
     parse_game_date,
     to_game_time,
 )
+from babel.web.markup import render_body
 
 log = logging.getLogger(__name__)
 
@@ -328,14 +329,33 @@ def register_routes(app: FastAPI) -> None:
             image_map = await browse.get_image_map(conn, article_id)
             counts = await browse.image_status_counts(conn, article_id)
 
+        rendered = render_body(detail.body_raw, image_map) if detail.body_raw else None
+        comment_html = {
+            c.id: render_body(c.body_raw, {}).html for c in comments if c.body_raw
+        }
+
+        # With markup, every image the article still cites is shown in place, so
+        # the strip below holds only blobs whose URL the article has dropped
+        # since we captured them — the case migration 004 exists to protect.
+        # Without markup (a row not re-collected yet) it is the whole gallery,
+        # exactly as before.
+        shown = rendered.image_urls if rendered else frozenset()
+        gallery = [
+            state.sha256.hex()
+            for url, state in image_map.items()
+            if state.state == "ok" and state.sha256 and url not in shown
+        ]
+
         return templates.TemplateResponse(
             request=request,
             name="article.html",
             context={
                 "article": detail,
+                "body_html": rendered.html if rendered else None,
                 "comments": comments,
-                "digests": [s.sha256.hex() for s in image_map.values()
-                            if s.state == "ok" and s.sha256],
+                "comment_html": comment_html,
+                "gallery": gallery,
+                "gallery_is_leftover": rendered is not None,
                 "counts": counts,
                 "game_time": to_game_time,
                 "settings": app.state.settings,

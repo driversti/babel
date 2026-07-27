@@ -133,3 +133,122 @@ async def test_an_id_too_big_for_the_column_is_a_404_not_an_outage(client):
         assert "<html" in response.text.lower()
         assert "not answering" not in response.text
         assert "Traceback" not in response.text
+
+
+async def test_markup_is_rendered_when_body_raw_is_present(client, pool):
+    await _article(pool, 2100, body="Alpha Beta")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE articles SET body_raw = $1 WHERE id = 2100",
+            "<p>Alpha<br><br><b>Beta</b></p>",
+        )
+    body = (await client.get("/article/2100")).text
+    assert "<p>Alpha</p>" in body
+    assert "<strong>Beta</strong>" in body
+
+
+async def test_a_row_without_body_raw_still_renders_the_plain_text(client, pool):
+    await _article(pool, 2101, body="Line one.\nLine two.")
+    body = (await client.get("/article/2101")).text
+    assert "body-text" in body
+    assert "Line one." in body
+
+
+async def test_a_script_in_body_raw_cannot_reach_the_page(client, pool):
+    await _article(pool, 2102)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE articles SET body_raw = $1 WHERE id = 2102",
+            '<p>ok<script>alert(1)</script><a href="javascript:alert(2)">x</a></p>',
+        )
+    body = (await client.get("/article/2102")).text
+    assert "<script>alert(1)</script>" not in body
+    assert "javascript:alert(2)" not in body
+    assert "ok" in body
+
+
+async def test_a_captured_image_renders_inline_and_not_in_the_gallery(client, pool):
+    await _article(pool, 2103)
+    digest = bytes.fromhex("1a" * 32)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE articles SET body_raw = $1 WHERE id = 2103",
+            '<p>see<br><br><img src="https://h/a.png"></p>',
+        )
+        await conn.execute(
+            "INSERT INTO images (sha256, bytes, mime) VALUES ($1, 3, 'image/png')", digest,
+        )
+        await conn.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status, sha256)
+               VALUES (2103, 0, 'https://h/a.png', 'ok', $1)""", digest,
+        )
+    body = (await client.get("/article/2103")).text
+    assert f'/img/{digest.hex()}' in body
+    assert body.count(f'/img/{digest.hex()}') == 1  # inline only, not also below
+
+
+async def test_an_image_dropped_from_the_article_still_shows_below(client, pool):
+    await _article(pool, 2104)
+    digest = bytes.fromhex("2b" * 32)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE articles SET body_raw = $1 WHERE id = 2104", "<p>no images now</p>",
+        )
+        await conn.execute(
+            "INSERT INTO images (sha256, bytes, mime) VALUES ($1, 3, 'image/png')", digest,
+        )
+        await conn.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status, sha256)
+               VALUES (2104, 0, 'https://h/old.png', 'ok', $1)""", digest,
+        )
+    body = (await client.get("/article/2104")).text
+    assert f'/img/{digest.hex()}' in body
+    assert "no longer in the article" in body
+
+
+async def test_a_missing_image_renders_a_placeholder_with_a_link(client, pool):
+    await _article(pool, 2105)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE articles SET body_raw = $1 WHERE id = 2105",
+            '<p><img src="https://h/gone.png"></p>',
+        )
+        await conn.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status)
+               VALUES (2105, 0, 'https://h/gone.png', 'dead')"""
+        )
+    body = (await client.get("/article/2105")).text
+    assert "already gone" in body
+    assert 'href="https://h/gone.png"' in body
+
+
+async def test_comment_markup_is_rendered(client, pool):
+    await _article(pool, 2106, comment_count=1)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO comments (id, article_id, position, depth, author_name,
+                                     body, body_raw)
+               VALUES (91, 2106, 0, 0, 'bob', 'one two',
+                       '<p>one<br><br><a href="https://e.org/">two</a></p>')"""
+        )
+    body = (await client.get("/article/2106")).text
+    assert 'href="https://e.org/"' in body
+    assert "<p>one</p>" in body
+
+
+async def test_the_plain_text_fallback_does_not_also_appear_beside_markup(client, pool):
+    """Found by mutation testing: removing the {% if body_html %}/{% else %}
+    split so `article.body` always renders alongside `body_html` left the
+    brief's own test_markup_is_rendered_when_body_raw_is_present green, since
+    that test only asserts the rendered markup is present, never that the raw
+    plain-text fallback is absent. `class="body-text"` is the fallback's own
+    marker and appears nowhere else on a comment-free article.
+    """
+    await _article(pool, 2107, body="Alpha Beta")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE articles SET body_raw = $1 WHERE id = 2107",
+            "<p>Alpha Beta</p>",
+        )
+    body = (await client.get("/article/2107")).text
+    assert 'class="body-text"' not in body

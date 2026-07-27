@@ -94,3 +94,52 @@ footer {
 footer p {
   margin: 0.25rem 0;
 }
+
+/* Rendered article markup. `.body-text` above still serves rows collected
+   before the markup was archived, which is why its pre-wrap stays. */
+
+.body p {
+  margin: 0 0 1rem;
+}
+
+.body h2,
+.body h3 {
+  font-size: 1.15rem;
+  margin: 1.5rem 0 0.5rem;
+}
+
+.body ul,
+.body ol {
+  margin: 0 0 1rem;
+  padding-left: 1.5rem;
+}
+
+.body blockquote {
+  margin: 0 0 1rem;
+  padding-left: 1rem;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+
+.body img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0.5rem 0;
+}
+
+.missing-image {
+  display: block;
+  padding: 0.75rem 1rem;
+  margin: 0.5rem 0;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.gallery img {
+  max-width: 100%;
+  height: auto;
+  margin: 0.5rem 0;
+}

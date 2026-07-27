@@ -17,11 +17,18 @@
          href="https://www.erepublik.com/en/article/{{ article.id }}">original</a>
   </p>
 
+  {% if body_html %}
+  <div class="body">{{ body_html }}</div>
+  {% else %}
   <div class="body-text">{{ article.body }}</div>
+  {% endif %}
 
-  {% if digests %}
+  {% if gallery %}
   <div class="gallery">
-    {% for hex in digests %}<img src="/img/{{ hex }}" alt="" loading="lazy">{% endfor %}
+    {% if gallery_is_leftover %}
+    <p class="meta">Images no longer in the article's text</p>
+    {% endif %}
+    {% for hex in gallery %}<img src="/img/{{ hex }}" alt="" loading="lazy">{% endfor %}
   </div>
   {% endif %}
 
@@ -39,7 +46,13 @@
   <div class="comment" style="margin-left: {{ c.depth * 1.5 }}rem">
     <p class="meta">{{ c.author_name or "someone" }}{% if c.posted_at %} ·
       {{ game_time(c.posted_at).strftime("%Y-%m-%d %H:%M") }}{% endif %}</p>
-    <p class="body-text">{% if c.body is none %}[removed]{% else %}{{ c.body }}{% endif %}</p>
+    {% if c.body is none %}
+    <p class="body-text">[removed]</p>
+    {% elif comment_html.get(c.id) %}
+    <div class="body">{{ comment_html[c.id] }}</div>
+    {% else %}
+    <p class="body-text">{{ c.body }}</p>
+    {% endif %}
   </div>
   {% endfor %}
 </section>
