@@ -758,6 +758,40 @@ git commit -m "Add the markup walker: an allowlist, escaped text, two ceilings"
 The problem that started this: the game separates paragraphs with a double
 `<br>` inside one `<p>`, so a stripped body is one block.
 
+> **This task's Step 1 and Step 3 code below is WRONG in two ways, both caught in
+> review, both fixed in the shipped implementation. Read `src/babel/web/markup.py`
+> and `tests/web/test_markup.py` as the source of truth, not this section.**
+>
+> 1. **The `BLOCKS` branch double-wraps.** Step 3's `_convert` change nests a
+>    `<p>` inside a source `<p>` even with zero `<br>`, and adds a spurious inner
+>    `<p>` to every other block tag. Measured: the literal code fails 7 of the
+>    module's 67 tests, including the pre-existing
+>    `test_h1_becomes_h2_so_the_article_title_keeps_h1`, which yields
+>    `<h2><p>Head</p></h2>`. The shipped fix branches on `kept`: `"p"` dissolves
+>    into `_paragraphs`'s own groups, and other blocks gain an inner `<p>` only
+>    when a `_has_paragraph_break()` gate confirms a real boundary.
+>
+> 2. **`_paragraphs` misses every real paragraph boundary.** The game writes
+>    `<br>` newline newline `<br>`, not `<br><br>` — there is a whitespace text
+>    node between them. In Step 3's code that whitespace `Text` fails the
+>    `not current` guard, falls through, appends one `Break`, and resets
+>    `pending_breaks` to 0, so a genuine boundary reads as two runs of one.
+>    Measured over this repo's three fixtures: **0 of 35 boundaries are strictly
+>    adjacent**, and every fixture rendered as a single paragraph — the exact
+>    defect this branch exists to fix, surviving the task written to fix it.
+>
+> Two of Step 1's own tests passed against the broken Step 3 because they use
+> substring (`in out`) checks, and `test_the_real_fixture_gains_paragraphs`
+> hand-inlined `<br><br>`, removing the very shape that defeated the code. The
+> shipped test reads `tests/fixtures/article_with_images.html` through
+> `css_first("div.postBody").html` — the same path `_capture_raw` stores — and
+> asserts the paragraph count.
+>
+> The general lesson, which cost this branch four rounds across two tasks: on
+> this module, an assertion that would hold with the change absent is the
+> default outcome, not the exception. Prefer `==` over `in`, and feed tests the
+> shape production actually produces.
+
 **Files:**
 - Modify: `src/babel/web/markup.py`
 - Test: `tests/web/test_markup.py`
