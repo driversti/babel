@@ -103,7 +103,10 @@ footer p {
 }
 
 .body h2,
-.body h3 {
+.body h3,
+.body h4,
+.body h5,
+.body h6 {
   font-size: 1.15rem;
   margin: 1.5rem 0 0.5rem;
 }

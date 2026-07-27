@@ -340,11 +340,32 @@ def register_routes(app: FastAPI) -> None:
         # Without markup (a row not re-collected yet) it is the whole gallery,
         # exactly as before.
         shown = rendered.image_urls if rendered else frozenset()
-        gallery = [
+
+        # Subtracting by URL is not the same as subtracting by blob: an
+        # author re-uploading byte-identical media under a new address —
+        # the exact edit migration 004 exists to protect — leaves
+        # article_images with two rows for one digest, one cited and one
+        # not. `seen` starts pre-loaded with the digest of every URL the
+        # body actually shows, so a leftover row sharing that digest is
+        # excluded even though its own URL was never cited, and it keeps
+        # growing as the gallery is built so two leftover rows sharing a
+        # digest don't produce two gallery entries either. Without this, a
+        # shared blob rendered once inline and again below, captioned "no
+        # longer in the article's text" — a caption that was false for it.
+        seen: set[str] = {
             state.sha256.hex()
             for url, state in image_map.items()
-            if state.state == "ok" and state.sha256 and url not in shown
-        ]
+            if url in shown and state.sha256
+        }
+        gallery: list[str] = []
+        for url, state in image_map.items():
+            if state.state != "ok" or not state.sha256 or url in shown:
+                continue
+            hex_digest = state.sha256.hex()
+            if hex_digest in seen:
+                continue
+            seen.add(hex_digest)
+            gallery.append(hex_digest)
 
         return templates.TemplateResponse(
             request=request,
@@ -355,7 +376,16 @@ def register_routes(app: FastAPI) -> None:
                 "comments": comments,
                 "comment_html": comment_html,
                 "gallery": gallery,
-                "gallery_is_leftover": rendered is not None,
+                # Content, not existence: a body_raw that parses but renders
+                # to nothing (e.g. a single whitespace-only paragraph) still
+                # produces a non-None RenderedBody, and `rendered is not
+                # None` called that "markup was shown" even though the page
+                # falls back to plain text — the same falsy .html the
+                # template's own `{% if body_html %}` already checks.
+                # Mismatched, the two could disagree: plain text shown
+                # alongside a gallery captioned as if a real body had been
+                # compared against it.
+                "gallery_is_leftover": bool(rendered and rendered.html),
                 "counts": counts,
                 "game_time": to_game_time,
                 "settings": app.state.settings,

@@ -218,7 +218,7 @@ async def test_a_missing_image_renders_a_placeholder_with_a_link(client, pool):
                VALUES (2105, 0, 'https://h/gone.png', 'dead')"""
         )
     body = (await client.get("/article/2105")).text
-    assert "already gone" in body
+    assert "missing-image" in body
     assert 'href="https://h/gone.png"' in body
 
 
@@ -252,3 +252,106 @@ async def test_the_plain_text_fallback_does_not_also_appear_beside_markup(client
         )
     body = (await client.get("/article/2107")).text
     assert 'class="body-text"' not in body
+
+
+async def test_the_gallery_subtracts_per_url_not_page_wide(client, pool):
+    """A mutant that makes the subtraction page-wide -- `gallery = [...] if
+    not shown else []` -- passes both test_a_captured_image_renders_inline_
+    and_not_in_the_gallery (image A alone: shown is non-empty, so the whole
+    gallery collapses to [] regardless of the per-URL check, and A's count
+    assertion still holds since it is only ever emitted inline) and
+    test_an_image_dropped_from_the_article_still_shows_below (image B
+    alone: shown is empty, so the whole-gallery-or-nothing branch still
+    yields the full gallery). Neither test has an article citing one image
+    while carrying a leftover second one, so neither can tell "subtract
+    this URL" from "subtract everything, once, based on whether anything at
+    all is shown". This is that article.
+    """
+    await _article(pool, 2108)
+    digest_a = bytes.fromhex("5e" * 32)
+    digest_b = bytes.fromhex("6f" * 32)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE articles SET body_raw = $1 WHERE id = 2108",
+            '<p>see<br><br><img src="https://h/cited.png"></p>',
+        )
+        await conn.execute(
+            "INSERT INTO images (sha256, bytes, mime) VALUES ($1, 3, 'image/png'), "
+            "($2, 3, 'image/png')", digest_a, digest_b,
+        )
+        await conn.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status, sha256)
+               VALUES (2108, 0, 'https://h/cited.png', 'ok', $1),
+                      (2108, 1, 'https://h/dropped.png', 'ok', $2)""",
+            digest_a, digest_b,
+        )
+    body = (await client.get("/article/2108")).text
+    body_start = body.index('<div class="body">')
+    gallery_start = body.index('<div class="gallery">')
+    images_note_start = body.index('<p class="images-note">')
+    body_slice = body[body_start:gallery_start]
+    gallery_slice = body[gallery_start:images_note_start]
+    assert f'/img/{digest_a.hex()}' in body_slice
+    assert f'/img/{digest_a.hex()}' not in gallery_slice
+    assert f'/img/{digest_b.hex()}' in gallery_slice
+    assert f'/img/{digest_b.hex()}' not in body_slice
+
+
+async def test_the_same_blob_under_two_urls_does_not_render_twice(client, pool):
+    """An author re-uploading byte-identical media under a new URL -- the
+    edit pattern migration 004 exists to protect -- gives article_images two
+    rows for one digest. Only one of the two URLs is still cited in
+    body_raw; the other is a stale duplicate of an image the reader can
+    already see. Without deduping by digest, the leftover URL's row still
+    clears the per-URL `not in shown` check (its own URL was never cited)
+    and lands in the gallery, showing the same blob a second time under a
+    caption -- "no longer in the article's text" -- that is false for it.
+    """
+    await _article(pool, 2109)
+    digest = bytes.fromhex("3c" * 32)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE articles SET body_raw = $1 WHERE id = 2109",
+            '<p><img src="https://h/live.png"></p>',
+        )
+        await conn.execute(
+            "INSERT INTO images (sha256, bytes, mime) VALUES ($1, 3, 'image/png')", digest,
+        )
+        await conn.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status, sha256)
+               VALUES (2109, 0, 'https://h/live.png', 'ok', $1),
+                      (2109, 1, 'https://h/old-copy.png', 'ok', $1)""",
+            digest,
+        )
+    body = (await client.get("/article/2109")).text
+    assert body.count(f'/img/{digest.hex()}') == 1
+    assert "no longer in the article" not in body
+
+
+async def test_an_empty_rendered_body_does_not_falsely_flag_the_gallery(client, pool):
+    """body_raw = "<p>   </p>" parses to a real (non-None) RenderedBody
+    whose .html is empty -- _paragraphs drops whitespace-only paragraphs --
+    so `rendered is not None` is true even though there is no rendered
+    markup on the page at all. The template's own body branch already
+    falls back to plain text correctly, because {% if body_html %} tests
+    the *content*, not whether `rendered` exists -- but gallery_is_leftover
+    used to test existence, not content, so the page showed the plain-text
+    body and a gallery captioned "no longer in the article's text" for an
+    image the (empty) rendered body was never actually compared against.
+    """
+    await _article(pool, 2110, body="Alpha Beta")
+    digest = bytes.fromhex("4d" * 32)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE articles SET body_raw = $1 WHERE id = 2110", "<p>   </p>",
+        )
+        await conn.execute(
+            "INSERT INTO images (sha256, bytes, mime) VALUES ($1, 3, 'image/png')", digest,
+        )
+        await conn.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status, sha256)
+               VALUES (2110, 0, 'https://h/x.png', 'ok', $1)""", digest,
+        )
+    body = (await client.get("/article/2110")).text
+    assert 'class="body-text"' in body
+    assert "no longer in the article" not in body
