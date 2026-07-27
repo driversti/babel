@@ -5,6 +5,8 @@ output alphabet, not the implementation: the invariant test at the bottom is
 the one that catches a case nobody thought of.
 """
 
+import time
+
 import pytest
 from selectolax.parser import HTMLParser
 
@@ -266,3 +268,44 @@ def test_a_protocol_relative_image_source_survives_as_the_raw_string():
     p_node = next(c for c in body.iter(include_text=True) if c.tag == "p")
     img_node = next(c for c in p_node.iter(include_text=True) if c.tag == "img")
     assert _convert(img_node, 0) == (Image("//www.erepublik.net/images/x/Turkey.png"),)
+
+
+def test_an_image_source_survives_verbatim_including_incidental_whitespace():
+    """Image.source_url must match what crawler/parser.py actually stored.
+
+    crawler/parser.py writes img.attributes.get("src") to article_images
+    with no .strip() -- so a src carrying surrounding whitespace is stored
+    with that whitespace intact. _convert validates a stripped-and-
+    normalised COPY (scheme checking tolerates incidental whitespace fine)
+    but must store the raw, unstripped attribute value, or Task 5's
+    `images.get(item.source_url)` misses a row that's actually on disk.
+    """
+    body = HTMLParser('<p><img src=" //host/x.png "></p>').body
+    p_node = next(c for c in body.iter(include_text=True) if c.tag == "p")
+    img_node = next(c for c in p_node.iter(include_text=True) if c.tag == "img")
+    assert _convert(img_node, 0) == (Image(" //host/x.png "),)
+
+
+def test_thousands_of_dropped_elements_render_well_under_a_second():
+    """Cost guard, not just correctness -- a correctness-only test would have
+    passed on the quadratic version too.
+
+    An earlier version of render_body removed DROPPED subtrees with
+    `while (n := root.css_first(sel)) is not None: n.decompose()`, which
+    rescans the whole tree on every css_first() call and so costs O(n^2) in
+    the number of dropped elements: measured at 25.3s for 8,000 of them,
+    long enough to stall the `web` process's async event loop (and its
+    /healthz) for every other in-flight request. render_body now uses
+    HTMLParser.strip_tags(), which runs in selectolax's C layer and is
+    linear. body_raw is capped at 1,000,000 characters (crawler/parser.py),
+    so a stored body can hold several times the 4,000-element payload here;
+    "well under a second" is a generous ceiling against a ~5ms measurement,
+    chosen to be robust to slower CI hardware while still catching a
+    regression back to quadratic behaviour.
+    """
+    raw = "<p>" + "".join(f"<script>x{i}</script>" for i in range(4000)) + "</p>"
+    started = time.perf_counter()
+    out = html(raw)
+    elapsed = time.perf_counter() - started
+    assert "x0" not in out and "x3999" not in out
+    assert elapsed < 1.0, f"took {elapsed:.2f}s -- DROPPED removal may have regressed to O(n^2)"

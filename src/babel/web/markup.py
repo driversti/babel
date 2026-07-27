@@ -141,21 +141,32 @@ def _convert(node: Node, depth: int) -> tuple[object, ...]:
     if kept == "br":
         return (Break(),)
     if kept == "img":
-        # Same scheme check as an <a> href, but validated against a
-        # normalised copy rather than the raw string: protocol-relative
+        # Same scheme check as an <a> href, applied to a stripped-and-
+        # normalised COPY, not the value that gets stored: protocol-relative
         # sources ("//host/path") are common in older articles (see
-        # crawler/images.py's normalise_url, which rewrites "//" to
-        # "https://" for the same reason before fetching), and
-        # article_images already holds rows keyed on the raw "//..." form.
-        # _href("//host/path") alone would reject it for having no scheme
-        # and silently drop the image. Image.source_url stays the RAW
-        # string -- Task 5 looks images up by exactly what the article
-        # wrote -- and its own emit path re-validates with _href before it
-        # ever links anywhere, so validating a normalised copy here loses
-        # no safety, only avoids losing content.
-        raw_src = (node.attributes.get("src") or "").strip()
-        normalised = "https:" + raw_src if raw_src.startswith("//") else raw_src
-        return (Image(raw_src),) if _href(normalised) else ()
+        # crawler/images.py's normalise_url, which does the same "//" ->
+        # "https://" rewrite before fetching, for the same reason), so
+        # validation strips and prefixes a copy rather than rejecting "//"
+        # for lacking a scheme. Image.source_url itself stores the RAW,
+        # UNSTRIPPED attribute value: crawler/parser.py writes
+        # img.attributes.get("src") to article_images verbatim, with no
+        # .strip(), so a src carrying incidental whitespace (" //host/x ")
+        # must be looked up the same way at render time or Task 5's
+        # `images.get(item.source_url)` misses a blob that is on disk.
+        #
+        # This check is a scheme filter and nothing more. It accepts
+        # anything whose normalised form parses with scheme http/https,
+        # which still admits malformed or dangerous-looking netlocs
+        # ("///evil", "//127.0.0.1/x.png", "//user:pass@evil.example/x")
+        # that neither this check nor crawler/images.py's address guard
+        # (which runs at fetch time, against already-collected URLs, not
+        # here) rejects. Whether source_url is actually safe to link to or
+        # fetch is Task 5's own emit-time decision, not a guarantee this
+        # module makes.
+        verbatim_src = node.attributes.get("src") or ""
+        stripped = verbatim_src.strip()
+        normalised = "https:" + stripped if stripped.startswith("//") else stripped
+        return (Image(verbatim_src),) if _href(normalised) else ()
 
     children: list[object] = []
     for child in node.iter(include_text=True):
@@ -192,29 +203,34 @@ def _emit(item: object) -> Markup:
 
 
 def render_body(raw: str, images: Mapping[str, object]) -> RenderedBody:
-    root = HTMLParser(raw or "").body
+    tree = HTMLParser(raw or "")
+    # Remove every DROPPED subtree once, before the walk, rather than
+    # relying only on the per-node check inside _convert. The depth
+    # ceiling's flatten path calls node.text(), which walks descendant text
+    # nodes in C and does not know about DROPPED -- so a <script> or
+    # <style> sitting deeper than MAX_DEPTH would otherwise have its source
+    # text resurrected as escaped but visible text. Stripping first means
+    # there is nothing left under a too-deep node for that flatten to find.
+    # The check inside _convert stays as defense in depth; it is simply
+    # never reached for these tags once this has run.
+    #
+    # strip_tags(), not a Python-side removal loop: an earlier version used
+    # `while (n := root.css_first(sel)) is not None: n.decompose()`
+    # specifically to avoid double-decomposing a node whose ancestor was
+    # already freed (a plain `for n in root.css(sel): n.decompose()` could
+    # do that, since DROPPED can nest -- e.g. <form> containing <input>).
+    # But css_first() rescans the whole tree on every call, so that loop is
+    # O(n^2) in the number of dropped elements. Measured: 8,000 dropped
+    # elements in one body (body_raw can hold roughly five times that many
+    # under its 1,000,000-character cap) took 25.3s in the while-loop
+    # version against ~5ms here -- long enough to stall the `web`
+    # process's event loop, since the route handlers are async, and take
+    # /healthz down with every other in-flight request. strip_tags() runs
+    # entirely in selectolax's C layer and is linear.
+    tree.strip_tags(sorted(DROPPED), recursive=True)
+    root = tree.body
     if root is None:
         return RenderedBody(html=Markup(""), image_urls=frozenset())
-    # Remove every DROPPED subtree once, up front, rather than relying only
-    # on the per-node check inside _convert. The depth ceiling's flatten path
-    # calls node.text(), which walks descendant text nodes in C and does not
-    # know about DROPPED -- so a <script> or <style> sitting deeper than
-    # MAX_DEPTH would otherwise have its source text resurrected as escaped
-    # but visible text. Decomposing first means there is nothing left under
-    # a too-deep node for that flatten to find. The check inside _convert
-    # stays as defense in depth; it is simply never reached for these tags
-    # once this has run.
-    #
-    # css_first() + re-query, not css() + a single pass over a snapshot list:
-    # a snapshot can contain a node whose ancestor is also in DROPPED (e.g.
-    # <form> before <input> in whatever order frozenset iteration happens to
-    # hash to -- that order is randomised per process). Decomposing the
-    # ancestor first frees the child too, and decomposing an already-freed
-    # node relies on undocumented selectolax behaviour. Re-querying the live
-    # tree each time never touches a node that isn't still attached.
-    dropped_selector = ",".join(DROPPED)
-    while (dropped := root.css_first(dropped_selector)) is not None:
-        dropped.decompose()
     items: list[object] = []
     for child in root.iter(include_text=True):
         items.extend(_convert(child, 0))
