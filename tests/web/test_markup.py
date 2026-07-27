@@ -610,3 +610,38 @@ def test_a_withheld_blob_inside_an_author_link_leaves_no_link_at_all():
     assert "https://h/1.png" not in out
     assert "<a " not in out
     assert "not available" in out
+
+
+def test_anchor_unwrap_examines_every_image_not_just_the_first_one_it_meets():
+    """Regression guard for three properties of _anchor_must_unwrap that no
+    other test pins -- each is a mutant that survives the whole file
+    otherwise (mutation-tested individually; see the task report):
+
+    - It must not stop scanning the moment it meets a GOOD image (`continue`,
+      not `break`). This anchor has two images; the good one (h/2.png) sits
+      later in the anchor's own child order but is visited FIRST by the
+      traversal's LIFO stack (stack.pop() pops the last-pushed child first),
+      so a `break` on the first good image found would exit before ever
+      reaching the bad one nested inside <b>.
+    - It must recurse into a non-Image child's own children
+      (`stack.extend(children)`). The bad image (h/1.png) is not a direct
+      child of the <a> -- it's nested one level inside a <b> -- so a check
+      that only inspects direct children would never see it.
+    - `state.state == "ok"` alone isn't enough to call an image real:
+      `state.sha256 is None` is its own disqualifying condition. h/1.png is
+      exactly that shape -- the one
+      test_an_ok_state_with_no_digest_yet_degrades_to_a_placeholder exists to
+      cover -- and dropping this clause restores the I1/I2 defect (an author
+      <a> surviving around a placeholder) for it specifically.
+    """
+    images = {
+        "https://h/1.png": ImageState(state="ok", sha256=None),
+        "https://h/2.png": ImageState(state="ok", sha256=DIGEST),
+    }
+    raw = (
+        '<p><a href="https://src.example/"><b><img src="https://h/1.png"></b>'
+        '<img src="https://h/2.png"></a></p>'
+    )
+    out = str(render_body(raw, images).html)
+    assert 'href="https://src.example/"' not in out
+    assert out.count("<a ") == 1
