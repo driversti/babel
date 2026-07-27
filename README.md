@@ -187,7 +187,7 @@ and article query instead, and hiding twice is a no-op — it does not overwrite
 arrived.
 
 **Neither command reaches a cache that already holds the page.** `/img/{sha256}` is served with
-`Cache-Control: public, max-age=86400, must-revalidate` and no `ETag`; `must-revalidate` governs what
+`Cache-Control: public, max-age=86400, must-revalidate`; `must-revalidate` governs what
 a cache may do once the entry is *stale*, not before, so a cache holding that blob keeps serving it
 for up to 24 hours after `babel hide --image`. Article and list pages carry `max-age=300`, so those
 close within five minutes. The trade is deliberate — content-addressed blobs would justify
