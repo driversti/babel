@@ -172,21 +172,34 @@ async def get_article(conn: asyncpg.Connection, article_id: int) -> ArticleDetai
 
 
 async def get_comments(conn: asyncpg.Connection, article_id: int) -> tuple[CommentRow, ...]:
+    # EXISTS, not a JOIN: the check is against the fixed $1 (not a per-row
+    # column of comments), so Postgres hoists it into a single InitPlan
+    # evaluated once, rather than adding a second table's columns to a plan
+    # that otherwise selects only from comments. A hidden article must yield
+    # no comments — hidden_at is the takedown mechanism, and comments have no
+    # tombstone of their own to check.
     rows = await conn.fetch(
         """SELECT id, position, depth, author_id, author_name, posted_at, body
-             FROM comments WHERE article_id = $1 ORDER BY position""",
+             FROM comments
+            WHERE article_id = $1
+              AND EXISTS (SELECT 1 FROM articles WHERE id = $1 AND hidden_at IS NULL)
+            ORDER BY position""",
         article_id,
     )
     return tuple(CommentRow(**dict(r)) for r in rows)
 
 
 async def get_ok_image_digests(conn: asyncpg.Connection, article_id: int) -> tuple[bytes, ...]:
+    # Same EXISTS-on-$1 reasoning as get_comments: a hidden article's images
+    # must not surface here even though each row's own status is 'ok' and its
+    # blob is not itself withheld — the article-level tombstone must dominate.
     rows = await conn.fetch(
         """SELECT ai.sha256
              FROM article_images ai
              JOIN images i ON i.sha256 = ai.sha256
             WHERE ai.article_id = $1 AND ai.status = 'ok'
               AND ai.sha256 IS NOT NULL AND i.withheld_at IS NULL
+              AND EXISTS (SELECT 1 FROM articles WHERE id = $1 AND hidden_at IS NULL)
             ORDER BY ai.position""",
         article_id,
     )
@@ -201,6 +214,11 @@ async def image_status_counts(conn: asyncpg.Connection, article_id: int) -> dict
     `total - ok` would render "6 of 6 images were already gone when we looked"
     above an empty gallery on the newest articles — the inverse of the truth, on
     the project's central claim about itself.
+
+    The same EXISTS-on-$1 check as get_comments and get_ok_image_digests: a
+    hidden article reports every bucket as zero rather than the queue's real
+    counts, because "how many images does this article have" is itself
+    something a takedown must stop answering.
     """
     row = await conn.fetchrow(
         """SELECT
@@ -209,7 +227,9 @@ async def image_status_counts(conn: asyncpg.Connection, article_id: int) -> dict
              count(*) FILTER (WHERE status = 'pending'
                                  OR (status = 'error' AND attempts < $2))       AS waiting,
              count(*) FILTER (WHERE status = 'error' AND attempts >= $2)        AS exhausted
-           FROM article_images WHERE article_id = $1""",
+           FROM article_images
+          WHERE article_id = $1
+            AND EXISTS (SELECT 1 FROM articles WHERE id = $1 AND hidden_at IS NULL)""",
         article_id, MAX_IMAGE_ATTEMPTS,
     )
     return {k: int(v) for k, v in dict(row).items()}
@@ -239,7 +259,14 @@ async def list_countries(conn: asyncpg.Connection) -> tuple[str, ...]:
 
 
 def _prefix_upper_bound(prefix: str) -> str:
-    """The smallest string greater than every string starting with `prefix`."""
+    """The smallest string greater than every string starting with `prefix`.
+
+    Requires `prefix` to be non-empty and to not end in U+10FFFF, the maximum
+    Unicode code point — there is no next character to compute for that one,
+    and `chr()` raises rather than answer. `suggest_authors` is this
+    function's only caller and screens both cases out first; see its
+    docstring for why that is done there instead of with a try/except here.
+    """
     return prefix[:-1] + chr(ord(prefix[-1]) + 1)
 
 
@@ -254,9 +281,33 @@ async def suggest_authors(
     95MB, and `?author=%` became a 938MB sequential scan. This form reads 127
     buffers in 0.10ms and is O(limit). It also means no LIKE ever sees user
     input, so `%` and `_` need no escaping — they are ordinary characters.
+
+    `prefix` is public, untrusted input (a query parameter), and two shapes of
+    it cannot name any stored author — rejected up front, before either
+    `_prefix_upper_bound` or the query runs, rather than left to raise and
+    surface as a 500 on a public page:
+
+    - A prefix ending in U+10FFFF, the maximum code point: `_prefix_upper_bound`
+      has no next character to compute (`chr(0x110000)` is out of range).
+    - Any lone surrogate (U+D800-U+DFFF) anywhere in the prefix: it cannot be
+      represented in UTF-8 at all, so asyncpg raises `DataError` trying to
+      encode it as a bound parameter. This is checked separately because it
+      defeats the first guard — a lone surrogate not in the last position
+      would sail past a check that only looks at the final character, and
+      only fails later, encoding the whole string.
+
+    Both are the same answer, not two special cases: a string that cannot be
+    represented, or that names no valid successor, cannot match a stored
+    author name either, so an empty tuple is correct, not a fallback.
     """
     lowered = prefix.lower()
     if not lowered:
+        return ()
+    if ord(lowered[-1]) >= 0x10FFFF:
+        return ()
+    try:
+        lowered.encode("utf-8")
+    except UnicodeEncodeError:
         return ()
     rows = await conn.fetch(
         """SELECT DISTINCT ON (lower(author_name)) author_name

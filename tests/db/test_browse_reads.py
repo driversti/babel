@@ -154,3 +154,95 @@ async def test_fetch_log_status_is_readable(pool):
         )
         assert await fetch_log_status(conn, 1400) == "missing"
         assert await fetch_log_status(conn, 1401) is None
+
+
+# --- Fix round 1: a hidden article's comments, images and counts must not leak ---
+
+
+async def test_get_comments_returns_nothing_for_a_hidden_article(pool):
+    async with pool.acquire() as conn:
+        await _article(conn, 910, hidden=True)
+        await conn.execute(
+            """INSERT INTO comments (id, article_id, position, depth, author_name, body)
+               VALUES (20, 910, 1, 0, 'bob', 'hello')"""
+        )
+        assert await get_comments(conn, 910) == ()
+
+
+async def test_get_ok_image_digests_returns_nothing_for_a_hidden_article(pool):
+    async with pool.acquire() as conn:
+        await _article(conn, 911, hidden=True)
+        await conn.execute(
+            "INSERT INTO images (sha256, mime, bytes) VALUES ($1,'image/png',1)",
+            b"\x04" * 32,
+        )
+        await conn.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status, sha256)
+               VALUES (911, 1, 'https://h/c.png', 'ok', $1)""",
+            b"\x04" * 32,
+        )
+        assert await get_ok_image_digests(conn, 911) == ()
+
+
+async def test_image_status_counts_are_zero_for_a_hidden_article(pool):
+    async with pool.acquire() as conn:
+        await _article(conn, 912, hidden=True)
+        await conn.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status, attempts)
+               VALUES (912, 1, 'https://h/d.png', 'ok', 1)"""
+        )
+        counts = await image_status_counts(conn, 912)
+    assert counts == {"ok": 0, "dead": 0, "waiting": 0, "exhausted": 0}
+
+
+async def test_get_blob_is_unaffected_by_a_citing_articles_hidden_at(pool):
+    """images.withheld_at is the only takedown signal get_blob honours.
+
+    A blob is content-addressed and may be cited by many articles; hiding one
+    citing article must not silently withhold a blob other, unhidden articles
+    still legitimately display. Whether to withhold a shared blob is a
+    separate, deliberate operator decision (see article_images_sha256_idx's
+    "which other articles cite this blob"), never an automatic side effect of
+    hiding one citing article.
+    """
+    async with pool.acquire() as conn:
+        await _article(conn, 913, hidden=True)
+        await conn.execute(
+            "INSERT INTO images (sha256, mime, bytes) VALUES ($1,'image/png',1)",
+            b"\x05" * 32,
+        )
+        await conn.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status, sha256)
+               VALUES (913, 1, 'https://h/e.png', 'ok', $1)""",
+            b"\x05" * 32,
+        )
+        row = await get_blob(conn, b"\x05" * 32)
+    assert row is not None
+    assert row.withheld_at is None
+
+
+# --- Fix round 1: suggest_authors must not crash on unencodable input ---
+
+
+async def test_author_suggestions_reject_a_prefix_ending_in_the_max_code_point(pool):
+    async with pool.acquire() as conn:
+        await _article(conn, 1500, author="ann")
+        assert await suggest_authors(conn, "a" + chr(0x10FFFF), limit=8) == ()
+
+
+async def test_author_suggestions_reject_a_lone_surrogate(pool):
+    async with pool.acquire() as conn:
+        await _article(conn, 1501, author="ann")
+        assert await suggest_authors(conn, "a\ud800", limit=8) == ()
+
+
+async def test_author_suggestions_handle_a_very_long_prefix_without_crashing(pool):
+    async with pool.acquire() as conn:
+        await _article(conn, 1502, author="ann")
+        assert await suggest_authors(conn, "a" * 100_000, limit=8) == ()
+
+
+async def test_author_suggestions_handle_an_unpaired_combining_character(pool):
+    async with pool.acquire() as conn:
+        await _article(conn, 1503, author="ann")
+        assert await suggest_authors(conn, "́", limit=8) == ()
