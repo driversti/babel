@@ -99,8 +99,24 @@ def register_routes(app: FastAPI) -> None:
             if order == "old":
                 cursor = browse.Cursor(published_at=game_date_to_utc(jump), article_id=0)
             else:
-                next_day = jump + datetime.timedelta(days=1)
-                cursor = browse.Cursor(published_at=game_date_to_utc(next_day), article_id=0)
+                try:
+                    next_day = jump + datetime.timedelta(days=1)
+                except OverflowError:
+                    # jump == date.max (9999-12-31): a perfectly valid ISO
+                    # date — parse_game_date stays a pure parser and is not
+                    # the place to reject it — but newest-first's boundary
+                    # needs the day *after* it, which the calendar has no
+                    # representation for. A reader who typed the calendar's
+                    # own edge did not ask for a 500: leave `cursor` as it
+                    # was (unset, absent an explicit after=/before=) so the
+                    # response falls through to the ordinary unpositioned
+                    # first page, the same treatment an unparseable date
+                    # already gets.
+                    pass
+                else:
+                    cursor = browse.Cursor(
+                        published_at=game_date_to_utc(next_day), article_id=0
+                    )
 
         going = "prev" if before else "next"
         filters = browse.ListFilters(country=country or None, author=author or None)

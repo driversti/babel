@@ -176,3 +176,42 @@ async def test_pager_labels_track_the_chosen_order(client, pool):
     assert "P54" in second
     assert "P0" not in second
     assert "← older" in second
+
+
+async def test_date_jump_at_the_end_of_the_calendar_does_not_500(client, pool):
+    """`jump + timedelta(days=1)` overflows past `date.max`; that must not reach
+    the reader as a crash.
+
+    Reproduced live by the coordinator: `?on=9999-12-31` under `order=new`
+    raised an unhandled `OverflowError`, caught only by the app's catch-all
+    500 handler. Before the newest-first date-jump fix, this exact input did
+    no arithmetic on `jump` at all and was harmless — a regression introduced
+    by that fix, not a pre-existing gap. A reader who types the calendar's
+    own edge into the date-jump field should get the list, not an error
+    page, under either sort order.
+    """
+    await _seed(pool, [
+        (600, "Ordinary", "ann", "Poland", datetime.datetime(2026, 1, 1, tzinfo=UTC)),
+    ])
+    for order in ("new", "old"):
+        response = await client.get("/", params={"on": "9999-12-31", "order": order})
+        assert response.status_code == 200
+        assert "<html" in response.text.lower()
+        assert "Traceback" not in response.text
+
+
+async def test_date_jump_at_the_start_of_the_calendar_does_not_500(client, pool):
+    """The other end of the representable range.
+
+    `date.min + timedelta(days=1)` does not overflow, so this end was never
+    actually broken — included so a future change to the day-jump arithmetic
+    can't quietly regress it without a test noticing.
+    """
+    await _seed(pool, [
+        (601, "Ordinary", "ann", "Poland", datetime.datetime(2026, 1, 1, tzinfo=UTC)),
+    ])
+    for order in ("new", "old"):
+        response = await client.get("/", params={"on": "0001-01-01", "order": order})
+        assert response.status_code == 200
+        assert "<html" in response.text.lower()
+        assert "Traceback" not in response.text
