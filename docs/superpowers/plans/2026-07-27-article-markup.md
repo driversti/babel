@@ -20,7 +20,10 @@
 - Size ceiling on captured markup: 1,000,000 characters, then truncate and log.
 - Depth ceiling in the walker: 100.
 - Link schemes permitted: `http`, `https`. Nothing else produces a link.
-- Run `uv run pytest` and `uv run ruff check src tests` before every commit. The suite is 204 tests today and stays green.
+- Run `uv run pytest` and `uv run ruff check src tests` before every commit. The
+  baseline measured on this branch at 0c51f62 is **348 passed** in ~4m40s (Docker
+  must be running for the `postgres:17` testcontainer). It stays green; the count
+  only goes up. CLAUDE.md's "204 tests" is stale — do not treat it as the target.
 - Commit messages follow this repository's house style, which is unusually
   demanding — read `git log -6` before writing one. A short imperative subject
   ("Serve stored image blobs", "Name the permission gap instead of crashing
@@ -360,8 +363,9 @@ two ceilings.
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
 - Produces:
-  - `KEPT: dict[str, str]`, `DROPPED: frozenset[str]`, `BLOCKS: frozenset[str]`,
-    `MAX_DEPTH: int`
+  - `KEPT: dict[str, str]`, `EMITTED_TAGS: frozenset[str]`,
+    `DROPPED: frozenset[str]`, `BLOCKS: frozenset[str]`,
+    `ALLOWED_ATTRIBUTES: frozenset[str]`, `MAX_DEPTH: int`
   - node types `Text(value: str)`, `Break()`, `Image(source_url: str)`,
     `Inline(tag: str, children: tuple, href: str | None)`,
     `Block(tag: str, children: tuple)`
@@ -387,7 +391,7 @@ the one that catches a case nobody thought of.
 import pytest
 from selectolax.parser import HTMLParser
 
-from babel.web.markup import ALLOWED_ATTRIBUTES, KEPT, render_body
+from babel.web.markup import ALLOWED_ATTRIBUTES, EMITTED_TAGS, render_body
 
 
 def html(raw: str) -> str:
@@ -517,11 +521,10 @@ def test_output_alphabet_holds_for_hostile_input(raw):
     asserted on the intended path only.
     """
     tree = HTMLParser(str(render_body(raw, {}).html))
-    permitted = set(KEPT.values())
     for node in tree.css("*"):
         if node.tag in ("html", "head", "body", "-text"):
             continue
-        assert node.tag in permitted, f"{node.tag} escaped the allowlist"
+        assert node.tag in EMITTED_TAGS, f"{node.tag} escaped the allowlist"
         for name in node.attributes:
             assert name in ALLOWED_ATTRIBUTES, f"{name} escaped the allowlist"
 ```
@@ -575,8 +578,14 @@ KEPT: dict[str, str] = {
     "h1": "h2", "h2": "h2", "h3": "h3", "h4": "h4", "h5": "h5", "h6": "h6",
     "a": "a",
     "img": "img",
-    "span": "span",
 }
+
+# Every tag this module may put in the output. `span` is here and deliberately
+# NOT in KEPT: no author <span> survives the walk (it is unwrapped), but Task 5
+# emits `<span class="missing-image">` of its own. Keeping the two sets apart is
+# what lets the invariant test check the real output alphabet without pretending
+# an author's <span> is kept.
+EMITTED_TAGS: frozenset[str] = frozenset(KEPT.values()) | {"span"}
 
 # Dropped together with their children. Unwrapping these would spill JavaScript
 # or CSS source into the page as visible text, which is not dangerous but is
@@ -680,7 +689,7 @@ def _convert(node: Node, depth: int) -> tuple[object, ...]:
     for child in node.iter(include_text=True):
         children.extend(_convert(child, depth + 1))
 
-    if kept is None or kept == "span":
+    if kept is None:
         return tuple(children)  # unwrap: keep the content, drop the wrapper
     if kept in BLOCKS:
         return (Block(kept, tuple(children)),)
@@ -1861,7 +1870,7 @@ def test_a_table_keeps_its_rows_and_cells():
 
 Run: `uv run pytest tests/web/test_markup.py -v`
 Expected: PASS, including the output-alphabet invariant test, which now covers
-the new tags automatically because it reads `KEPT.values()`.
+the new tags automatically because it reads `EMITTED_TAGS`.
 
 - [ ] **Step 5: Commit and redeploy**
 
