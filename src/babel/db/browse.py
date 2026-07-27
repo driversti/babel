@@ -127,6 +127,7 @@ class ArticleDetail:
     id: int
     title: str
     body: str
+    body_raw: str | None
     author_name: str | None
     author_id: int | None
     country: str | None
@@ -144,6 +145,7 @@ class CommentRow:
     author_name: str | None
     posted_at: datetime.datetime | None
     body: str | None
+    body_raw: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,7 +178,7 @@ class ImageState:
 
 async def get_article(conn: asyncpg.Connection, article_id: int) -> ArticleDetail | None:
     row = await conn.fetchrow(
-        """SELECT id, title, body, author_name, author_id, country,
+        """SELECT id, title, body, body_raw, author_name, author_id, country,
                   published_at, e_day, comment_count
              FROM articles
             WHERE id = $1 AND hidden_at IS NULL""",
@@ -193,7 +195,7 @@ async def get_comments(conn: asyncpg.Connection, article_id: int) -> tuple[Comme
     # no comments — hidden_at is the takedown mechanism, and comments have no
     # tombstone of their own to check.
     rows = await conn.fetch(
-        """SELECT id, position, depth, author_id, author_name, posted_at, body
+        """SELECT id, position, depth, author_id, author_name, posted_at, body, body_raw
              FROM comments
             WHERE article_id = $1
               AND EXISTS (SELECT 1 FROM articles WHERE id = $1 AND hidden_at IS NULL)
@@ -203,21 +205,39 @@ async def get_comments(conn: asyncpg.Connection, article_id: int) -> tuple[Comme
     return tuple(CommentRow(**dict(r)) for r in rows)
 
 
-async def get_ok_image_digests(conn: asyncpg.Connection, article_id: int) -> tuple[bytes, ...]:
-    # Same EXISTS-on-$1 reasoning as get_comments: a hidden article's images
-    # must not surface here even though each row's own status is 'ok' and its
-    # blob is not itself withheld — the article-level tombstone must dominate.
+async def get_image_map(conn: asyncpg.Connection, article_id: int) -> dict[str, ImageState]:
+    """Every image slot of an article, keyed by the URL the article cited.
+
+    Keyed on source_url because that is what the renderer has in hand: the
+    `src` in body_raw is the same string `_parse_images` recorded at ingest, and
+    migration 004 already made (article_id, source_url) the primary key.
+
+    The buckets mirror image_status_counts exactly, plus 'withheld' for a blob
+    `babel hide --image` has taken down — which must not be served and must not
+    be linked round.
+
+    The same EXISTS-on-$1 check as get_comments: a hidden article's images must
+    not surface here even though each row's own status is fine, because the
+    article-level tombstone has to dominate.
+    """
     rows = await conn.fetch(
-        """SELECT ai.sha256
+        """SELECT ai.source_url,
+                  ai.sha256,
+                  CASE
+                    WHEN i.withheld_at IS NOT NULL                  THEN 'withheld'
+                    WHEN ai.status = 'ok' AND ai.sha256 IS NOT NULL THEN 'ok'
+                    WHEN ai.status = 'dead'                         THEN 'dead'
+                    WHEN ai.status = 'error' AND ai.attempts >= $2  THEN 'exhausted'
+                    ELSE 'waiting'
+                  END AS state
              FROM article_images ai
-             JOIN images i ON i.sha256 = ai.sha256
-            WHERE ai.article_id = $1 AND ai.status = 'ok'
-              AND ai.sha256 IS NOT NULL AND i.withheld_at IS NULL
+             LEFT JOIN images i ON i.sha256 = ai.sha256
+            WHERE ai.article_id = $1
               AND EXISTS (SELECT 1 FROM articles WHERE id = $1 AND hidden_at IS NULL)
             ORDER BY ai.position""",
-        article_id,
+        article_id, MAX_IMAGE_ATTEMPTS,
     )
-    return tuple(r["sha256"] for r in rows)
+    return {r["source_url"]: ImageState(state=r["state"], sha256=r["sha256"]) for r in rows}
 
 
 async def image_status_counts(conn: asyncpg.Connection, article_id: int) -> dict[str, int]:
@@ -229,10 +249,10 @@ async def image_status_counts(conn: asyncpg.Connection, article_id: int) -> dict
     above an empty gallery on the newest articles — the inverse of the truth, on
     the project's central claim about itself.
 
-    The same EXISTS-on-$1 check as get_comments and get_ok_image_digests: a
-    hidden article reports every bucket as zero rather than the queue's real
-    counts, because "how many images does this article have" is itself
-    something a takedown must stop answering.
+    The same EXISTS-on-$1 check as get_comments and get_image_map: a hidden
+    article reports every bucket as zero rather than the queue's real counts,
+    because "how many images does this article have" is itself something a
+    takedown must stop answering.
     """
     row = await conn.fetchrow(
         """SELECT

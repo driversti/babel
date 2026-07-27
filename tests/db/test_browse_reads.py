@@ -1,12 +1,12 @@
 import datetime
 
+from babel.db import browse
 from babel.db.browse import (
     archive_stats,
     fetch_log_status,
     get_article,
     get_blob,
     get_comments,
-    get_ok_image_digests,
     image_status_counts,
     list_countries,
     suggest_authors,
@@ -75,7 +75,7 @@ async def test_image_counts_separate_dead_from_not_yet_captured(pool):
     assert counts["exhausted"] == 1     # error at the ceiling
 
 
-async def test_ok_digests_come_back_in_position_order(pool):
+async def test_image_map_entries_come_back_in_position_order(pool):
     async with pool.acquire() as conn:
         await _article(conn, 904)
         await conn.execute(
@@ -87,8 +87,10 @@ async def test_ok_digests_come_back_in_position_order(pool):
                VALUES (904, $1, $2, 'ok', $3)""",
             [(2, "https://h/b.png", b"\x02" * 32), (1, "https://h/a.png", b"\x01" * 32)],
         )
-        digests = await get_ok_image_digests(conn, 904)
-    assert digests == (b"\x01" * 32, b"\x02" * 32)
+        mapping = await browse.get_image_map(conn, 904)
+    assert list(mapping) == ["https://h/a.png", "https://h/b.png"]
+    assert mapping["https://h/a.png"].sha256 == b"\x01" * 32
+    assert mapping["https://h/b.png"].sha256 == b"\x02" * 32
 
 
 async def test_withheld_blob_is_reported(pool):
@@ -169,7 +171,7 @@ async def test_get_comments_returns_nothing_for_a_hidden_article(pool):
         assert await get_comments(conn, 910) == ()
 
 
-async def test_get_ok_image_digests_returns_nothing_for_a_hidden_article(pool):
+async def test_get_image_map_returns_nothing_for_a_hidden_article(pool):
     async with pool.acquire() as conn:
         await _article(conn, 911, hidden=True)
         await conn.execute(
@@ -181,7 +183,7 @@ async def test_get_ok_image_digests_returns_nothing_for_a_hidden_article(pool):
                VALUES (911, 1, 'https://h/c.png', 'ok', $1)""",
             b"\x04" * 32,
         )
-        assert await get_ok_image_digests(conn, 911) == ()
+        assert await browse.get_image_map(conn, 911) == {}
 
 
 async def test_image_status_counts_are_zero_for_a_hidden_article(pool):
@@ -246,3 +248,83 @@ async def test_author_suggestions_handle_an_unpaired_combining_character(pool):
     async with pool.acquire() as conn:
         await _article(conn, 1503, author="ann")
         assert await suggest_authors(conn, "́", limit=8) == ()
+
+
+# --- Task 6: the raw markup and the image map the renderer needs ---
+
+
+async def test_get_article_returns_the_raw_markup(pg):
+    await pg.execute(
+        """INSERT INTO articles (id, title, body, body_raw, published_at, comment_count)
+           VALUES (7001, 't', 'text', '<p>A<br><br>B</p>', now(), 0)"""
+    )
+    detail = await browse.get_article(pg, 7001)
+    assert detail.body_raw == "<p>A<br><br>B</p>"
+
+
+async def test_get_comments_returns_the_raw_markup(pg):
+    await pg.execute(
+        """INSERT INTO articles (id, title, body, published_at, comment_count)
+           VALUES (7002, 't', 'text', now(), 1)"""
+    )
+    await pg.execute(
+        """INSERT INTO comments (id, article_id, position, depth, body, body_raw)
+           VALUES (81, 7002, 0, 0, 'hi', '<p>hi<br>there</p>')"""
+    )
+    assert (await browse.get_comments(pg, 7002))[0].body_raw == "<p>hi<br>there</p>"
+
+
+async def test_image_map_buckets_match_the_counts_the_note_shows(pg):
+    await pg.execute(
+        """INSERT INTO articles (id, title, body, published_at, comment_count)
+           VALUES (7003, 't', 'text', now(), 0)"""
+    )
+    digest = bytes.fromhex("cd" * 32)
+    await pg.execute("INSERT INTO images (sha256, bytes, mime) VALUES ($1, 3, 'image/png')",
+                     digest)
+    await pg.executemany(
+        """INSERT INTO article_images (article_id, position, source_url, status,
+                                       attempts, sha256)
+           VALUES (7003, $1, $2, $3, $4, $5)""",
+        [
+            (0, "https://h/ok.png", "ok", 1, digest),
+            (1, "https://h/dead.png", "dead", 1, None),
+            (2, "https://h/wait.png", "pending", 0, None),
+            (3, "https://h/gone.png", "error", 5, None),
+        ],
+    )
+    mapping = await browse.get_image_map(pg, 7003)
+    assert [s.state for s in mapping.values()] == ["ok", "dead", "waiting", "exhausted"]
+    assert list(mapping) == ["https://h/ok.png", "https://h/dead.png",
+                             "https://h/wait.png", "https://h/gone.png"]
+    assert mapping["https://h/ok.png"].sha256 == digest
+
+
+async def test_a_withheld_blob_reports_withheld_not_ok(pg):
+    await pg.execute(
+        """INSERT INTO articles (id, title, body, published_at, comment_count)
+           VALUES (7004, 't', 'text', now(), 0)"""
+    )
+    digest = bytes.fromhex("ef" * 32)
+    await pg.execute(
+        """INSERT INTO images (sha256, bytes, mime, withheld_at)
+           VALUES ($1, 3, 'image/png', now())""", digest,
+    )
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status, sha256)
+           VALUES (7004, 0, 'https://h/x.png', 'ok', $1)""", digest,
+    )
+    mapping = await browse.get_image_map(pg, 7004)
+    assert mapping["https://h/x.png"].state == "withheld"
+
+
+async def test_a_hidden_article_yields_an_empty_image_map(pg):
+    await pg.execute(
+        """INSERT INTO articles (id, title, body, published_at, comment_count, hidden_at)
+           VALUES (7005, 't', 'text', now(), 0, now())"""
+    )
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status)
+           VALUES (7005, 0, 'https://h/x.png', 'pending')"""
+    )
+    assert await browse.get_image_map(pg, 7005) == {}

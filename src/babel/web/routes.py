@@ -325,7 +325,7 @@ def register_routes(app: FastAPI) -> None:
                     status_code=404,
                 )
             comments = await browse.get_comments(conn, article_id)
-            digests = await browse.get_ok_image_digests(conn, article_id)
+            image_map = await browse.get_image_map(conn, article_id)
             counts = await browse.image_status_counts(conn, article_id)
 
         return templates.TemplateResponse(
@@ -334,7 +334,8 @@ def register_routes(app: FastAPI) -> None:
             context={
                 "article": detail,
                 "comments": comments,
-                "digests": [d.hex() for d in digests],
+                "digests": [s.sha256.hex() for s in image_map.values()
+                            if s.state == "ok" and s.sha256],
                 "counts": counts,
                 "game_time": to_game_time,
                 "settings": app.state.settings,
