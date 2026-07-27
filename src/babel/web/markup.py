@@ -24,6 +24,8 @@ from urllib.parse import urlsplit
 from markupsafe import Markup, escape
 from selectolax.parser import HTMLParser, Node
 
+from babel.db.browse import ImageState
+
 # Source tag -> the tag we emit. The only source of tag names in the output.
 KEPT: dict[str, str] = {
     "p": "p",
@@ -72,6 +74,17 @@ MAX_DEPTH = 100
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 _VOID = frozenset({"br", "img"})
+
+# What the reader is told when the bytes are not on our disk. 'withheld' gets no
+# link: `babel hide --image` is a takedown, and linking round it would defeat it.
+_CAPTIONS = {
+    "dead": "Image already gone when we looked",
+    "waiting": "Image not captured yet",
+    "exhausted": "Image could not be retrieved",
+    "withheld": "Image not available",
+    None: "Image not archived",
+}
+_UNLINKED = frozenset({"withheld"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,14 +317,51 @@ def _paragraphs(items: Sequence[object]) -> tuple[object, ...]:
     return tuple(out)
 
 
-def _emit(item: object) -> Markup:
+def _placeholder_href(source_url: str) -> str | None:
+    """The URL a missing-image placeholder links to as "original", if any.
+
+    Normalised the same way _convert's scheme check normalises before
+    validating an <img src>, so a protocol-relative source ("//host/x.png")
+    still gets a link: crawler/images.py's normalise_url performs the same
+    "//" -> "https://" rewrite before dialling, so "https:" + the stripped
+    source is the URL the fetcher actually used, not a guess. Without this
+    normalisation, `_href("//host/x.png")` returns None for lacking a
+    scheme, and a naive "link to the original" would silently render no
+    link at all for exactly the sources this archive most often carries —
+    protocol-relative sources are common in older articles. This is only
+    ever used to decide the placeholder's href; the lookup key into
+    `images` stays the raw, unstripped `source_url` (see Image.source_url).
+    """
+    stripped = source_url.strip()
+    normalised = "https:" + stripped if stripped.startswith("//") else stripped
+    return _href(normalised)
+
+
+def _emit_image(item: Image, images: Mapping[str, ImageState]) -> Markup:
+    state = images.get(item.source_url)
+    if state is not None and state.state == "ok" and state.sha256 is not None:
+        return Markup('<img src="/img/%s" alt="" loading="lazy">') % state.sha256.hex()
+
+    caption = _CAPTIONS[state.state if state is not None else None]
+    href = None if (state is not None and state.state in _UNLINKED) else _placeholder_href(
+        item.source_url
+    )
+    if href is None:
+        return Markup('<span class="missing-image">%s</span>') % caption
+    return Markup(
+        '<span class="missing-image">%s '
+        '<a href="%s" rel="nofollow noreferrer" target="_blank">original</a></span>'
+    ) % (caption, href)
+
+
+def _emit(item: object, images: Mapping[str, ImageState]) -> Markup:
     if isinstance(item, Text):
         return escape(item.value)
     if isinstance(item, Break):
         return Markup("<br>")
     if isinstance(item, Image):
-        return Markup("")  # Task 5
-    inner = Markup("").join(_emit(child) for child in item.children)
+        return _emit_image(item, images)
+    inner = Markup("").join(_emit(child, images) for child in item.children)
     if isinstance(item, Inline) and item.tag == "a":
         return Markup('<a href="%s" rel="nofollow noreferrer ugc" target="_blank">%s</a>') % (
             item.href, inner,
@@ -321,7 +371,17 @@ def _emit(item: object) -> Markup:
     return Markup("<%s>%s</%s>") % (item.tag, inner, item.tag)
 
 
-def render_body(raw: str, images: Mapping[str, object]) -> RenderedBody:
+def _image_urls(items: Sequence[object]) -> set[str]:
+    found: set[str] = set()
+    for item in items:
+        if isinstance(item, Image):
+            found.add(item.source_url)
+        elif isinstance(item, (Inline, Block)):
+            found |= _image_urls(item.children)
+    return found
+
+
+def render_body(raw: str, images: Mapping[str, ImageState]) -> RenderedBody:
     tree = HTMLParser(raw or "")
     # Remove every DROPPED subtree once, before the walk, rather than
     # relying only on the per-node check inside _convert. The depth
@@ -355,6 +415,6 @@ def render_body(raw: str, images: Mapping[str, object]) -> RenderedBody:
         items.extend(_convert(child, 0))
     blocks = _paragraphs(items)
     return RenderedBody(
-        html=Markup("").join(_emit(item) for item in blocks),
-        image_urls=frozenset(),
+        html=Markup("").join(_emit(item, images) for item in blocks),
+        image_urls=frozenset(_image_urls(blocks)),
     )

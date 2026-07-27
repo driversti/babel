@@ -11,6 +11,7 @@ import time
 import pytest
 from selectolax.parser import HTMLParser
 
+from babel.db.browse import ImageState
 from babel.web.markup import ALLOWED_ATTRIBUTES, EMITTED_TAGS, Image, _convert, render_body
 
 FIXTURES = pathlib.Path(__file__).parent.parent / "fixtures"
@@ -415,3 +416,86 @@ def test_a_block_boundary_flushes_pending_text_before_it_not_after():
     """
     out = html("<blockquote>Alpha<ul><li>one</li></ul></blockquote>")
     assert out == "<blockquote><p>Alpha</p><ul><li>one</li></ul></blockquote>"
+
+
+DIGEST = bytes.fromhex("ab" * 32)
+
+
+def test_a_captured_image_is_served_from_our_own_disk():
+    images = {"https://h/1.png": ImageState(state="ok", sha256=DIGEST)}
+    out = str(render_body('<p><img src="https://h/1.png"></p>', images).html)
+    assert f'src="/img/{DIGEST.hex()}"' in out
+    assert 'loading="lazy"' in out
+    assert "https://h/1.png" not in out
+
+
+@pytest.mark.parametrize(
+    ("state", "caption"),
+    [
+        ("dead", "already gone"),
+        ("waiting", "not captured yet"),
+        ("exhausted", "could not be retrieved"),
+    ],
+)
+def test_a_missing_image_is_a_placeholder_that_links_to_the_original(state, caption):
+    images = {"https://h/1.png": ImageState(state=state, sha256=None)}
+    out = str(render_body('<p><img src="https://h/1.png"></p>', images).html)
+    assert caption in out
+    assert 'href="https://h/1.png"' in out
+    assert 'rel="nofollow noreferrer"' in out
+    assert "<img" not in out
+
+
+def test_a_withheld_blob_is_not_linked_to_its_original():
+    """`babel hide --image` is a takedown. Linking round it would defeat it."""
+    images = {"https://h/1.png": ImageState(state="withheld", sha256=DIGEST)}
+    out = str(render_body('<p><img src="https://h/1.png"></p>', images).html)
+    assert "not available" in out
+    assert "https://h/1.png" not in out
+    assert DIGEST.hex() not in out
+
+
+def test_an_image_with_no_row_reads_as_not_archived():
+    """Comments are parsed for text only, so their images have no queue row."""
+    out = str(render_body('<p><img src="https://h/1.png"></p>', {}).html)
+    assert "not archived" in out
+    assert "not captured yet" not in out
+    assert 'href="https://h/1.png"' in out
+
+
+def test_an_image_source_that_is_not_http_gets_no_link():
+    out = str(render_body('<p><img src="javascript:alert(1)"></p>', {}).html)
+    assert "<a " not in out
+    assert "alert(1)" not in out or "javascript:" not in out
+
+
+def test_a_linked_image_keeps_the_authors_link_around_it():
+    images = {"https://h/1.png": ImageState(state="ok", sha256=DIGEST)}
+    raw = '<p><a href="https://src.example/"><img src="https://h/1.png"></a></p>'
+    out = str(render_body(raw, images).html)
+    assert 'href="https://src.example/"' in out
+    assert f'src="/img/{DIGEST.hex()}"' in out
+
+
+def test_rendered_image_urls_are_reported_for_the_gallery():
+    images = {
+        "https://h/1.png": ImageState(state="ok", sha256=DIGEST),
+        "https://h/2.png": ImageState(state="ok", sha256=DIGEST),
+    }
+    rendered = render_body('<p><img src="https://h/1.png"></p>', images)
+    assert rendered.image_urls == frozenset({"https://h/1.png"})
+
+
+def test_a_missing_protocol_relative_image_still_links_to_its_original():
+    """Fact 3 from the task brief: `_href("//h/1.png")` returns None for
+    lacking a scheme, so linking straight to `item.source_url` would
+    silently drop the link for exactly the protocol-relative sources this
+    archive commonly holds (older articles; crawler/images.py's
+    normalise_url does the same "//" -> "https://" rewrite before dialling,
+    so that is the URL the fetcher actually used, not a guess). The
+    placeholder must link to that normalised https:// form rather than
+    render no link at all.
+    """
+    out = str(render_body('<p><img src="//h/1.png"></p>', {}).html)
+    assert 'href="https://h/1.png"' in out
+    assert "not archived" in out

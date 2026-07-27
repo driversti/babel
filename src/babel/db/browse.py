@@ -160,6 +160,20 @@ class BlobRow:
     withheld_at: datetime.datetime | None
 
 
+@dataclass(frozen=True, slots=True)
+class ImageState:
+    """One image slot as the page needs to render it.
+
+    `state` collapses status, attempts and the blob's tombstone into the single
+    fact the renderer acts on, in the same four buckets image_status_counts
+    uses plus 'withheld'. Keeping the bucket definition in SQL means the note
+    under the article and the placeholder in it cannot drift apart.
+    """
+
+    state: str  # ok | dead | waiting | exhausted | withheld
+    sha256: bytes | None
+
+
 async def get_article(conn: asyncpg.Connection, article_id: int) -> ArticleDetail | None:
     row = await conn.fetchrow(
         """SELECT id, title, body, author_name, author_id, country,
