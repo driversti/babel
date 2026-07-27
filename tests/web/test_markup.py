@@ -169,6 +169,18 @@ HOSTILE = [
     '<ul><li onclick="alert(1)">Item</li></ul>',
     '<p>Line1<br onclick="alert(1)">Line2<br><br></p>',
     "<p>" + "<b>" * 150 + '<a href="https://evil.example/">deep link</a>' + "</b>" * 150 + "</p>",
+    # These four round out coverage of every EMITTED_TAGS member reachable in
+    # this task (em, u, s, blockquote, ol, h2, h4, h5, h6 -- img and span
+    # stay unreached until Task 5 actually emits them). Before these, the
+    # sweep below reached 7 of 18 EMITTED_TAGS; a tag-alphabet regression in
+    # any of these nine could have shipped without the invariant test ever
+    # touching it.
+    '<p><em onclick="alert(1)">em</em><u style="color:red">u</u>'
+    '<s onmouseover="alert(1)">s</s></p>',
+    '<blockquote onclick="alert(1)">quote<script>alert(1)</script></blockquote>',
+    '<ol><li formaction="/x">item</li></ol>',
+    '<h2 onclick="alert(1)">H2</h2><h4 onclick="alert(1)">H4</h4>'
+    '<h5 onclick="alert(1)">H5</h5><h6 onclick="alert(1)">H6</h6>',
 ]
 
 
@@ -192,13 +204,20 @@ def test_output_alphabet_holds_for_hostile_input(raw):
 def test_hostile_input_sweep_actually_exercises_attributes():
     """Regression guard: the invariant test above must not vacuously pass.
 
-    Before the five entries above were added, the HOSTILE sweep produced
-    only <p> and <strong> tags and zero attributes across all ten cases, so
+    Before the five https/heading/list/br/depth-ceiling entries were added,
+    the HOSTILE sweep produced only <p> and <strong> tags and zero
+    attributes across all ten original cases, so
     `assert name in ALLOWED_ATTRIBUTES` in the test above ran zero times in
     the whole suite -- it could not have caught a hostile byte breaking out
-    of the one attribute an author's bytes actually reach, an href. This
-    asserts the sweep now sees a real spread of tags and at least one
-    attribute, so that regression can't reoccur silently.
+    of the one attribute an author's bytes actually reach, an href.
+
+    The tag check is pinned to every EMITTED_TAGS member this task can
+    actually reach -- everything except "img" and "span", which stay
+    unreachable until Task 5 renders a real <img> and its own
+    "missing-image" <span>. Asserting the full reachable set, not a handful
+    of representative tags, is what turns "the sweep observes most of
+    EMITTED_TAGS" from a one-time review finding into something a later
+    change can't quietly regress.
     """
     seen_tags: set[str] = set()
     seen_attrs: set[str] = set()
@@ -210,7 +229,7 @@ def test_hostile_input_sweep_actually_exercises_attributes():
             seen_tags.add(node.tag)
             seen_attrs.update(node.attributes)
     assert seen_attrs, "no HOSTILE payload emitted any attribute"
-    assert {"p", "strong", "a", "h3", "ul", "li", "br"} <= seen_tags
+    assert (EMITTED_TAGS - {"img", "span"}) <= seen_tags
 
 
 def test_an_image_with_a_disallowed_scheme_is_dropped_before_task_5_sees_it():
@@ -232,3 +251,18 @@ def test_an_image_with_an_allowed_scheme_still_produces_an_image_node():
     p_node = next(c for c in body.iter(include_text=True) if c.tag == "p")
     img_node = next(c for c in p_node.iter(include_text=True) if c.tag == "img")
     assert _convert(img_node, 0) == (Image("https://example.org/x.jpg"),)
+
+
+def test_a_protocol_relative_image_source_survives_as_the_raw_string():
+    """"//host/path" sources are common in older articles (crawler/images.py's
+    normalise_url rewrites them to "https://..." for the same reason before
+    fetching) and article_images already holds rows keyed on that exact raw
+    string. _convert must validate a normalised copy rather than reject the
+    raw string for lacking a scheme -- and Image.source_url must stay the
+    RAW "//..." form, because Task 5 looks images up by exactly what the
+    article wrote.
+    """
+    body = HTMLParser('<p><img src="//www.erepublik.net/images/x/Turkey.png"></p>').body
+    p_node = next(c for c in body.iter(include_text=True) if c.tag == "p")
+    img_node = next(c for c in p_node.iter(include_text=True) if c.tag == "img")
+    assert _convert(img_node, 0) == (Image("//www.erepublik.net/images/x/Turkey.png"),)

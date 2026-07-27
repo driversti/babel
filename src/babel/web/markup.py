@@ -141,12 +141,21 @@ def _convert(node: Node, depth: int) -> tuple[object, ...]:
     if kept == "br":
         return (Break(),)
     if kept == "img":
-        # Same scheme check as an <a> href -- Image.source_url is exactly
-        # what Task 5 will fetch and render, and _emit renders it as
-        # Markup("") for now regardless, so an unchecked value here would sit
-        # inert only until Task 5 starts consuming it.
-        src = _href(node.attributes.get("src"))
-        return (Image(src),) if src else ()
+        # Same scheme check as an <a> href, but validated against a
+        # normalised copy rather than the raw string: protocol-relative
+        # sources ("//host/path") are common in older articles (see
+        # crawler/images.py's normalise_url, which rewrites "//" to
+        # "https://" for the same reason before fetching), and
+        # article_images already holds rows keyed on the raw "//..." form.
+        # _href("//host/path") alone would reject it for having no scheme
+        # and silently drop the image. Image.source_url stays the RAW
+        # string -- Task 5 looks images up by exactly what the article
+        # wrote -- and its own emit path re-validates with _href before it
+        # ever links anywhere, so validating a normalised copy here loses
+        # no safety, only avoids losing content.
+        raw_src = (node.attributes.get("src") or "").strip()
+        normalised = "https:" + raw_src if raw_src.startswith("//") else raw_src
+        return (Image(raw_src),) if _href(normalised) else ()
 
     children: list[object] = []
     for child in node.iter(include_text=True):
@@ -195,7 +204,16 @@ def render_body(raw: str, images: Mapping[str, object]) -> RenderedBody:
     # a too-deep node for that flatten to find. The check inside _convert
     # stays as defense in depth; it is simply never reached for these tags
     # once this has run.
-    for dropped in root.css(",".join(DROPPED)):
+    #
+    # css_first() + re-query, not css() + a single pass over a snapshot list:
+    # a snapshot can contain a node whose ancestor is also in DROPPED (e.g.
+    # <form> before <input> in whatever order frozenset iteration happens to
+    # hash to -- that order is randomised per process). Decomposing the
+    # ancestor first frees the child too, and decomposing an already-freed
+    # node relies on undocumented selectolax behaviour. Re-querying the live
+    # tree each time never touches a node that isn't still attached.
+    dropped_selector = ",".join(DROPPED)
+    while (dropped := root.css_first(dropped_selector)) is not None:
         dropped.decompose()
     items: list[object] = []
     for child in root.iter(include_text=True):
