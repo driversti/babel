@@ -18,6 +18,16 @@ from babel.web.cursor import (
 _STATS_TTL_SEC = 300
 
 
+def _missing_detail(status: str | None, frontier: int | None) -> str:
+    """Why this article is not here — three different facts a bare 404 flattens into one."""
+    if status == "missing":
+        return "This article was already deleted when the crawler reached it."
+    if status in ("error", "stale"):
+        return "Collecting this article failed. The crawler will try again."
+    reached = f" Collection has reached article {frontier:,}.".replace(",", " ") if frontier else ""
+    return f"This article is not collected yet.{reached}"
+
+
 async def _stats(app, conn) -> browse.ArchiveStats:
     """Archive-wide totals, on a five-minute clock.
 
@@ -169,6 +179,41 @@ def register_routes(app: FastAPI) -> None:
                 "prev_cursor": prev_cursor,
                 "next_label": next_label,
                 "prev_label": prev_label,
+                "game_time": to_game_time,
+                "settings": app.state.settings,
+            },
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    @app.get("/article/{article_id}", response_class=HTMLResponse)
+    async def article(request: Request, article_id: int):
+        async with app.state.pool.acquire() as conn:
+            detail = await browse.get_article(conn, article_id)
+            if detail is None:
+                status = await browse.fetch_log_status(conn, article_id)
+                stats = await _stats(app, conn)
+                return templates.TemplateResponse(
+                    request=request,
+                    name="error.html",
+                    context={
+                        "heading": "Not in the archive",
+                        "detail": _missing_detail(status, stats.frontier),
+                        "settings": app.state.settings,
+                    },
+                    status_code=404,
+                )
+            comments = await browse.get_comments(conn, article_id)
+            digests = await browse.get_ok_image_digests(conn, article_id)
+            counts = await browse.image_status_counts(conn, article_id)
+
+        return templates.TemplateResponse(
+            request=request,
+            name="article.html",
+            context={
+                "article": detail,
+                "comments": comments,
+                "digests": [d.hex() for d in digests],
+                "counts": counts,
                 "game_time": to_game_time,
                 "settings": app.state.settings,
             },

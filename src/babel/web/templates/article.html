@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}{{ article.title }} — babel{% endblock %}
+{% block content %}
+
+<article>
+  <h1>{{ article.title }}</h1>
+  <p class="meta">
+    <time>{{ game_time(article.published_at).strftime("%Y-%m-%d %H:%M") }} game time</time>
+    {% if article.e_day %}· day {{ "{:,}".format(article.e_day) }}{% endif %}
+    {% if article.author_name %}
+    · <a href="/?author={{ article.author_name|urlencode }}">{{ article.author_name }}</a>
+    {% endif %}
+    {% if article.country %}
+    · <a href="/?country={{ article.country|urlencode }}">{{ article.country }}</a>
+    {% endif %}
+    · <a rel="nofollow noreferrer"
+         href="https://www.erepublik.com/en/article/{{ article.id }}">original</a>
+  </p>
+
+  <div class="body-text">{{ article.body }}</div>
+
+  {% if digests %}
+  <div class="gallery">
+    {% for hex in digests %}<img src="/img/{{ hex }}" alt="" loading="lazy">{% endfor %}
+  </div>
+  {% endif %}
+
+  <p class="images-note">
+    {% if counts.dead %}{{ counts.dead }} image{{ "s were" if counts.dead != 1 else " was" }} already gone when we looked.{% endif %}
+    {% if counts.waiting %}{{ counts.waiting }} not captured yet.{% endif %}
+    {% if counts.exhausted %}{{ counts.exhausted }} we could not retrieve.{% endif %}
+  </p>
+</article>
+
+{% if comments %}
+<section class="comments">
+  <h2>{{ comments|length }} comments</h2>
+  {% for c in comments %}
+  <div class="comment" style="margin-left: {{ c.depth * 1.5 }}rem">
+    <p class="meta">{{ c.author_name or "someone" }}{% if c.posted_at %} ·
+      {{ game_time(c.posted_at).strftime("%Y-%m-%d %H:%M") }}{% endif %}</p>
+    <p class="body-text">{% if c.body is none %}[removed]{% else %}{{ c.body }}{% endif %}</p>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% endblock %}
