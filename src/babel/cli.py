@@ -8,6 +8,7 @@ import logging
 import pathlib
 import random
 from collections.abc import Awaitable, Callable
+from urllib.parse import urljoin
 
 import asyncpg
 import click
@@ -17,7 +18,7 @@ from babel.config import Settings
 from babel.crawler.backfill import run_backfill
 from babel.crawler.fetcher import curl_getter
 from babel.crawler.hostlimit import HostLimiter
-from babel.crawler.images import ImageTooLarge
+from babel.crawler.images import ImageBlocked, ImageTooLarge, classify_url
 from babel.crawler.imageworker import run_image_worker
 from babel.crawler.ingest import Ingestor
 from babel.crawler.poller import newest_article_id, poll_once
@@ -111,6 +112,25 @@ IMAGE_FETCH_HEADERS = {
 }
 
 
+# curl_cffi 0.15.0 follows up to 30 redirects on its own. classify_url's guard in
+# capture_image only ever sees the URL an article wrote, so a public host that
+# 302s into 127.0.0.1 would sail straight through it — measured directly: a
+# public URL returning "302 Location: http://127.0.0.1/secret" was followed and
+# the private body came back. Turning every redirect into a failure is not the
+# fix either: real image hosts redirect constantly (CDN migrations, URL
+# shorteners), and this project has already lost a batch of images to exactly
+# that class of over-eager "not a 200, so it must be dead/broken" mistake. So
+# redirects are followed by hand below, one hop at a time, classifying every
+# hop before it is dialled — the same guard capture_image applies to the first
+# URL, applied again to every URL a redirect ever points at.
+_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+
+# Five hops is headroom, not a target — every legitimate image host redirects
+# at most once or twice in practice. Anything past five is far more likely a
+# loop than a real chain, and either way must not be followed forever.
+MAX_REDIRECT_HOPS = 5
+
+
 def _bytes_getter(session: AsyncSession, timeout_sec: int):
     """Fetch image bytes, abandoning anything past max_bytes.
 
@@ -120,22 +140,49 @@ def _bytes_getter(session: AsyncSession, timeout_sec: int):
     """
 
     async def get_bytes(url: str, max_bytes: int) -> tuple[int, bytes, str | None]:
-        response = await session.get(
-            url, timeout=timeout_sec, stream=True, headers=IMAGE_FETCH_HEADERS
-        )
-        try:
-            declared = response.headers.get("content-length")
-            if declared and declared.isdigit() and int(declared) > max_bytes:
-                raise ImageTooLarge(f"{url} declares {declared} bytes")
-            chunks, total = [], 0
-            async for chunk in response.aiter_content():
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ImageTooLarge(f"{url} exceeded {max_bytes} bytes")
-                chunks.append(chunk)
-            return response.status_code, b"".join(chunks), response.headers.get("content-type")
-        finally:
-            await response.aclose()
+        current = url
+        for _ in range(MAX_REDIRECT_HOPS + 1):
+            verdict = await classify_url(current)
+            if verdict == "blocked":
+                raise ImageBlocked(current)
+            if verdict == "unresolved":
+                # A resolver having a bad minute mid-chain is exactly as
+                # retryable as one on the first hop — capture_image's generic
+                # handler turns this into 'error', not 'dead'.
+                raise RuntimeError(f"{current} did not resolve")
+
+            response = await session.get(
+                current,
+                timeout=timeout_sec,
+                stream=True,
+                headers=IMAGE_FETCH_HEADERS,
+                allow_redirects=False,
+            )
+            try:
+                if response.status_code in _REDIRECT_STATUS_CODES:
+                    location = response.headers.get("location")
+                    if not location:
+                        # A redirect status with nowhere to go is a host
+                        # misbehaving, not evidence the image is gone or here.
+                        raise RuntimeError(
+                            f"{current} sent {response.status_code} with no Location"
+                        )
+                    current = urljoin(current, location)
+                    continue
+
+                declared = response.headers.get("content-length")
+                if declared and declared.isdigit() and int(declared) > max_bytes:
+                    raise ImageTooLarge(f"{current} declares {declared} bytes")
+                chunks, total = [], 0
+                async for chunk in response.aiter_content():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ImageTooLarge(f"{current} exceeded {max_bytes} bytes")
+                    chunks.append(chunk)
+                return response.status_code, b"".join(chunks), response.headers.get("content-type")
+            finally:
+                await response.aclose()
+        raise RuntimeError(f"{url} exceeded {MAX_REDIRECT_HOPS} redirects")
 
     return get_bytes
 

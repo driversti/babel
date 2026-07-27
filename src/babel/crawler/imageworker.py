@@ -31,8 +31,15 @@ async def run_image_worker(
     circuit=None,
     sleep=asyncio.sleep,
     max_cycles: int | None = None,
+    resolve=None,
 ) -> None:
-    """Fetch queued images until stopped. `max_cycles` bounds the loop for tests."""
+    """Fetch queued images until stopped. `max_cycles` bounds the loop for tests.
+
+    `resolve` is threaded straight down to `classify_url` (see images.py) — it
+    lets tests of this worker's own behaviour (retries, concurrency, the host
+    circuit breaker) stub out DNS instead of needing it live, without touching
+    classify_url's own tests, which are about the resolver's real behaviour.
+    """
     if circuit is None:
         circuit = HostCircuit(settings.host_failure_threshold, settings.host_open_sec)
     cycles = 0
@@ -70,7 +77,7 @@ async def run_image_worker(
             await sleep(settings.image_idle_sleep_sec)
             continue
 
-        await _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch, circuit)
+        await _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch, circuit, resolve)
 
 
 def _interleave_by_host(batch):
@@ -101,7 +108,9 @@ def _interleave_by_host(batch):
     return out
 
 
-async def _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch, circuit) -> None:
+async def _capture_batch(
+    pool, get_bytes, limiter, host_limiter, settings, batch, circuit, resolve=None
+) -> None:
     """Fetch a batch through a fixed set of workers pulling from a shared queue.
 
     Not `gather` over the batch. HostLimiter allows one in-flight request per
@@ -130,14 +139,18 @@ async def _capture_batch(pool, get_bytes, limiter, host_limiter, settings, batch
                 # skipped image is not a failed one, and it is still queued.
                 continue
             try:
-                await _capture_one(pool, get_bytes, limiter, host_limiter, settings, item, circuit)
+                await _capture_one(
+                    pool, get_bytes, limiter, host_limiter, settings, item, circuit, resolve
+                )
             except Exception:  # noqa: BLE001 — one row's fault must not end this worker
                 log.exception("recording %s failed", item.source_url)
 
     await asyncio.gather(*(worker() for _ in range(settings.image_concurrency)))
 
 
-async def _capture_one(pool, get_bytes, limiter, host_limiter, settings, item, circuit=None) -> None:
+async def _capture_one(
+    pool, get_bytes, limiter, host_limiter, settings, item, circuit=None, resolve=None
+) -> None:
     try:
         # The host slot first, then the rate token. The token paces requests to
         # the fleet, so it has to be spent on a request that is about to happen —
@@ -151,6 +164,7 @@ async def _capture_one(pool, get_bytes, limiter, host_limiter, settings, item, c
                     settings.image_root,
                     item.source_url,
                     max_bytes=settings.max_image_bytes,
+                    resolve=resolve,
                 ),
                 timeout=settings.image_timeout_sec,
             )

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import socket
 
 import pytest
 
@@ -15,6 +16,14 @@ from babel.crawler.images import (
     sniff_image_mime,
     store_bytes,
 )
+
+
+async def _resolves_publicly(_host: str) -> list[tuple]:
+    """Stand-in for the real resolver, for tests that are about capture_image's
+    outcome mapping and must not depend on live DNS to pass. classify_url's own
+    resolution behaviour — including real DNS failure — is covered directly by
+    the classify_url tests above, which do not use this seam."""
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
 
 
 def test_normalise_url_expands_protocol_relative():
@@ -115,6 +124,61 @@ async def test_unresolvable_host_is_unresolved_not_blocked():
     assert await classify_url("https://no-such-host.invalid/a.png") == "unresolved"
 
 
+async def test_malformed_hostname_is_blocked_not_unresolved():
+    """Measured: "a..com" has an empty label, which the idna codec cannot
+    encode — a UnicodeEncodeError, not a socket.gaierror. A hostname the
+    resolver cannot even attempt is malformed, a permanent property of the
+    URL, not a resolver having a transient bad minute — so this is 'blocked',
+    not 'unresolved'."""
+    assert await classify_url("http://a..com/") == "blocked"
+
+
+async def test_unterminated_ipv6_literal_is_blocked():
+    """Measured: `urlsplit` itself raises ValueError on an unbalanced IPv6
+    literal such as "[::1/". Malformed is permanent, so 'blocked'."""
+    assert await classify_url("http://[::1/") == "blocked"
+
+
+async def test_multicast_is_blocked():
+    """is_global is True for multicast — measured:
+    ip_address("224.0.0.1").is_global and ip_address("ff02::1").is_global are
+    both True — so it must be rejected by name, not assumed covered by
+    is_global alone."""
+    assert await classify_url("http://224.0.0.1/") == "blocked"
+    assert await classify_url("http://239.255.255.250/") == "blocked"  # SSDP
+    assert await classify_url("http://[ff02::1]/") == "blocked"
+
+
+async def test_unspecified_address_is_blocked():
+    assert await classify_url("http://0.0.0.0/") == "blocked"
+    assert await classify_url("http://[::]/") == "blocked"
+
+
+async def test_octal_looking_literal_is_blocked():
+    """Measured directly: this used to return 'ok', because getaddrinfo reads
+    '0177' as decimal 177 (a public-looking address), while curl_cffi actually
+    dials 127.0.0.1, reading the same string as octal — two parsers
+    disagreeing about what address is being requested, with no timing or race
+    needed. `ipaddress` refuses to parse it at all, and a host that is nothing
+    but digits and dots is never a real DNS name, so this must be 'blocked'
+    rather than handed to a resolver that might read it differently again."""
+    assert await classify_url("http://0177.0.0.1/") == "blocked"
+
+
+async def test_decimal_integer_literal_is_blocked():
+    """"2130706433" is 127.0.0.1 as a bare decimal integer — a form curl_cffi
+    and browsers historically accept and `ipaddress` does not."""
+    assert await classify_url("http://2130706433/") == "blocked"
+
+
+async def test_ordinary_dotted_quad_literal_is_still_ok():
+    """The fix for the numeric-literal ambiguity must not start rejecting
+    canonical IP literals — these are valid `ipaddress` parses, so they are
+    decided directly and never even reach a resolver."""
+    assert await classify_url("http://93.184.216.34/") == "ok"
+    assert await classify_url("http://8.8.8.8/") == "ok"
+
+
 async def test_capture_never_fetches_a_private_address(tmp_path):
     calls = []
 
@@ -142,7 +206,7 @@ async def test_capture_stores_a_live_image(tmp_path):
         return 200, b"\x89PNG fake", "image/png"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000, resolve=_resolves_publicly
     )
     assert outcome.status == "ok"
     assert outcome.mime == "image/png"
@@ -154,7 +218,7 @@ async def test_capture_marks_a_404_as_dead(tmp_path):
         return 404, b"", None
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://example.com/gone.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/gone.png", max_bytes=10_000, resolve=_resolves_publicly
     )
     assert outcome.status == "dead"
     assert outcome.digest is None
@@ -165,7 +229,7 @@ async def test_capture_marks_a_non_image_response_as_dead(tmp_path):
         return 200, b"<html>parked domain</html>", "text/html"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000, resolve=_resolves_publicly
     )
     assert outcome.status == "dead"
 
@@ -177,7 +241,7 @@ async def test_capture_marks_a_410_as_dead(tmp_path):
         return 410, b"", None
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://example.com/gone.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/gone.png", max_bytes=10_000, resolve=_resolves_publicly
     )
     assert outcome.status == "dead"
 
@@ -196,7 +260,7 @@ async def test_a_host_refusing_us_is_retryable_not_dead(tmp_path, status_code):
         return status_code, b"", "application/json"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000, resolve=_resolves_publicly
     )
     assert outcome.status == "error", f"{status_code} must stay retryable"
 
@@ -208,7 +272,7 @@ async def test_an_empty_200_is_retryable_not_dead(tmp_path):
         return 200, b"", "image/png"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000, resolve=_resolves_publicly
     )
     assert outcome.status == "error"
 
@@ -263,7 +327,7 @@ async def test_capture_stores_an_image_mislabelled_as_octet_stream(tmp_path):
         return 200, PNG, "application/octet-stream"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000, resolve=_resolves_publicly
     )
     assert outcome.status == "ok"
     assert outcome.mime == "image/png", "the stored type must be the real one, not the claimed one"
@@ -275,7 +339,7 @@ async def test_capture_refuses_an_oversized_image(tmp_path):
         raise ImageTooLarge
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://example.com/big.png", max_bytes=1000
+        get_bytes, tmp_path, "https://x.example/big.png", max_bytes=1000, resolve=_resolves_publicly
     )
     assert outcome.status == "error"
 
@@ -285,6 +349,6 @@ async def test_transport_failure_is_an_error_not_a_dead_link(tmp_path):
         raise TimeoutError("slow host")
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000, resolve=_resolves_publicly
     )
     assert outcome.status == "error"

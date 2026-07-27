@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import socket
 
 from babel.config import Settings
 from babel.crawler.circuit import HostCircuit
@@ -9,6 +10,16 @@ from babel.crawler.imageworker import _capture_one, _interleave_by_host, run_ima
 from babel.crawler.ratelimit import RateLimiter
 from babel.db import repo
 from babel.notify import Throttled
+
+
+async def _fake_resolve(_host: str) -> list[tuple]:
+    """Stand-in for DNS. These tests are about the worker's own behaviour —
+    retries, concurrency, the host circuit breaker — and must not depend on
+    live resolution for hosts like "a.example" that exist only as labels
+    here. classify_url's own resolution behaviour, including real failure
+    modes, is covered directly in test_images.py, which does not use this
+    seam."""
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
 
 
 class Recorder:
@@ -49,7 +60,7 @@ async def noop_sleep(_seconds):
 
 
 async def test_drains_the_queue_and_stores_bytes(pg, tmp_path, fake_pool):
-    await seed(pg, 1, ["https://example.com/1.png", "https://example.com/2.png"])
+    await seed(pg, 1, ["https://a.example/1.png", "https://a.example/2.png"])
 
     async def get_bytes(url, max_bytes):
         return 200, b"\x89PNG " + url.encode(), "image/png"
@@ -57,7 +68,7 @@ async def test_drains_the_queue_and_stores_bytes(pg, tmp_path, fake_pool):
     await run_image_worker(
         fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
         Throttled(Recorder(), 1, now=lambda: 0.0), settings(tmp_path),
-        sleep=noop_sleep, max_cycles=2,
+        sleep=noop_sleep, max_cycles=2, resolve=_fake_resolve,
     )
     rows = await pg.fetch("SELECT status FROM article_images ORDER BY position")
     assert [r["status"] for r in rows] == ["ok", "ok"]
@@ -65,8 +76,8 @@ async def test_drains_the_queue_and_stores_bytes(pg, tmp_path, fake_pool):
 
 
 async def test_drains_newest_article_first(pg, tmp_path, fake_pool):
-    await seed(pg, 10, ["https://example.com/old.png"])
-    await seed(pg, 20, ["https://example.com/new.png"])
+    await seed(pg, 10, ["https://a.example/old.png"])
+    await seed(pg, 20, ["https://a.example/new.png"])
     order: list[str] = []
 
     async def get_bytes(url, max_bytes):
@@ -76,13 +87,13 @@ async def test_drains_newest_article_first(pg, tmp_path, fake_pool):
     await run_image_worker(
         fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
         Throttled(Recorder(), 1, now=lambda: 0.0), settings(tmp_path),
-        sleep=noop_sleep, max_cycles=1,
+        sleep=noop_sleep, max_cycles=1, resolve=_fake_resolve,
     )
     assert order[0].endswith("new.png")
 
 
 async def test_a_dead_host_marks_dead_and_does_not_stop_the_batch(pg, tmp_path, fake_pool):
-    await seed(pg, 1, ["https://example.com/gone.png", "https://example.net/fine.png"])
+    await seed(pg, 1, ["https://a.example/gone.png", "https://b.example/fine.png"])
 
     async def get_bytes(url, max_bytes):
         if "gone" in url:
@@ -92,7 +103,7 @@ async def test_a_dead_host_marks_dead_and_does_not_stop_the_batch(pg, tmp_path, 
     await run_image_worker(
         fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
         Throttled(Recorder(), 1, now=lambda: 0.0), settings(tmp_path),
-        sleep=noop_sleep, max_cycles=2,
+        sleep=noop_sleep, max_cycles=2, resolve=_fake_resolve,
     )
     rows = await pg.fetch("SELECT status FROM article_images ORDER BY position")
     assert [r["status"] for r in rows] == ["dead", "ok"]
@@ -125,7 +136,7 @@ async def test_an_errored_image_is_retried_until_the_ceiling(pg, tmp_path, fake_
     be exercised. That interaction is real and wanted; it is just not what this
     test is about.
     """
-    await seed(pg, 1, ["https://example.com/flaky.png"])
+    await seed(pg, 1, ["https://a.example/flaky.png"])
     calls = {"n": 0}
 
     async def get_bytes(url, max_bytes):
@@ -137,7 +148,7 @@ async def test_an_errored_image_is_retried_until_the_ceiling(pg, tmp_path, fake_
         Throttled(Recorder(), 1, now=lambda: 0.0),
         settings(tmp_path, image_retry_cooldown_sec=0),
         circuit=HostCircuit(threshold=999, open_sec=1, now=lambda: 0.0),
-        sleep=noop_sleep, max_cycles=10,
+        sleep=noop_sleep, max_cycles=10, resolve=_fake_resolve,
     )
     row = await pg.fetchrow("SELECT status, attempts FROM article_images WHERE article_id = 1")
     assert row["status"] == "error"
@@ -156,7 +167,7 @@ async def test_a_host_having_a_bad_minute_does_not_burn_every_attempt(pg, tmp_pa
     storm or a brief tunnel blip therefore wrote off living images permanently,
     with no log line, because a clean 429 raises nothing.
     """
-    await seed(pg, 1, ["https://example.com/flaky.png"])
+    await seed(pg, 1, ["https://a.example/flaky.png"])
     calls = {"n": 0}
 
     async def get_bytes(url, max_bytes):
@@ -167,7 +178,7 @@ async def test_a_host_having_a_bad_minute_does_not_burn_every_attempt(pg, tmp_pa
         fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
         Throttled(Recorder(), 1, now=lambda: 0.0),
         settings(tmp_path, image_retry_cooldown_sec=3600),
-        sleep=noop_sleep, max_cycles=10,
+        sleep=noop_sleep, max_cycles=10, resolve=_fake_resolve,
     )
     row = await pg.fetchrow("SELECT status, attempts FROM article_images WHERE article_id = 1")
     assert calls["n"] == 1, f"ten cycles inside the cooldown made {calls['n']} attempts"
@@ -202,7 +213,7 @@ async def test_a_hanging_host_cannot_wedge_the_worker(pg, tmp_path, fake_pool):
     container reporting healthy, nothing collected for as long as it stayed up.
     A stuck fetch must cost one row, not the worker.
     """
-    await seed(pg, 1, ["https://example.com/hangs-1.png", "https://example.net/works-2.png"])
+    await seed(pg, 1, ["https://hangs.example/1.png", "https://works.example/2.png"])
 
     async def get_bytes(url, max_bytes):
         if "hangs" in url:
@@ -213,12 +224,12 @@ async def test_a_hanging_host_cannot_wedge_the_worker(pg, tmp_path, fake_pool):
         fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
         Throttled(Recorder(), 1, now=lambda: 0.0),
         settings(tmp_path, image_timeout_sec=0.05),
-        sleep=noop_sleep, max_cycles=1,
+        sleep=noop_sleep, max_cycles=1, resolve=_fake_resolve,
     )
 
     rows = dict(await pg.fetch("SELECT source_url, status FROM article_images"))
-    assert rows["https://example.net/works-2.png"] == "ok", "the healthy image must still be collected"
-    assert rows["https://example.com/hangs-1.png"] == "error", (
+    assert rows["https://works.example/2.png"] == "ok", "the healthy image must still be collected"
+    assert rows["https://hangs.example/1.png"] == "error", (
         "a timeout is not evidence the image is gone, so it must stay retryable"
     )
 
@@ -233,10 +244,7 @@ async def test_a_slow_host_does_not_idle_the_rate_budget(pg, tmp_path, fake_pool
     load, so politeness is unchanged; what changes is that a slow host no longer
     spends everyone else's budget waiting.
     """
-    # Three distinct real hosts, cycled: measured live, this is the actual split
-    # (39 of 50 rows on three hosts) — see _capture_batch's docstring.
-    hosts = ["example.com", "example.net", "example.org"]
-    await seed(pg, 1, [f"https://{hosts[i % 3]}/x{i}.png" for i in range(8)])
+    await seed(pg, 1, [f"https://h{i}.example/x.png" for i in range(8)])
     in_flight = 0
     peak = 0
 
@@ -254,7 +262,7 @@ async def test_a_slow_host_does_not_idle_the_rate_budget(pg, tmp_path, fake_pool
         fake_pool(pg), get_bytes, RateLimiter(1000), HostLimiter(),
         Throttled(Recorder(), 1, now=lambda: 0.0),
         settings(tmp_path, image_concurrency=4),
-        sleep=noop_sleep, max_cycles=1,
+        sleep=noop_sleep, max_cycles=1, resolve=_fake_resolve,
     )
 
     assert peak > 1, f"requests never overlapped (peak={peak}); a slow host still blocks the batch"
@@ -334,12 +342,15 @@ async def test_the_rate_token_is_taken_after_the_host_slot(tmp_path):
         return None
 
     item = repo.PendingImage(
-        article_id=1, position=0, source_url="https://example.com/x.png", attempts=0
+        article_id=1, position=0, source_url="https://a.example/x.png", attempts=0
     )
     original = repo.record_image_result, repo.save_image_blob
     repo.record_image_result, repo.save_image_blob = noop, noop
     try:
-        await _capture_one(OnePool(), get_bytes, Limiter(), Hosts(), settings(tmp_path), item)
+        await _capture_one(
+            OnePool(), get_bytes, Limiter(), Hosts(), settings(tmp_path), item,
+            resolve=_fake_resolve,
+        )
     finally:
         repo.record_image_result, repo.save_image_blob = original
 
@@ -354,13 +365,13 @@ async def test_a_failing_host_is_held_off_while_others_keep_going(pg, tmp_path, 
     every batch was postimg at 20s each — 0.04 images/second while every other
     host answered in under a second.
     """
-    await seed(pg, 1, [f"https://example.com/bad-{i}.png" for i in range(4)])
-    await seed(pg, 2, [f"https://example.net/good-{i}.png" for i in range(4)])
+    await seed(pg, 1, [f"https://bad.example/{i}.png" for i in range(4)])
+    await seed(pg, 2, [f"https://good.example/{i}.png" for i in range(4)])
     attempted: list[str] = []
 
     async def get_bytes(url, max_bytes):
         attempted.append(url)
-        if "bad-" in url:
+        if "bad.example" in url:
             raise TimeoutError("stalled")
         return 200, b"\x89PNG ok", "image/png"
 
@@ -369,10 +380,10 @@ async def test_a_failing_host_is_held_off_while_others_keep_going(pg, tmp_path, 
         Throttled(Recorder(), 1, now=lambda: 0.0),
         settings(tmp_path, image_retry_cooldown_sec=0, image_concurrency=1),
         circuit=HostCircuit(threshold=3, open_sec=900, now=lambda: 0.0),
-        sleep=noop_sleep, max_cycles=6,
+        sleep=noop_sleep, max_cycles=6, resolve=_fake_resolve,
     )
 
-    bad_attempts = [u for u in attempted if "bad-" in u]
+    bad_attempts = [u for u in attempted if "bad.example" in u]
     assert len(bad_attempts) == 3, (
         f"the host should be left alone after 3 consecutive failures, got {len(bad_attempts)}"
     )
@@ -385,7 +396,7 @@ async def test_a_dead_link_is_an_answer_not_a_host_failure(pg, tmp_path, fake_po
     """A 404 means the host is working and the image is gone. Counting those as
     host failures would hold off exactly the hosts still answering — and old
     articles are full of dead links by design."""
-    await seed(pg, 1, [f"https://example.com/alive-{i}.png" for i in range(5)])
+    await seed(pg, 1, [f"https://alive.example/{i}.png" for i in range(5)])
 
     async def get_bytes(url, max_bytes):
         return 404, b"", None
@@ -395,6 +406,6 @@ async def test_a_dead_link_is_an_answer_not_a_host_failure(pg, tmp_path, fake_po
         Throttled(Recorder(), 1, now=lambda: 0.0),
         settings(tmp_path, image_concurrency=1),
         circuit=HostCircuit(threshold=3, open_sec=900, now=lambda: 0.0),
-        sleep=noop_sleep, max_cycles=2,
+        sleep=noop_sleep, max_cycles=2, resolve=_fake_resolve,
     )
     assert await pg.fetchval("SELECT count(*) FROM article_images WHERE status='dead'") == 5
