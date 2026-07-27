@@ -175,9 +175,10 @@ HOSTILE = [
     '<ul><li onclick="alert(1)">Item</li></ul>',
     '<p>Line1<br onclick="alert(1)">Line2<br><br></p>',
     "<p>" + "<b>" * 150 + '<a href="https://evil.example/">deep link</a>' + "</b>" * 150 + "</p>",
-    # These four round out coverage of every EMITTED_TAGS member reachable in
-    # this task (em, u, s, blockquote, ol, h2, h4, h5, h6 -- img and span
-    # stay unreached until Task 5 actually emits them). Before these, the
+    # These four round out coverage of every EMITTED_TAGS member reachable
+    # without a captured image (em, u, s, blockquote, ol, h2, h4, h5, h6).
+    # "img" and "span" are covered separately, further down, by a case that
+    # actually reaches the missing-image placeholder path. Before these, the
     # sweep below reached 7 of 18 EMITTED_TAGS; a tag-alphabet regression in
     # any of these nine could have shipped without the invariant test ever
     # touching it.
@@ -258,10 +259,14 @@ def test_hostile_input_sweep_actually_exercises_attributes():
 def test_an_image_with_a_disallowed_scheme_is_dropped_before_task_5_sees_it():
     """Image.source_url must be a checked URL, the same way Inline("a").href is.
 
-    render_body can't observe this yet -- _emit still renders every Image as
-    Markup("") regardless of validity, because image rendering is Task 5 --
-    so this asserts directly on _convert's output, which is part of this
-    module's documented interface.
+    Asserted directly against _convert's output, which is part of this
+    module's documented interface, rather than through render_body: a
+    disallowed-scheme <img> never becomes an Image node at all, so no
+    render_body input can exercise _emit_image's own validation for this
+    case at all. Confirmed directly (see the task report's mutation check
+    for test_an_image_source_that_is_not_http_gets_no_link): _emit_image is
+    never even called for this input, because _convert already dropped it
+    here.
     """
     body = HTMLParser('<p><img src="javascript:alert(1)"></p>').body
     p_node = next(c for c in body.iter(include_text=True) if c.tag == "p")
@@ -461,6 +466,10 @@ def test_a_missing_image_is_a_placeholder_that_links_to_the_original(state, capt
     assert 'href="https://h/1.png"' in out
     assert 'rel="nofollow noreferrer"' in out
     assert "<img" not in out
+    # Task 7's placeholder styling hooks off this class; unguarded before
+    # this line (mutant M13: dropping the class attribute left all 81 tests
+    # in this file green).
+    assert 'class="missing-image"' in out
 
 
 def test_a_withheld_blob_is_not_linked_to_its_original():
@@ -489,9 +498,15 @@ def test_an_image_source_that_is_not_http_gets_no_link():
 def test_a_linked_image_keeps_the_authors_link_around_it():
     images = {"https://h/1.png": ImageState(state="ok", sha256=DIGEST)}
     raw = '<p><a href="https://src.example/"><img src="https://h/1.png"></a></p>'
-    out = str(render_body(raw, images).html)
+    rendered = render_body(raw, images)
+    out = str(rendered.html)
     assert 'href="https://src.example/"' in out
     assert f'src="/img/{DIGEST.hex()}"' in out
+    # _image_urls' recursion into Inline was unguarded (mutant M9: deleting
+    # it left all 81 tests in this file green, silently emptying
+    # image_urls for every image inside an author link -- the common
+    # shape, and the one Task 7's gallery subtracts against).
+    assert rendered.image_urls == frozenset({"https://h/1.png"})
 
 
 def test_rendered_image_urls_are_reported_for_the_gallery():
@@ -516,3 +531,82 @@ def test_a_missing_protocol_relative_image_still_links_to_its_original():
     out = str(render_body('<p><img src="//h/1.png"></p>', {}).html)
     assert 'href="https://h/1.png"' in out
     assert "not archived" in out
+
+
+def test_a_captured_image_is_found_by_the_exact_unstripped_key():
+    """images.get() must key on item.source_url exactly as stored, not a
+    stripped copy of it -- crawler/parser.py writes the src attribute
+    verbatim, with no .strip() (settled in an earlier review round), so
+    article_images can hold a row keyed on a string with incidental
+    whitespace. Mutating the lookup to `images.get(item.source_url.strip())`
+    is exactly the "obvious cleanup" that misses such a row silently --
+    survived the whole file before this test existed.
+    """
+    padded = " https://h/1.png "
+    images = {padded: ImageState(state="ok", sha256=DIGEST)}
+    out = str(render_body(f'<p><img src="{padded}"></p>', images).html)
+    assert f'src="/img/{DIGEST.hex()}"' in out
+
+
+def test_an_ok_state_with_no_digest_yet_degrades_to_a_placeholder():
+    """_CAPTIONS has no "ok" key of its own -- the ok+digest branch above it
+    is the only path that ever wants that word. A row that says "ok" but
+    has no sha256 yet is exactly the shape the ok-branch's own condition
+    (`state.sha256 is not None`) anticipates falling through on, and a bare
+    `_CAPTIONS[state.state]` subscript KeyErrors on it, which would take
+    the whole article page down instead of degrading the one image slot.
+    """
+    images = {"https://h/1.png": ImageState(state="ok", sha256=None)}
+    out = str(render_body('<p><img src="https://h/1.png"></p>', images).html)
+    assert 'class="missing-image"' in out
+    assert "<img" not in out
+
+
+def test_an_unrecognised_state_degrades_to_a_placeholder_instead_of_crashing():
+    """'pending' and 'error' are the real article_images statuses -- not
+    among _CAPTIONS' five buckets -- and would reach here unchanged if a
+    future caller (Task 6's SQL) ever passed one through without collapsing
+    it first. A bare subscript KeyErrors; render_body must degrade the one
+    image slot instead of taking the whole article page down with it.
+    """
+    images = {"https://h/1.png": ImageState(state="pending", sha256=None)}
+    out = str(render_body('<p><img src="https://h/1.png"></p>', images).html)
+    assert 'class="missing-image"' in out
+
+
+def test_a_placeholder_inside_an_author_link_does_not_nest_anchors():
+    """`[url=x][img]x[/img][/url]` is the BBCode idiom, so an author `<a>`
+    almost always wraps exactly one image. With no queue row the image
+    renders as a placeholder that already contains its own "original" <a>
+    -- keeping the author's wrapping <a> around it nests one <a> inside
+    another, which is invalid HTML5. Verified directly with lexbor (the
+    same tree-construction algorithm a real browser runs): parsing the
+    un-fixed output split the pair apart via the adoption-agency algorithm
+    and hoisted the inner <a> out from under the outer one, so the escaped
+    markup didn't even describe the nesting this module wrote. The fix
+    drops the author's <a>, keeping its content.
+    """
+    raw = '<p><a href="https://src.example/"><img src="https://h/1.png"></a></p>'
+    out = str(render_body(raw, {}).html)
+    assert out.count("<a ") == 1
+    assert 'href="https://src.example/"' not in out
+    assert 'href="https://h/1.png"' in out  # the placeholder's own "original" link
+
+
+def test_a_withheld_blob_inside_an_author_link_leaves_no_link_at_all():
+    """`babel hide --image` is a takedown, and `[url=x][img]x[/img][/url]`
+    means the author's own href commonly points at the exact URL that was
+    hidden -- so a case-by-case check on which href to suppress is the
+    wrong shape of fix; only dropping the wrapping <a> unconditionally
+    closes it. Before the fix, this exact input rendered
+    `<a href="https://h/1.png" ...><span class="missing-image">Image not
+    available</span></a>` -- a live link to the original of a blob someone
+    ran `babel hide --image` on, defeating the takedown the placeholder's
+    own `_UNLINKED` check had already correctly honoured for itself.
+    """
+    images = {"https://h/1.png": ImageState(state="withheld", sha256=DIGEST)}
+    raw = '<p><a href="https://h/1.png"><img src="https://h/1.png"></a></p>'
+    out = str(render_body(raw, images).html)
+    assert "https://h/1.png" not in out
+    assert "<a " not in out
+    assert "not available" in out

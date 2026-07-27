@@ -342,7 +342,18 @@ def _emit_image(item: Image, images: Mapping[str, ImageState]) -> Markup:
     if state is not None and state.state == "ok" and state.sha256 is not None:
         return Markup('<img src="/img/%s" alt="" loading="lazy">') % state.sha256.hex()
 
-    caption = _CAPTIONS[state.state if state is not None else None]
+    # .get(), not a bare subscript: _CAPTIONS only has five keys (the four
+    # image_status_counts buckets, 'withheld', and None for "no row at all"),
+    # but state.state is not restricted to those at the type level. An "ok"
+    # row with no digest yet reaches here too -- the branch above already
+    # anticipates that shape by checking state.sha256 is not None separately
+    # from state.state == "ok" -- and 'pending'/'error' are the real
+    # article_images statuses, which would reach here unchanged if a future
+    # caller (Task 6's SQL) ever passed one through without collapsing it
+    # into one of the five buckets first. A bare subscript KeyErrors on any
+    # of these and takes the whole article page down with it, rather than
+    # degrading the one image slot that doesn't fit a known bucket.
+    caption = _CAPTIONS.get(state.state if state is not None else None, _CAPTIONS[None])
     href = None if (state is not None and state.state in _UNLINKED) else _placeholder_href(
         item.source_url
     )
@@ -354,6 +365,53 @@ def _emit_image(item: Image, images: Mapping[str, ImageState]) -> Markup:
     ) % (caption, href)
 
 
+def _anchor_must_unwrap(item: Inline, images: Mapping[str, ImageState]) -> bool:
+    """True if the author's own `<a>` around `item`'s children must be
+    dropped -- tag removed, children kept -- because at least one image
+    inside it is not rendering as a real `<img>`.
+
+    The anchor exists to make an image clickable; `[url=x][img]x[/img][/url]`
+    is the BBCode idiom that produces it, so an author link almost always
+    wraps exactly one image and nothing else. With no real `<img>` inside --
+    the image is a "missing-image" placeholder instead -- keeping the
+    wrapper is wrong in two independent ways, not one:
+
+    - A withheld blob's own placeholder already drops its "original" link
+      (see `_UNLINKED` above), but the *author's* href commonly points at
+      that exact URL -- it's the source the image was hidden from in the
+      first place -- so leaving the wrapper intact silently re-links round
+      a takedown that the placeholder itself correctly honoured.
+    - For every other missing state, the placeholder already contains its
+      own `<a>` ("original"); keeping the author's wrapper nests one `<a>`
+      inside another, which is invalid HTML5. Verified directly with
+      lexbor (the same tree-construction algorithm a real browser runs):
+      the adoption-agency algorithm splits the pair apart on parse and
+      hoists the inner `<a>` out from under the outer one, so the escaped
+      markup does not even describe the nesting this module wrote.
+
+    Unwrapping whenever any contained image isn't a real `<img>` satisfies
+    both concerns unconditionally, rather than by case analysis on which
+    href happens to match a hidden source. Returns False when `item`
+    contains no `Image` at all -- an ordinary text or formatting link is
+    untouched -- and also False once every contained image is confirmed
+    `ok` with a digest, so `render_body(images={..ok..})` still nests the
+    author's `<a>` around a real `<img>` exactly as before this check
+    existed.
+    """
+    stack: list[object] = list(item.children)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, Image):
+            state = images.get(node.source_url)
+            if state is None or state.state != "ok" or state.sha256 is None:
+                return True
+            continue
+        children = getattr(node, "children", None)
+        if children:
+            stack.extend(children)
+    return False
+
+
 def _emit(item: object, images: Mapping[str, ImageState]) -> Markup:
     if isinstance(item, Text):
         return escape(item.value)
@@ -363,6 +421,8 @@ def _emit(item: object, images: Mapping[str, ImageState]) -> Markup:
         return _emit_image(item, images)
     inner = Markup("").join(_emit(child, images) for child in item.children)
     if isinstance(item, Inline) and item.tag == "a":
+        if _anchor_must_unwrap(item, images):
+            return inner
         return Markup('<a href="%s" rel="nofollow noreferrer ugc" target="_blank">%s</a>') % (
             item.href, inner,
         )
