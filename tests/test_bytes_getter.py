@@ -22,16 +22,45 @@ _PUBLIC_A = "93.184.216.34"
 _PUBLIC_B = "8.8.8.8"
 
 
+class _RecordingEvent:
+    """Stands in for curl_cffi's asyncio.Event-typed `response.quit_now`.
+
+    The real `aclose()` never touches `quit_now` at all (see I9 in CLAUDE.md) —
+    it is `await self.astream_task`, which waits for curl's background fetch to
+    finish rather than severing it. Only `quit_now.set()` makes curl's write
+    callback (`qput`, in curl_cffi's own source) return CURL_WRITEFUNC_ERROR and
+    abort the transfer early. A no-op fake `aclose()` would let a test pass
+    whether or not the getter ever calls `quit_now.set()` — exactly the blind
+    spot that let I9 sit open while CLAUDE.md claimed it was closed — so this
+    fake records both whether and when `set()` was called, relative to
+    `aclose()`, via the shared `events` list.
+    """
+
+    def __init__(self, events: list[str]):
+        self._events = events
+        self._is_set = False
+
+    def set(self):
+        self._is_set = True
+        self._events.append("quit_now")
+
+    def is_set(self):
+        return self._is_set
+
+
 class _Response:
     def __init__(self):
         self.status_code = 200
         self.headers = {"content-type": "image/png", "content-length": "9"}
+        self.events: list[str] = []
+        self.quit_now = _RecordingEvent(self.events)
 
     async def aiter_content(self):
+        self.events.append("read")
         yield b"\x89PNG fake"
 
     async def aclose(self):
-        pass
+        self.events.append("aclose")
 
 
 class _RecordingSession:
@@ -73,20 +102,28 @@ def test_no_user_agent_override(header):
 
 
 class _ScriptedResponse:
-    def __init__(self, status_code, *, location=None, body=b"", content_type=None):
+    """`chunks` lets a test spread a body over several `aiter_content` yields,
+    so a mid-stream abort can be shown to stop partway rather than draining
+    everything; `body` (a single bytes value) is the common-case shorthand."""
+
+    def __init__(self, status_code, *, location=None, body=b"", chunks=None, content_type=None):
         self.status_code = status_code
         self.headers = {}
         if location is not None:
             self.headers["location"] = location
         if content_type is not None:
             self.headers["content-type"] = content_type
-        self._body = body
+        self._chunks = list(chunks) if chunks is not None else [body]
+        self.events: list[str] = []
+        self.quit_now = _RecordingEvent(self.events)
 
     async def aiter_content(self):
-        yield self._body
+        for chunk in self._chunks:
+            self.events.append("read")
+            yield chunk
 
     async def aclose(self):
-        pass
+        self.events.append("aclose")
 
 
 class _ScriptedSession:
@@ -172,3 +209,78 @@ async def test_a_redirect_loop_is_retryable_not_dead(tmp_path):
     # Not just "some exception happened" — it must have actually walked the
     # loop up to the ceiling rather than given up on the first hop.
     assert len(session.requested) == MAX_REDIRECT_HOPS + 1
+
+
+async def test_a_redirect_hop_is_aborted_via_quit_now_not_drained(tmp_path):
+    """N1 (round 2 of review): the redirect loop `continue`s on a 3xx before
+    either size check runs, and `aclose()` alone does not stop curl from
+    pulling the rest of that response in the background — measured against
+    real curl_cffi with a 302 carrying a 300 MB body: peak RSS went
+    61 MB -> 466 MB and the capture still returned 'ok'. This is the same
+    mechanism as I9 (CLAUDE.md): curl_cffi's async `aclose()` is just
+    `await self.astream_task`, which waits for the transfer to finish rather
+    than severing it. Only `response.quit_now.set()` makes curl's own write
+    callback abort early. A fake whose `aclose()` is a no-op cannot see this
+    bug at all — it was exactly why I9 stayed open once already — so this
+    checks the actual sequence of events on the redirect response, not merely
+    the final outcome.
+    """
+    redirect_resp = _ScriptedResponse(302, location=f"https://{_PUBLIC_B}/b.png")
+    final_resp = _ScriptedResponse(200, body=b"\x89PNG fake", content_type="image/png")
+    session = _ScriptedSession(
+        {
+            f"https://{_PUBLIC_A}/a.png": redirect_resp,
+            f"https://{_PUBLIC_B}/b.png": final_resp,
+        }
+    )
+
+    outcome = await capture_image(
+        _bytes_getter(session, 5), tmp_path, f"https://{_PUBLIC_A}/a.png", max_bytes=10_000
+    )
+
+    assert outcome.status == "ok"
+    assert "read" not in redirect_resp.events, "a 3xx body must never be read"
+    assert redirect_resp.events == ["quit_now", "aclose"], redirect_resp.events
+    # The terminal response is a normal, fully-consumed read. It must not be
+    # reported as aborted — only abandoned responses set quit_now.
+    assert not final_resp.quit_now.is_set()
+    assert final_resp.events == ["read", "aclose"], final_resp.events
+
+
+async def test_an_oversized_declared_length_is_aborted_via_quit_now(tmp_path):
+    """A declared Content-Length past max_bytes is rejected before a single
+    byte is read. The rejection must be a real abort, not merely an early
+    `raise` that leaves curl free to keep pulling the rest of the body behind
+    the getter's back — the same I9 mechanism as the redirect case above."""
+    resp = _ScriptedResponse(200, content_type="image/png")
+    resp.headers["content-length"] = str(50_000_000)
+    session = _ScriptedSession({f"https://{_PUBLIC_A}/big.png": resp})
+
+    outcome = await capture_image(
+        _bytes_getter(session, 5), tmp_path, f"https://{_PUBLIC_A}/big.png", max_bytes=1_000
+    )
+
+    assert outcome.status == "error"
+    assert "read" not in resp.events, "an oversized declared length must abort before reading"
+    assert resp.events == ["quit_now", "aclose"], resp.events
+
+
+async def test_an_oversized_stream_is_aborted_via_quit_now_mid_transfer(tmp_path):
+    """No declared Content-Length, so the cap is only caught mid-stream — the
+    shape of the report's 300 MB / 8 MiB measurement. The stream must be
+    abandoned at the chunk that crosses max_bytes, with quit_now set before
+    close, not drained to the end first."""
+    chunks = [b"x" * 100 for _ in range(10)]  # 1000 bytes total, 100 at a time
+    resp = _ScriptedResponse(200, chunks=chunks, content_type="image/png")
+    session = _ScriptedSession({f"https://{_PUBLIC_A}/big.png": resp})
+
+    outcome = await capture_image(
+        _bytes_getter(session, 5), tmp_path, f"https://{_PUBLIC_A}/big.png", max_bytes=350
+    )
+
+    assert outcome.status == "error"
+    read_events = [e for e in resp.events if e == "read"]
+    assert len(read_events) < len(chunks), (
+        "the stream must be abandoned once max_bytes is crossed, not drained to the end"
+    )
+    assert resp.events[-2:] == ["quit_now", "aclose"], resp.events
