@@ -90,15 +90,14 @@ MAX_NESTING = 1000
 
 # Below this the scan is skipped, because nesting cannot cost *much* at this
 # size, not because it costs nothing: a 32 KiB body of plain <div>...</div>,
-# nested as deeply as its own length permits (depth 2,978), parses in 19.5 ms
-# -- but that is the cheap shape, not the worst one this size can hold. A
-# tag-dense shape wastes fewer bytes per level: "<b></x>" * 4,681 also fits in
-# 32 KiB (the close never matches, so it costs nothing but bytes) and reaches
-# depth 4,666, measured at 62 ms to parse. Still comfortably inside the 1 s
+# nested as deeply as its own length permits (depth 2,978), parses in 19.5 ms.
+# A tag-dense shape costs more at the same size -- not a claimed maximum,
+# just a higher measured figure: "<div>" * 6,553 (32,765 B, unclosed, so
+# every byte buys a level) parses in 89 ms. Still comfortably inside the 1 s
 # budget this guard exists to protect, which is what makes the floor safe --
 # just not free. 16 KiB nested (div) is 5.3 ms. The average archived body is
 # 3.4 KB (SPEC.md), so in practice the scan never runs. The scan itself is
-# not free either -- 79 ms over a flat 1 MB document -- which is exactly why
+# not free either -- 69 ms over a flat 1 MB document -- which is exactly why
 # it is gated on size rather than run unconditionally.
 GUARD_MIN_BYTES = 32 * 1024
 
@@ -109,7 +108,7 @@ _VOID_ELEMENTS = frozenset({
     "meta", "param", "source", "track", "wbr",
 })
 
-_TAG_RE = re.compile(r"""<(/?)([a-zA-Z][a-zA-Z0-9]*)((?:[^>"']|"[^"]*"|'[^']*')*)>""")
+_TAG_RE = re.compile(r"""<(/?)([a-zA-Z][^\s/>"']*)((?:[^>"']|"[^"]*"|'[^']*')*)>""")
 
 
 def _too_deeply_nested(raw: str) -> bool:
@@ -122,39 +121,69 @@ def _too_deeply_nested(raw: str) -> bool:
     choice below is made to never under-count, even at the cost of sometimes
     over-counting a body that would actually have parsed cheaply.
 
-    A running balance -- +1 on an open, -1 on any close -- is NOT enough, and
-    an earlier version of this function used one. selectolax (like any HTML5
-    tree builder) ignores a close tag that names no open element currently in
-    scope: it is simply skipped, not applied to whatever happens to be on
-    top. A running balance does not know that -- it decrements on every close
-    regardless of its name -- so pairing each open with a close that names
-    something else (`"<div></x>" * 90000`, 810 KB, inside crawler/parser.py's
-    1,000,000-character ceiling) drops the balance back down after every
-    pair while the real parser, finding no open `<x>` to match, ignores the
-    close and keeps genuinely nesting the `<div>`. Measured directly: that
-    input parsed in 18,157 ms -- worse than the 17,662 ms balanced attack
-    this guard exists to stop -- while the running balance never tripped.
-    Reproduced the same way with `<div></p>`, `<x></y>`, `<b></x>`,
-    `<div></br>`, `<DIV></X>`, `<div\\n></x>`, and `<div a=">"></x>`.
+    This function has been wrong three times before landing on the rule
+    below, and every one of those times was a *clever* attempt to track HTML5
+    tree construction more exactly. Read this history before changing
+    anything here again:
 
-    The fix models the one part of HTML5 tree construction this guard
-    actually needs: a stack of open tag names, plus a name -> count map so
-    "is this name open anywhere right now" is an O(1) check rather than a
-    stack scan. An open pushes and increments; the stack's own length is
-    the true nesting depth, so the MAX_NESTING check reads it directly
-    instead of trusting a separately-tracked number that could drift from
-    it. A close whose name has a zero count is ignored outright, exactly as
-    the real parser ignores it. A close whose name IS open pops the stack
-    down to and including the matching entry, decrementing each popped
-    name's count as it goes -- this is also deliberate, not incidental: it
-    mirrors the real parser force-closing any unclosed descendants when an
-    ancestor's end tag arrives (`<div><span></div>` closes both, because
-    nothing else could `</span>` refer to once the `<div>` that contains it
-    is gone), so an attacker cannot use an unclosed inner tag to keep extra
-    stack entries around under a name this function has already popped.
-    Every push is popped at most once across the whole scan, so the total
-    cost stays linear in the number of tags -- the same amortised-O(1)-per-
-    tag shape the previous, wrong version had, not a quadratic one.
+    1. A running balance (+1 on open, -1 on ANY close) doesn't know a close
+       needs a matching open at all. selectolax ignores a close tag that
+       names no open element currently in scope, so pairing each open with a
+       close that names something else (`"<div></x>" * 90000`, 810 KB)
+       drops the balance back down every pair while the real parser, with
+       nothing to close, keeps genuinely nesting the `<div>`. Measured:
+       18,157 ms unrefused, worse than the 17,662 ms attack this guard
+       exists to stop.
+    2. A stack that pops down to and including a same-named entry anywhere
+       in it (not just the top) assumed every close either matches nothing
+       or matches cleanly. Three more ways that's false, all measured at
+       crawler/parser.py's 1,000,000-character ceiling:
+       - **Scope boundaries.** HTML5 ignores a close tag when the named
+         element is not *in scope* -- `object`, `marquee`, `applet`,
+         `template`, `table`, `td`, `th`, `caption` all block scope the same
+         way. `"<div><object></div>" * 52631` (999,989 B): the real parser
+         never closes the `div` (blocked by the open `object`), but a
+         search-any-depth stack finds `div` two entries down and pops both.
+         Measured 29,488 ms unrefused -- 1.7x the original attack, built
+         from ordinary tags.
+       - **RAWTEXT/RCDATA content.** Inside `textarea`, `style`, `title`,
+         `iframe`, `script`, `xmp`, `noembed`, anything that looks like a
+         close tag is literal text to the real parser, not a tag.
+         `"<div><style></div></style>"` (999,986 B): the `</div>` inside
+         `<style>` is text, but this function's regex can't tell RAWTEXT
+         content from markup and matched it as a real close anyway.
+         Measured 3,547 ms unrefused.
+       - **A tag-name class narrower than HTML5's.** The previous regex,
+         `[a-zA-Z][a-zA-Z0-9]*`, stops at the first `-`, `:` or `_`, so
+         `<div-x>` was recorded as an open `div` -- and a later `</div>`
+         matched that phantom and popped it, while the real parser has no
+         `div` in scope at all (the open element is named `div-x`, a
+         different name) and keeps nesting. Measured 24,332 ms unrefused via
+         `"<div-x></div>"` (999,999 B); same defect via `:`.
+       Fixed here too: `_TAG_RE`'s name class widened to
+       `[a-zA-Z][^\\s/>"']*`, matching everything HTML5 accepts in a tag
+       name (letters, digits, and the punctuation real tag names use).
+
+    **The rule that actually holds, this time because it stops trying to be
+    exact: pop only when a close matches the TOP of the stack. Never search
+    deeper. If it doesn't match the top, ignore the close outright** -- the
+    same outcome as "no matching open in scope" from the parser's own
+    perspective, without this function having to know *why* (scope
+    boundary, RAWTEXT content, a name it never really opened, or a
+    genuinely absent element all look identical from here: the top doesn't
+    match). This is strictly more conservative than searching the whole
+    stack: it can only leave MORE entries open for longer than a real parser
+    would, never fewer. That is over-counting, and over-counting only costs
+    a body the plain-text fallback -- the safe side of every mistake this
+    function has made. Do not replace it with anything that tries to model
+    scope, RAWTEXT, or matching-anywhere-in-the-stack more precisely; every
+    such attempt so far has bought a little accuracy on the safe side by
+    selling correctness on the dangerous one. Be crude in the safe
+    direction, on purpose.
+
+    Still amortised linear: every push is popped at most once (an ignored
+    close pops nothing), so the total cost stays proportional to the number
+    of tags, not the document's real nesting depth.
 
     A trailing "/" on the tag (`<div/>`) is NOT treated as self-closing here,
     on purpose, for anything outside `_VOID_ELEMENTS`. HTML5 has no general
@@ -180,20 +209,15 @@ def _too_deeply_nested(raw: str) -> bool:
     if len(raw) < GUARD_MIN_BYTES:
         return False
     stack: list[str] = []
-    open_counts: dict[str, int] = {}
     for match in _TAG_RE.finditer(raw):
         closing, name = match.group(1), match.group(2).lower()
         if closing:
-            if not open_counts.get(name):
-                continue  # no matching open tag in scope -- the parser ignores this too
-            while stack:
-                popped = stack.pop()
-                open_counts[popped] -= 1
-                if popped == name:
-                    break
+            if stack and stack[-1] == name:
+                stack.pop()
+            # else: ignore. Deliberately never search past the top -- see the
+            # docstring's history of why "search deeper" is the unsafe move.
         elif name not in _VOID_ELEMENTS:
             stack.append(name)
-            open_counts[name] = open_counts.get(name, 0) + 1
             if len(stack) > MAX_NESTING:
                 return True
     return False

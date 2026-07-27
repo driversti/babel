@@ -806,6 +806,78 @@ def test_a_mismatched_close_tag_cannot_defeat_the_depth_counter(raw):
     assert render_body(raw, {}) is None
 
 
+def test_a_scope_boundary_cannot_defeat_the_depth_counter():
+    """Found in review, round 3: `object`, `marquee`, `applet`, `template`,
+    `table`, `td`, `th`, and `caption` are HTML5 scope boundaries -- a close
+    tag whose named element sits on the far side of one of these is ignored
+    by the real parser, because the element is not "in scope" even though it
+    is still open. `"<div><object></div>"` repeated: the `</div>` never
+    closes the `div` (the open `object` blocks scope), so the real parser
+    keeps nesting both, genuinely two levels deeper per repetition. The
+    round-2 stack fix (pop down to a same-named entry anywhere in the stack,
+    not just the top) didn't know about scope at all -- it found `div` two
+    entries down and popped straight through the `object`, undercounting.
+    Measured directly, before this fix: `"<div><object></div>" * 52631`
+    (999,989 B, crawler/parser.py's own ceiling) rendered -- not refused --
+    in 29,488 ms, 1.7x the original 17,662 ms attack this guard exists to
+    stop, built from ordinary tags with no trickery at all.
+
+    The fix (pop only on a top-of-stack match, never search deeper) doesn't
+    need to know `object` is special -- it only ever sees that the top of
+    the stack is `object`, not `div`, and leaves both open, which happens to
+    be the same outcome the real parser reaches for a different reason.
+    """
+    raw = "<div><object></div>" * 20_000
+    assert len(raw) > GUARD_MIN_BYTES
+    assert render_body(raw, {}) is None
+
+
+def test_rawtext_content_cannot_defeat_the_depth_counter():
+    """Found in review, round 3: inside `textarea`, `style`, `title`,
+    `iframe`, `script`, `xmp`, and `noembed`, anything that looks like a
+    close tag is literal text to the real HTML5 parser, not markup -- these
+    elements' content model is RAWTEXT/RCDATA, scanned only for their own
+    literal terminator. `_TAG_RE` has no notion of RAWTEXT and matches
+    `</div>` inside a `<style>` block as a real close tag regardless, so the
+    round-2 stack fix (pop down to a same-named entry anywhere in the
+    stack) popped the outer `div` on a "close" the real parser treats as
+    plain text -- undercounting. Measured directly, before this fix:
+    `"<div><style></div></style>" * 37036` (962,936 B) rendered -- not
+    refused -- in 3,547 ms.
+
+    The fix doesn't model RAWTEXT either. It only ever compares against the
+    top of the stack, which is `style` at the point the phantom `</div>`
+    close is seen (nothing else could be on top, since nothing real opens
+    inside RAWTEXT content) -- so the phantom close doesn't match and is
+    ignored, leaving `div` open, same as the real parser's RAWTEXT handling
+    reaches by a completely different route.
+    """
+    raw = "<div><style></div></style>" * 20_000
+    assert len(raw) > GUARD_MIN_BYTES
+    assert render_body(raw, {}) is None
+
+
+def test_a_hyphenated_tag_name_cannot_defeat_the_depth_counter():
+    """Found in review, round 3: the original `_TAG_RE` used
+    `[a-zA-Z][a-zA-Z0-9]*` for a tag name, which stops at the first `-`,
+    `:`, or `_` -- narrower than what HTML5 actually accepts in a tag name.
+    `<div-x>` was therefore recorded as an open `div`, not `div-x`, so a
+    later `</div>` matched that phantom `div` and the round-2 stack fix
+    popped it -- while the real parser has no `div` in scope at all (the
+    only open element is named `div-x`, a different name) and keeps
+    nesting. Measured directly, before this fix: `"<div-x></div>" * 76924`
+    (999,999 B) rendered -- not refused -- in 24,332 ms.
+
+    Fixed by widening `_TAG_RE`'s name class to `[a-zA-Z][^\\s/>"']*`,
+    which captures the tag name HTML5 actually sees (`div-x`, whole), not a
+    truncated prefix of it -- so the mismatched close no longer has a
+    phantom entry to (mis)match against at all.
+    """
+    raw = "<div-x></div>" * 20_000
+    assert len(raw) > GUARD_MIN_BYTES
+    assert render_body(raw, {}) is None
+
+
 def test_the_pathological_body_renders_in_well_under_a_second():
     """The whole point. Without the guard this exact input takes ~17.7 s."""
     n = 1_000_000 // 11
