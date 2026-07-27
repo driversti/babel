@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}babel — eRepublik article archive{% endblock %}
+{% block content %}
+
+<p class="coverage">
+  {{ "{:,}".format(stats.articles).replace(",", " ") }} articles so far{% if stats.oldest %},
+  covering {{ game_time(stats.oldest).strftime("%Y-%m-%d") }} –
+  {{ game_time(stats.newest).strftime("%Y-%m-%d") }}{% endif %}.
+  {% if stats.frontier %}Collection walks backwards through article IDs and has reached
+  {{ "{:,}".format(stats.frontier).replace(",", " ") }}; anything published earlier is
+  not in the archive yet.{% endif %}
+</p>
+
+<form class="filters" method="get" action="/">
+  <label>Country
+    <select name="country">
+      <option value="">any</option>
+      {% for c in countries %}
+      <option value="{{ c }}"{% if c == filters.country %} selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Author <input type="text" name="author" value="{{ filters.author or '' }}"></label>
+  <label>Order
+    <select name="order">
+      <option value="new"{% if order == 'new' %} selected{% endif %}>newest first</option>
+      <option value="old"{% if order == 'old' %} selected{% endif %}>oldest first</option>
+    </select>
+  </label>
+  <label>Jump to
+    <input type="date" name="on"
+           {% if stats.oldest %}min="{{ game_time(stats.oldest).strftime('%Y-%m-%d') }}"
+           max="{{ game_time(stats.newest).strftime('%Y-%m-%d') }}"{% endif %}>
+  </label>
+  <button type="submit">Apply</button>
+</form>
+
+{% if rows %}
+<ol class="articles">
+  {% for row in rows %}
+  <li>
+    <time>{{ game_time(row.published_at).strftime("%Y-%m-%d") }}</time>
+    <a class="title" href="/article/{{ row.id }}">{{ row.title }}</a>
+    {% if row.author_name %}
+    <a class="author" href="/?author={{ row.author_name|urlencode }}">{{ row.author_name }}</a>
+    {% endif %}
+    {% if row.country %}
+    <a class="country" href="/?country={{ row.country|urlencode }}">{{ row.country }}</a>
+    {% endif %}
+    <span class="comments">{{ row.comment_count }} comments</span>
+  </li>
+  {% endfor %}
+</ol>
+
+<nav class="pager">
+  {% if prev_cursor %}<a href="/?before={{ prev_cursor|urlencode }}{% if filters.country %}&country={{ filters.country|urlencode }}{% endif %}{% if filters.author %}&author={{ filters.author|urlencode }}{% endif %}&order={{ order }}">← newer</a>{% endif %}
+  {% if next_cursor %}<a href="/?after={{ next_cursor|urlencode }}{% if filters.country %}&country={{ filters.country|urlencode }}{% endif %}{% if filters.author %}&author={{ filters.author|urlencode }}{% endif %}&order={{ order }}">older →</a>{% endif %}
+</nav>
+{% else %}
+<p class="empty">Nothing here.
+  {% if stats.frontier %}Collection has reached article
+  {{ "{:,}".format(stats.frontier).replace(",", " ") }}; anything published earlier is
+  not in the archive yet.{% else %}This archive is a small, growing slice of
+  eRepublik's history; whatever you were looking for is simply not in the archive yet.{% endif %}</p>
+{% endif %}
+
+{% if suggestions %}
+<p class="suggestions">Did you mean:
+  {% for name in suggestions %}
+  <a href="/?author={{ name|urlencode }}">{{ name }}</a>{% if not loop.last %}, {% endif %}
+  {% endfor %}
+</p>
+{% endif %}
+
+{% if not next_cursor and rows %}
+<p class="coverage end">That is everything collected so far.
+  {% if stats.frontier %}Collection has reached article
+  {{ "{:,}".format(stats.frontier).replace(",", " ") }} and is still walking backwards.{% endif %}</p>
+{% endif %}
+
+{% endblock %}
