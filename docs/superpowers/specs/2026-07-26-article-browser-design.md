@@ -246,8 +246,15 @@ docker compose up -d crawler images web
 
 Both long-running commands apply migrations at startup, so `docker compose up -d images` alone —
 which CLAUDE.md documents as safe — would run this DDL against a live walk. The file sets
-`lock_timeout = '5s'` at the top so a contended run fails fast instead of blocking `save_article`
-indefinitely behind an `ACCESS EXCLUSIVE` lock held for the whole build.
+`lock_timeout = '5s'` at the top, but that bounds only how long the migration itself waits to
+*acquire* a lock — verified against a live Postgres: once acquired, the lock is held for the whole
+build regardless of `lock_timeout`. Plain `CREATE INDEX` takes `ShareLock`, which blocks concurrent
+writers (not readers) for the whole build; `ACCESS EXCLUSIVE` belongs to the two `ADD COLUMN`
+statements below, and both are metadata-only (neither column has a default) and effectively
+instant. What actually keeps this from blocking `save_article` indefinitely is the runbook — stop
+`crawler` and `images` before migrating — not `lock_timeout`. `lock_timeout` only matters because
+Postgres's lock queue is FIFO: once an `ACCESS EXCLUSIVE` request is waiting, every later reader and
+writer queues behind it too, so failing fast to acquire is still worth doing.
 
 The two `DROP INDEX` statements go in a **separate, later** migration, so a failed build cannot
 leave `articles` with neither index set.
@@ -518,8 +525,11 @@ The existing pytest suite, the existing `postgres:17` testcontainer, plus httpx'
    its index. So: the country, `lower(author_name)` and `(published_at, id)` terms must appear as
    index conditions and must not appear in `Filter:`; the `IS NULL OR` variant is included as an
    explicit negative control; and enough rows are inserted (or `ANALYZE` run) that the plan is not
-   chosen from a zero-page estimate. This is finding M3 in CLAUDE.md being closed rather than
-   re-enacted.
+   chosen from a zero-page estimate. This is finding M3 in CLAUDE.md being *prevented from
+   recurring in this new query path*, not closed outright: the pre-existing offenders — the two
+   partial-index EXPLAIN tests in `tests/db/test_repo.py`, which still build their own copy of the
+   SQL and EXPLAIN that instead of the code's query — are untouched, and `RETRYABLE_STATUSES` in
+   `repo.py` is still unused. M3 stays open in CLAUDE.md until those are fixed too.
 
 ## Out of scope
 

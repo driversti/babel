@@ -368,3 +368,41 @@ async def record_image_result(
            WHERE article_id = $1 AND source_url = $2""",
         article_id, source_url, status, sha256,
     )
+
+
+async def hide_article(conn: asyncpg.Connection, article_id: int) -> int:
+    """Suppress an article from the public site. Returns rows changed.
+
+    A tombstone rather than a DELETE, and the difference is not stylistic.
+    Measured on a fresh database: DELETE FROM articles cascades comments and
+    article_images, but the images row and its blob survive (the FK runs
+    article_images.sha256 -> images, not the reverse), and fetch_log has no FK to
+    articles at all, so its row stays 'ok'. `babel refetch` then flips it to
+    'stale', the sweep re-collects it, and the taken-down article comes back.
+    Deletion is silently reversible by tooling this project already ships.
+
+    Idempotent: an already-hidden row keeps its original timestamp, so re-running
+    the command does not rewrite when the request arrived.
+    """
+    result = await conn.execute(
+        "UPDATE articles SET hidden_at = now() WHERE id = $1 AND hidden_at IS NULL",
+        article_id,
+    )
+    return int(result.split()[-1])
+
+
+async def withhold_image(conn: asyncpg.Connection, digest: bytes) -> int:
+    """Stop serving one blob. Returns how many articles cite it.
+
+    The count is the point. Content addressing means a blob is shared — flags,
+    avatars and recycled memes recur across thousands of articles — so
+    withholding is never a single-article act, and the operator has to see the
+    blast radius before deciding.
+    """
+    await conn.execute(
+        "UPDATE images SET withheld_at = now() WHERE sha256 = $1 AND withheld_at IS NULL",
+        digest,
+    )
+    return await conn.fetchval(
+        "SELECT count(DISTINCT article_id) FROM article_images WHERE sha256 = $1", digest
+    )

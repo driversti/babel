@@ -1,0 +1,16 @@
+# BuildKit does not read .gitignore, and pgdata/ and data/images live inside
+# the build context. Without this, `docker compose build` reads the running
+# Postgres data directory and the whole rescued-image tree — hundreds of GB at
+# the projected archive size — and transfers them to the daemon before a single
+# layer is evaluated. None of it reaches the image.
+pgdata/
+data/
+gluetun/
+.git/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.idea/
+.superpowers/
+__pycache__/
+docs/

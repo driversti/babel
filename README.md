@@ -80,10 +80,67 @@ redeployed without touching the other: stopping `images` simply lets the queue b
   10,000 IDs ask for confirmation (skip with `--yes`); the running service's backfill sweep phase
   picks the queued IDs up on its own, no restart required
 
+## Public archive
+
+A fifth compose service, `web` (command `babel serve`), serves the archive read-only over HTTP. It
+is a separate FastAPI process from the crawler, deliberately outside gluetun's network namespace: it
+needs *inbound* connections, which that namespace cannot accept, and its only outbound dependency is
+Postgres on the bridge — so the site stays up when the VPN tunnel is down. `babel serve` never
+applies migrations: `crawler` and `images` both do that at startup, and a third command written the
+same way would connect as a SELECT-only role and crash-loop under `restart: unless-stopped`.
+Applying the schema is an explicit operator step (below).
+
+### One-time setup
+
+1. Create a SELECT-only database role and put its DSN in `.env` as `WEB_DATABASE_URL` — `babel serve`
+   refuses to start if this is unset or equal to `DATABASE_URL`, because that fallback would run the
+   public site as the database owner, silently. The exact grants (including the two `ALTER ROLE`
+   settings that are the actual enforcement — see `.env.example`) are documented there.
+2. Set `WEB_BIND` to the host's LAN address and `WEB_PORT`, both in `.env`. `WEB_BIND` must never be
+   `0.0.0.0`: Docker's published-port rules install into the `DOCKER` chain and bypass the host
+   firewall, so binding to every interface defeats a host firewall that looks like it covers this
+   port. Point whatever sits in front of it (reverse proxy, tunnel) at `http://<WEB_BIND>:<WEB_PORT>`.
+
+### Deploying migration 005 (and any future browse migration)
+
+Migration 005 adds the browse indexes and the suppression tombstones. **Never let it run as a side
+effect of a bare `docker compose up -d`** — both `crawler` and `images` apply pending migrations at
+startup, so starting either one first runs this DDL against a live walk. Plain `CREATE INDEX` (`CREATE
+INDEX CONCURRENTLY` is unavailable through this project's transaction-wrapped migration runner) takes
+`ShareLock` for the entire build, which blocks concurrent writers — not readers — for as long as the
+build takes, not just while the lock is being acquired. Stop the writers first:
+
+```bash
+git pull
+docker compose stop crawler images
+docker compose run --rm crawler babel migrate
+docker compose build web
+docker compose up -d crawler images web
+```
+
+### Taking a page down
+
+`babel hide --article <id>` sets a tombstone (`articles.hidden_at`) rather than deleting the row.
+Measured on a fresh database: `DELETE FROM articles` cascades to `comments` and `article_images`, but
+the `images` row and its blob on disk survive (the foreign key runs `article_images.sha256 ->
+images(sha256)`, not the other way), and `fetch_log` has no foreign key to `articles` at all, so its
+row stays `ok`. `babel refetch` would then flip that row to `stale`, the sweep would re-collect the
+article, and the takedown would silently reverse itself. The tombstone is filtered out of every list
+and article query instead, and hiding twice is a no-op — it does not overwrite when the first request
+arrived.
+
+**Hiding an article does not withhold its images.** Images are content-addressed and stored once, so
+the same blob is very often cited by other articles too (flags, avatars, and recycled memes recur
+across thousands of pages) — suppressing one article can never imply the image should stop being
+served everywhere else it appears. `/img/{sha256}` stays reachable by digest until an operator
+separately runs `babel hide --image <sha256>`, which reports how many articles currently cite that
+blob so the blast radius is visible before deciding. **A takedown request is two steps, not one** —
+handling only the article and believing the job done leaves the image itself still public.
+
 ## Development
 
 ```bash
 uv run pytest             # full suite (needs Docker for testcontainers)
 uv run ruff check src tests
-docker compose build crawler images
+docker compose build crawler images web
 ```

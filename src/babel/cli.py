@@ -25,8 +25,10 @@ from babel.crawler.poller import newest_article_id, poll_once
 from babel.crawler.ratelimit import RateLimiter
 from babel.db import repo
 from babel.db.migrate import apply_migrations
+from babel.db.repo import hide_article, withhold_image
 from babel.notify import Throttled, build_notifier
 from babel.vpn import IpInfo, IpLeak, check_ip_leak
+from babel.web.blobs import parse_digest
 
 log = logging.getLogger("babel")
 MIGRATIONS = pathlib.Path(__file__).parent.parent.parent / "migrations"
@@ -162,17 +164,18 @@ def _bytes_getter(session: AsyncSession, timeout_sec: int):
             # reading before its natural end, and `completed` is the one flag
             # that turns it off — set only once the body has actually been
             # read in full, just before the return below. Getting this
-            # backwards once already cost a still-open finding (I9): aclose()
-            # alone never severs a curl_cffi stream, it only awaits the
-            # background fetch finishing on its own — response.quit_now.set()
-            # is the one thing that makes curl's write callback abort early,
-            # and a default of "do nothing unless told" meant every new exit
-            # path from this function — a redirect, an oversize abort, and
-            # (found the round after those two were fixed) a timeout
-            # cancelling this coroutine mid-read — silently inherited a full
-            # drain instead. A `finally` runs for a cancellation exactly as it
-            # does for any other exit, so defaulting to sever there closes
-            # all of those the same way, including ones not yet written.
+            # backwards once already cost a finding (I9, closed by commit
+            # e5461dc): aclose() alone never severs a curl_cffi stream, it
+            # only awaits the background fetch finishing on its own —
+            # response.quit_now.set() is the one thing that makes curl's
+            # write callback abort early, and a default of "do nothing unless
+            # told" meant every new exit path from this function — a
+            # redirect, an oversize abort, and (found the round after those
+            # two were fixed) a timeout cancelling this coroutine mid-read —
+            # silently inherited a full drain instead. A `finally` runs for a
+            # cancellation exactly as it does for any other exit, so
+            # defaulting to sever there closes all of those the same way,
+            # including ones not yet written.
             completed = False
             try:
                 if response.status_code in _REDIRECT_STATUS_CODES:
@@ -512,3 +515,56 @@ async def _refetch(selection: list[int]) -> None:
     finally:
         await conn.close()
     click.echo(f"queued {changed:,} of {len(selection):,} selected article(s) for re-collection")
+
+
+@main.command()
+def serve() -> None:
+    """Run the public read-only web archive."""
+    asyncio.run(_serve())
+
+
+async def _serve() -> None:
+    import uvicorn
+
+    from babel.web.app import create_app
+
+    settings = Settings()
+    # Deliberately does not migrate the schema here. Both long-running crawler
+    # commands do that at startup; this one connects as a SELECT-only role and
+    # would crash-loop under restart: unless-stopped. Applying the schema is the
+    # operator's step, documented in README.md.
+    app = create_app(settings)
+    config = uvicorn.Config(app, host="0.0.0.0", port=8080, log_level="info")  # noqa: S104
+    await uvicorn.Server(config).serve()
+
+
+@main.command()
+@click.option("--article", "article_id", type=int, default=None, help="Article ID to suppress.")
+@click.option("--image", "image_hex", default=None, help="Image sha256 (hex) to stop serving.")
+def hide(article_id: int | None, image_hex: str | None) -> None:
+    """Suppress an article or an image from the public site."""
+    if (article_id is None) == (image_hex is None):
+        raise click.UsageError("Pass exactly one of --article or --image.")
+    asyncio.run(_hide(article_id, image_hex))
+
+
+async def _hide(article_id: int | None, image_hex: str | None) -> None:
+    settings = Settings()
+    pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            if article_id is not None:
+                changed = await hide_article(conn, article_id)
+                click.echo(
+                    f"article {article_id} hidden"
+                    if changed
+                    else f"article {article_id} was already hidden or is not in the archive"
+                )
+                return
+            digest = parse_digest(image_hex or "")
+            if digest is None:
+                raise click.UsageError("--image must be 64 lowercase hex characters.")
+            citing = await withhold_image(conn, digest)
+            click.echo(f"image withheld; it was cited by {citing} article(s)")
+    finally:
+        await pool.close()

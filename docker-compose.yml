@@ -79,3 +79,31 @@ services:
       gluetun: {condition: service_healthy}
       db: {condition: service_healthy}
     restart: unless-stopped
+
+  web:
+    build: .
+    container_name: babel-web
+    command: ["babel", "serve"]
+    env_file: .env
+    volumes:
+      # Read-only: the site serves blobs, it never writes one.
+      - ${IMAGE_ROOT_HOST:-./data/images}:/data/images:ro
+    # Deliberately NOT network_mode: service:gluetun. That namespace cannot
+    # accept inbound connections, and this service has no reason to egress:
+    # its only outbound dependency is Postgres on the bridge. The site
+    # therefore stays up when the tunnel is down.
+    #
+    # WEB_BIND must be the host's LAN address, matching the Cloudflare tunnel
+    # ingress rule, and never 0.0.0.0 — Docker's published-port rules install
+    # into the DOCKER chain and bypass the host firewall.
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8080}:8080"
+    depends_on:
+      db: {condition: service_healthy}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

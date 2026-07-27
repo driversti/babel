@@ -145,6 +145,16 @@ def create_app(settings: Settings, pool: object | None = None) -> FastAPI:
         # this one runs at the outermost layer instead of being skipped —
         # without it, this exact case reaches Starlette's own fallback, which
         # is a bare "Internal Server Error" with none of the headers below.
+        # Worth knowing before anyone adds a debug flag: this handler does NOT
+        # protect against one. Starlette's ServerErrorMiddleware.__call__ checks
+        # `self.debug` before it ever looks at a registered Exception handler —
+        # `if self.debug: return debug_response(...); elif self.handler is
+        # None: ...; else: call self.handler`. Verified directly against this
+        # FastAPI version: FastAPI(debug=True) with this exact handler still
+        # registered returns Starlette's own traceback page, not this one's
+        # sentence. Turning on debug here would bypass this handler entirely
+        # and leak schema and file-path detail on the public route it exists
+        # to protect — it must stay off in production.
         log.exception("unhandled error serving %s", request.url.path)
         return render_error(
             request, 500, "Something went wrong",
