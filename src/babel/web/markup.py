@@ -8,7 +8,7 @@ both are properties of this file rather than of a library:
   2. Every text node goes through `markupsafe.escape`.
 
 There is therefore no code path by which an author's bytes reach the output
-unescaped. `render_body` returns `Markup`, so templates never say `|safe` --
+unescaped. `render_body` returns `Markup`, so templates never say `|safe` —
 which is what makes "no template contains |safe" a meaningful guard rather than
 a style rule.
 
@@ -174,7 +174,7 @@ def _emit(item: object) -> Markup:
             item.href, inner,
         )
     # `%` escapes its arguments, and escape() returns Markup unchanged because
-    # Markup carries __html__ -- so `inner` is not double-escaped.
+    # Markup carries __html__ — so `inner` is not double-escaped.
     return Markup("<%s>%s</%s>") % (item.tag, inner, item.tag)
 
 
