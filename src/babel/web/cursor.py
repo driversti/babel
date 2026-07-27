@@ -23,10 +23,29 @@ from babel.db.browse import Cursor
 # are not the ASCII decimal this module emits.
 _CURSOR_RE = re.compile(r"^([0-9]{1,19})-([0-9]{1,19})$")
 
+# Fixed reference instant for the cursor's integer microsecond arithmetic.
+# datetime subtraction and timedelta floor-division are exact — datetime and
+# timedelta store their fields as integers — so this is not "epoch as a
+# constant for readability", it is the thing that makes the round-trip exact.
+# Defined once so encode_cursor and decode_cursor cannot drift apart.
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
+_ONE_MICROSECOND = datetime.timedelta(microseconds=1)
+
 
 def encode_cursor(published_at: datetime.datetime, article_id: int) -> str:
-    """Microseconds since the epoch and the id, both unsigned decimal."""
-    micros = int(published_at.timestamp() * 1_000_000)
+    """Microseconds since the epoch and the id, both unsigned decimal.
+
+    Deliberately not `int(published_at.timestamp() * 1_000_000)`: timestamp()
+    is a float64, exact for microsecond resolution only while seconds-since-
+    epoch stays under 2**31 (2038-01-19 03:14:08 UTC). Past that, a chunk of
+    microsecond values lose the low bit of mantissa and decode one
+    microsecond off — permanently, on an archive meant to run indefinitely,
+    and landing a cursor on the wrong side of its own row is exactly the
+    repeated-or-skipped boundary keyset pagination exists to prevent.
+    Subtracting a fixed epoch and floor-dividing by one microsecond, by
+    contrast, is exact integer arithmetic at any date `datetime` can hold.
+    """
+    micros = (published_at - _EPOCH) // _ONE_MICROSECOND
     return f"{micros}-{article_id}"
 
 
@@ -44,8 +63,8 @@ def decode_cursor(raw: str | None) -> Cursor | None:
         return None
     micros, article_id = int(match.group(1)), int(match.group(2))
     try:
-        published_at = datetime.datetime.fromtimestamp(micros / 1_000_000, tz=datetime.UTC)
-    except (OverflowError, OSError, ValueError):
+        published_at = _EPOCH + datetime.timedelta(microseconds=micros)
+    except OverflowError:
         return None
     return Cursor(published_at=published_at, article_id=article_id)
 
