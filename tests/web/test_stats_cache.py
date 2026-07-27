@@ -1,6 +1,8 @@
 import asyncio
 import datetime
 
+import asyncpg
+
 from babel.config import Settings
 from babel.db import browse
 from babel.web import routes
@@ -83,3 +85,41 @@ async def test_the_waiters_get_the_value_the_winner_computed(pg, pool, image_roo
 
     assert [r.articles for r in results] == [11] * 5
     assert later.articles == 11
+
+
+async def test_concurrent_callers_share_one_failing_archive_stats_scan(pg, pool, image_root, monkeypatch):
+    """The lock must not turn a fast failure into a queue of sequential failures.
+
+    The success path is single-flighted by writing the cache only once the query
+    returns — which means a *raising* query never writes anything, so every
+    waiter that queued on the lock while the winner was failing wakes up, finds
+    an empty cache, and repeats the same doomed scan itself. Six concurrent
+    requests become six sequential scans instead of one, and each waiter holds
+    a pool connection for the whole re-run — the operator role's
+    `statement_timeout = '10s'` (.env.example) makes that a real event, not a
+    hypothetical one, on a table heading for 2.8M rows.
+
+    The fix has to cache the failure too, briefly, so a waiter that wakes up
+    after the winner's scan raised gets the cached error instead of a second
+    scan.
+    """
+    app = create_app(_settings(image_root), pool=pool)
+
+    calls = 0
+
+    async def failing_stats(conn):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.05)
+        raise asyncpg.QueryCanceledError("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(browse, "archive_stats", failing_stats)
+
+    async with app.router.lifespan_context(app):
+        results = await asyncio.gather(
+            *(routes._stats(app, pg) for _ in range(6)), return_exceptions=True
+        )
+
+    assert calls == 1, f"{calls} scans of a failing query instead of one"
+    assert len(results) == 6
+    assert all(isinstance(r, asyncpg.QueryCanceledError) for r in results)

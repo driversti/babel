@@ -22,6 +22,13 @@ from babel.web.cursor import (
 log = logging.getLogger(__name__)
 
 _STATS_TTL_SEC = 300
+# Far shorter than the success TTL, and deliberately so: this only has to outlive
+# the single burst of waiters already queued on stats_lock when the scan fails —
+# once they have all been served the cached error, nothing is gained by holding
+# a stale 503 for anywhere near five minutes, and a genuinely transient cause
+# (a statement_timeout hit under load, a momentary connection blip) should get a
+# fresh attempt on the next request rather than wait out the success window.
+_STATS_ERROR_TTL_SEC = 5
 
 # `articles.id` is `bigint` (migrations/001_initial.sql), so this is the largest
 # id the archive could ever hold — and the largest asyncpg will bind at all.
@@ -70,6 +77,14 @@ def _cached_stats(app) -> browse.ArchiveStats | None:
     return None
 
 
+def _cached_stats_error(app) -> BaseException | None:
+    """The cached failure if it is still inside its (short) TTL, else None."""
+    cached: tuple[float, BaseException] | None = getattr(app.state, "stats_error", None)
+    if cached is not None and time.monotonic() - cached[0] < _STATS_ERROR_TTL_SEC:
+        return cached[1]
+    return None
+
+
 async def _stats(app, conn) -> browse.ArchiveStats:
     """Archive-wide totals, on a five-minute clock, computed once at a time.
 
@@ -86,6 +101,16 @@ async def _stats(app, conn) -> browse.ArchiveStats:
     after acquiring, so they return the value the winner just computed instead
     of queueing up to repeat it. A request never waits on more than one scan.
 
+    That has to hold when the scan raises too, not only when it succeeds — a
+    success is cached by writing it after the query returns, and a raising
+    query never reaches that line, so without a separate failure cache every
+    waiter queued on the lock would wake to an empty cache and repeat the same
+    doomed scan itself. Measured: 6 concurrent requests against a failing
+    scan became 6 sequential scans and 1.82s wall time instead of 1 scan,
+    each waiter holding a pool connection for its whole re-run. The error is
+    therefore cached too, under `_STATS_ERROR_TTL_SEC` rather than the success
+    TTL — see that constant for why the two durations differ.
+
     The cache lives on app.state, not in a module global. A module global
     outlives the app that filled it, and the tests build one app per test
     against a fresh database — the second test would read the first one's
@@ -95,11 +120,21 @@ async def _stats(app, conn) -> browse.ArchiveStats:
     fresh = _cached_stats(app)
     if fresh is not None:
         return fresh
+    stale_error = _cached_stats_error(app)
+    if stale_error is not None:
+        raise stale_error
     async with app.state.stats_lock:
         fresh = _cached_stats(app)
         if fresh is not None:
             return fresh
-        stats = await browse.archive_stats(conn)
+        stale_error = _cached_stats_error(app)
+        if stale_error is not None:
+            raise stale_error
+        try:
+            stats = await browse.archive_stats(conn)
+        except Exception as exc:
+            app.state.stats_error = (time.monotonic(), exc)
+            raise
         app.state.stats_cache = (time.monotonic(), stats)
         return stats
 
