@@ -149,25 +149,25 @@ docker compose build web
 docker compose up -d crawler images web
 ```
 
-**A one-time audit is worth running once `web` and this branch's image-capture fixes are both
-deployed.** Everything already sitting in `article_images`/`images` was captured before the
-scheme/address guard (`a4ba9ca`) and before the abort that actually severs an over-budget download
-(`e5461dc`) existed, so neither protects rows already on disk — an internal address answering with
-an `image/*` type could have been stored and would still be `ok` today. `source_url` is retained for
-every row, which makes the check one query:
+**Two things gate the site being reachable, and both come before the hostname exists, not after.**
+The runbook for each is in README.md under "One-time setup"; they are named here because CLAUDE.md
+used to sequence the first one *after* deployment, which is the wrong way round.
 
-```sql
-SELECT article_id, position, source_url, sha256
-FROM article_images
-WHERE status = 'ok'
-  AND (source_url !~* '^https?://'
-       OR source_url ~* '(://|@)(localhost|127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|169\.254\.|0\.0\.0\.0)');
-```
+1. **Audit the blobs captured before the address guard.** Everything already sitting in
+   `article_images`/`images` predates the scheme/address guard (`a4ba9ca`) and the abort that
+   actually severs an over-budget download (`e5461dc`), so neither protects rows already on disk —
+   an internal address answering with an `image/*` type could have been stored and would still be
+   `ok` today. Publishing `/img/{sha256}` is precisely what turns a blind fetch into a readable one,
+   so the audit belongs before that happens. `source_url` is retained for every row, which makes the
+   check one query; it is in README, and it is a heuristic over stored text, not a re-resolution.
+2. **Re-collect the article bodies.** The parser only started emitting `"\n"` at block boundaries on
+   this branch, and that changes new fetches only — every article collected earlier is one unbroken
+   block of text, and launching publishes it that way. It is a deliberate stop/sweep/restart pass,
+   not a queued job, because of M1 above: a running service does not reach its sweep phase until the
+   walk bottoms out. Three commands, in README.
 
-This is a heuristic over stored text, not a re-resolution of every hostname at audit time — a host
-that only pointed at a private address when it was first crawled will not match. Anything the query
-does return is worth inspecting by hand and withholding with `babel hide --image` if it turns out to
-be internal rather than a real image host.
+Neither is optional and neither is automatic; the site should not be pointed at a hostname until both
+have been done.
 
 One more thing worth knowing before anyone adds a debug flag to `babel serve`: the bare-`Exception`
 handler `create_app` always registers (`web/app.py`) does **not** protect against one. Verified
@@ -225,7 +225,10 @@ measurement was cheap.
 - `docker compose run --rm crawler babel probe --newest <id>` — check the exit node is not challenged
 - `docker compose run --rm crawler babel refetch --ids 123,456` or
   `babel refetch --from 100 --to 200` — queue already-collected articles for re-collection after a
-  parser fix or a markup change; the running service's sweep phase picks them up on its own
+  parser fix or a markup change. The sweep phase that picks them up is only reached once the walk
+  bottoms out (M1 above), so during a walk this queues work for ~32 days' time. To act on it now,
+  stop `crawler` and run a one-shot `babel run --no-poll` until the queue drains — README, "Re-collect
+  the bodies before launch", has the exact commands
 - `docker compose run --rm crawler babel requeue-images --host i.imgur.com` — put one image host's
   `dead`/`error` rows back to `pending` with attempts reset, after fixing whatever caused that host
   to be misjudged. Pass a host you don't recognise to get a ranked list of hosts with stuck images.
@@ -236,10 +239,18 @@ measurement was cheap.
   image URLs and never fetches the bytes itself
 - `babel serve` — run the public read-only web archive; the `web` compose service. Refuses to start
   if `WEB_DATABASE_URL` is unset or equal to `DATABASE_URL`, and never applies migrations itself —
-  see "Operating the live run" for why and for the deploy order
+  see "Operating the live run" for why and for the deploy order. It does *check* them: one throwaway
+  connection reads `schema_migrations` before anything is served and refuses, naming
+  `005_browse.sql`, if the browse migration is absent. Without that check a skipped migrate step
+  answers 503 on every page — `UndefinedColumnError` is a `PostgresError`, so it lands in the
+  database-down handler — while `/healthz` and the compose healthcheck stay green, which points the
+  operator at Postgres instead of at the deploy
 - `docker compose run --rm crawler babel hide --article <id>` or `babel hide --image <sha256>` —
   suppress an article, or stop serving one blob by digest. These are two separate commands on
   purpose: hiding an article does not withhold its images, because a blob is content-addressed and
   commonly shared across many articles. `--image` reports how many articles currently cite the
   digest so the blast radius is visible before deciding — a takedown request is not fully handled
-  until both commands have been run for anything that needs to disappear entirely
+  until both commands have been run for anything that needs to disappear entirely. Nor is it
+  instantaneous: `/img/{sha256}` is served `max-age=86400`, so a cache that already holds the blob
+  keeps serving it for up to a day (pages are `max-age=300`). Purge the CDN too — README, "Taking a
+  page down"

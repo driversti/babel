@@ -77,8 +77,11 @@ redeployed without touching the other: stopping `images` simply lets the queue b
   articles for re-collection, e.g. after fixing a parser bug or when the site's markup has changed.
   Only `ok` and `error` rows are touched — a `missing` row is a fact about the article, not about
   our copy of it, and an ID never fetched will be reached by the walk anyway. Selections over
-  10,000 IDs ask for confirmation (skip with `--yes`); the running service's backfill sweep phase
-  picks the queued IDs up on its own, no restart required
+  10,000 IDs ask for confirmation (skip with `--yes`). The queued IDs are picked up by the backfill's
+  sweep phase, which `run_backfill` only reaches once the walk bottoms out — finding M1 in CLAUDE.md
+  — so during a walk that is ~32 days away. Nothing is lost by waiting (waiting burns no attempts),
+  but a re-collection you need now has to be driven by hand: see "Re-collect the bodies before
+  launch" below for the three-command form
 
 ## Public archive
 
@@ -88,7 +91,15 @@ needs *inbound* connections, which that namespace cannot accept, and its only ou
 Postgres on the bridge — so the site stays up when the VPN tunnel is down. `babel serve` never
 applies migrations: `crawler` and `images` both do that at startup, and a third command written the
 same way would connect as a SELECT-only role and crash-loop under `restart: unless-stopped`.
-Applying the schema is an explicit operator step (below).
+Applying the schema is an explicit operator step (below). It does check that the step was taken —
+one throwaway connection reads `schema_migrations` before anything is served, and the process
+refuses to start, naming `005_browse.sql`, if the browse migration is missing. A skipped migrate
+step otherwise answers 503 on every page while `/healthz` and the compose healthcheck stay green.
+
+`web` is also the one service that does not get `env_file: .env`. It is handed `WEB_DATABASE_URL`,
+`IMAGE_ROOT`, `CONTACT` and `WEB_POOL_SIZE` and nothing else, because it is the only process here
+that accepts connections from the internet and it reads none of the rest — see the comment on the
+service in `docker-compose.yml` for what that costs and what carries the weight instead.
 
 ### One-time setup
 
@@ -99,7 +110,53 @@ Applying the schema is an explicit operator step (below).
 2. Set `WEB_BIND` to the host's LAN address and `WEB_PORT`, both in `.env`. `WEB_BIND` must never be
    `0.0.0.0`: Docker's published-port rules install into the `DOCKER` chain and bypass the host
    firewall, so binding to every interface defeats a host firewall that looks like it covers this
-   port. Point whatever sits in front of it (reverse proxy, tunnel) at `http://<WEB_BIND>:<WEB_PORT>`.
+   port.
+3. **Re-collect the article bodies** so they have paragraph breaks, and **audit the blobs captured
+   before the address guard existed** — both below, both before the site is reachable, in either
+   order.
+4. Apply the schema and start the service — "Deploying migration 005" below, which is a
+   stop/migrate/start and never a bare `up -d`.
+5. Only then point whatever sits in front of it (reverse proxy, tunnel) at
+   `http://<WEB_BIND>:<WEB_PORT>`.
+
+### Re-collect the bodies before launch
+
+The parser only started emitting `"\n"` at `<br>`, `</p>`, `</div>` and `</li>` on this branch, and
+that changes new fetches only. Every article collected before it is one unbroken block of text in
+the database, and publishing the site publishes that. Re-collection is a deliberate three-step pass,
+not a queued job:
+
+```bash
+docker compose run --rm crawler babel refetch --from 1 --to 2797025 --yes
+docker compose stop crawler
+docker compose run --rm crawler babel run --no-poll   # runs the sweep; stop it when the queue drains
+docker compose up -d crawler
+```
+
+The middle two steps are not optional. `run_backfill` only reaches its sweep phase once the walk
+bottoms out (finding M1 in CLAUDE.md), which is ~32 days away, so the `stale` rows a running service
+is holding are not picked up in the meantime. Nothing is lost by waiting — waiting burns no attempts
+— but nothing happens either.
+
+### Audit the pre-guard blobs before launch
+
+Everything already in `article_images`/`images` was captured before `capture_image` had a scheme and
+address filter, so nothing on disk was checked against it. Publishing `/img/{sha256}` is what turns
+a blind fetch into a readable one, which is why this belongs before the hostname exists and not
+after:
+
+```sql
+SELECT article_id, position, source_url, sha256
+FROM article_images
+WHERE status = 'ok'
+  AND (source_url !~* '^https?://'
+       OR source_url ~* '(://|@)(localhost|127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|169\.254\.|0\.0\.0\.0)');
+```
+
+This is a heuristic over stored text, not a re-resolution of every hostname: a host that pointed at a
+private address only when it was crawled will not match. Inspect anything it returns by hand and
+`babel hide --image <sha256>` whatever turns out to be an internal endpoint rather than a real image
+host.
 
 ### Deploying migration 005 (and any future browse migration)
 
@@ -128,6 +185,16 @@ row stays `ok`. `babel refetch` would then flip that row to `stale`, the sweep w
 article, and the takedown would silently reverse itself. The tombstone is filtered out of every list
 and article query instead, and hiding twice is a no-op — it does not overwrite when the first request
 arrived.
+
+**Neither command reaches a cache that already holds the page.** `/img/{sha256}` is served with
+`Cache-Control: public, max-age=86400, must-revalidate` and no `ETag`; `must-revalidate` governs what
+a cache may do once the entry is *stale*, not before, so a cache holding that blob keeps serving it
+for up to 24 hours after `babel hide --image`. Article and list pages carry `max-age=300`, so those
+close within five minutes. The trade is deliberate — content-addressed blobs would justify
+`immutable`, and this is already the shortened form — but it means a takedown is not complete when
+the commands return: purge the blob's URL from whatever CDN or tunnel cache sits in front of the site
+(for Cloudflare, a single-file purge of `https://<host>/img/<sha256>`), and say so if you are
+answering someone who is counting hours.
 
 **Hiding an article does not withhold its images.** Images are content-addressed and stored once, so
 the same blob is very often cited by other articles too (flags, avatars, and recycled memes recur
