@@ -68,6 +68,39 @@ async def test_prev_page_is_symmetric(pool):
     assert [r.id for r in back.rows] == [r.id for r in first.rows]
 
 
+async def test_prev_page_is_symmetric_oldest_first(pool):
+    """The fourth (order, going) combination — the one with no coverage.
+
+    `list_articles` flips the SQL direction twice, once for `order` and once for
+    `going`, so `order="old"` with `going="prev"` is the only combination where
+    both flips apply and the query runs ascending-reversed. The web layer's
+    paging defect lived in exactly this branch, and nothing here exercised it.
+    """
+    async with pool.acquire() as conn:
+        await _seed(conn, [(800 + i, _ts(1 + i), "Poland", "ann") for i in range(6)])
+
+        first = await list_articles(
+            conn, ListFilters(), order="old", cursor=None, going="next", limit=2
+        )
+        second_cursor = Cursor(first.rows[-1].published_at, first.rows[-1].id)
+        second = await list_articles(
+            conn, ListFilters(), order="old", cursor=second_cursor, going="next", limit=2
+        )
+        back_cursor = Cursor(second.rows[0].published_at, second.rows[0].id)
+        back = await list_articles(
+            conn, ListFilters(), order="old", cursor=back_cursor, going="prev", limit=2
+        )
+
+    assert [r.id for r in first.rows] == [800, 801]
+    assert [r.id for r in second.rows] == [802, 803]
+    # Same rows as page one, and still in the reader's chosen order — not the
+    # order the backward query fetched them in.
+    assert [r.id for r in back.rows] == [800, 801]
+    # Two rows sit further back than 802 (800 and 801) and the page took both,
+    # so nothing remains beyond them.
+    assert back.has_more is False
+
+
 async def test_order_old_reverses(pool):
     async with pool.acquire() as conn:
         await _seed(conn, [(300 + i, _ts(1 + i), "Poland", "ann") for i in range(4)])

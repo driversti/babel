@@ -171,14 +171,37 @@ def register_routes(app: FastAPI) -> None:
             if filters.author and not page.rows:
                 suggestions = await browse.suggest_authors(conn, filters.author)
 
+        # `page.has_more` always describes the direction the page was *fetched*
+        # in, so which of the two links it gates flips with `going`, and the
+        # other link's condition is not its mirror.
+        #
+        # Forward: has_more means "more rows ahead", so it gates the forward
+        # link. The backward link needs no such evidence — a cursor was
+        # supplied, so the reader came from a page that is still there.
+        #
+        # Backward: has_more now means "more rows further back", so it gates
+        # the *backward* link, and the forward link is unconditional, because
+        # arriving on a backward page at all means there is a page ahead to
+        # return to.
+        #
+        # Gating both on has_more was a guaranteed dead end rather than an edge
+        # case: the top page always holds exactly PAGE_SIZE rows above page 2's
+        # first row, so a backward fetch to it finds nothing beyond them and
+        # reports has_more False every time. Page 1 lost its forward link, grew
+        # a backward link onto an empty page, and — because list.html reads
+        # `not next_cursor` — told the reader it held everything, above 51 more
+        # articles.
+        forward = going == "next"
+        offer_next = page.has_more if forward else True
+        offer_prev = cursor is not None if forward else page.has_more
         next_cursor = (
             encode_cursor(page.rows[-1].published_at, page.rows[-1].id)
-            if page.rows and page.has_more
+            if page.rows and offer_next
             else None
         )
         prev_cursor = (
             encode_cursor(page.rows[0].published_at, page.rows[0].id)
-            if page.rows and (cursor is not None)
+            if page.rows and offer_prev
             else None
         )
 

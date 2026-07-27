@@ -200,6 +200,139 @@ async def test_date_jump_at_the_end_of_the_calendar_does_not_500(client, pool):
         assert "Traceback" not in response.text
 
 
+_PAGER_RE = re.compile(r'<nav class="pager">(.*?)</nav>', re.S)
+_LINK_RE = re.compile(r'href="(/\?(after|before)=[^"]*)"')
+_TITLE_RE = re.compile(r'<a class="title" href="/article/(\d+)">')
+
+END_MESSAGE = "That is everything collected so far."
+
+
+def _pager(body: str) -> dict[str, str]:
+    """The pager's two links by direction, `after` (forward) and `before` (back).
+
+    Read out of the rendered page rather than asserted on the handler's locals,
+    because the defect this guards was invisible at the row level: the pages
+    held exactly the right rows, and only the links between them were wrong.
+    """
+    nav = _PAGER_RE.search(body)
+    assert nav is not None, "the page has no pager at all"
+    return {m[2]: m[1].replace("&amp;", "&") for m in _LINK_RE.finditer(nav[1])}
+
+
+def _ids(body: str) -> list[str]:
+    return _TITLE_RE.findall(body)
+
+
+async def _seed_three_pages(pool, base_id, tag):
+    """101 rows under their own country tag: two full pages of 50, then one.
+
+    101 rather than 51 so the walk can reach a genuine end of list and the
+    "everything collected" message can be checked where it is true as well as
+    where it is not. The tag is what every test here filters on, so each one
+    pages through only its own rows whatever else the database holds.
+    """
+    await _seed(pool, [
+        (base_id + i, f"P{i:03d}", "ann", tag,
+         datetime.datetime(2026, 10, 1, tzinfo=UTC) + datetime.timedelta(seconds=i))
+        for i in range(101)
+    ])
+
+
+async def test_paging_back_keeps_the_way_forward_newest_first(client, pool):
+    """Forward one page, back one page — the way forward must still be there.
+
+    `page.has_more` describes the direction the query was *fetched* in. Gating
+    the forward link on it is right going forward and wrong coming back, where
+    it means "more rows further back". The top page always holds exactly
+    PAGE_SIZE rows above page 2's first row, so on the way back has_more is
+    always False there: every backward navigation lost the "older →" link,
+    gained a "← newer" link onto an empty page, and printed the end-of-list
+    message above 51 further articles.
+    """
+    await _seed_three_pages(pool, 700, "PageNew")
+
+    first = (await client.get("/", params={"country": "PageNew"})).text
+    links = _pager(first)
+    assert "after" in links
+    assert "before" not in links, "the top page has nothing newer than itself"
+    assert END_MESSAGE not in first
+
+    second = (await client.get(links["after"])).text
+    assert _ids(second) != _ids(first)
+    second_links = _pager(second)
+    assert "after" in second_links
+    assert "before" in second_links
+
+    back = (await client.get(second_links["before"])).text
+    assert _ids(back) == _ids(first), "paging back must land on the rows it came from"
+    back_links = _pager(back)
+    assert "after" in back_links, "paging back must not destroy the forward link"
+    assert "before" not in back_links, "there is still nothing newer than the top page"
+    assert END_MESSAGE not in back
+
+    # And the restored link is not merely present — it goes where it says.
+    forward_again = (await client.get(back_links["after"])).text
+    assert _ids(forward_again) == _ids(second)
+
+
+async def test_paging_back_keeps_the_way_forward_oldest_first(client, pool):
+    """The same walk under `order=old`, the direction combination with no test."""
+    await _seed_three_pages(pool, 900, "PageOld")
+
+    first = (await client.get("/", params={"country": "PageOld", "order": "old"})).text
+    links = _pager(first)
+    assert "after" in links
+    assert "before" not in links
+    assert END_MESSAGE not in first
+
+    second = (await client.get(links["after"])).text
+    assert _ids(second) != _ids(first)
+    back = (await client.get(_pager(second)["before"])).text
+    assert _ids(back) == _ids(first)
+    back_links = _pager(back)
+    assert "after" in back_links, "paging back must not destroy the forward link"
+    assert "before" not in back_links
+    assert END_MESSAGE not in back
+
+    forward_again = (await client.get(back_links["after"])).text
+    assert _ids(forward_again) == _ids(second)
+
+
+async def test_the_end_of_the_list_is_claimed_only_at_the_end(client, pool):
+    """Walk to the real last page, then back off it.
+
+    The end-of-list message is gated on the forward link being absent, so it
+    inherits whatever that gate gets wrong. Three pages of 101 rows: it belongs
+    on the third and nowhere else, in either sort order.
+    """
+    for order, base_id, tag in (("new", 1100, "EndNew"), ("old", 1300, "EndOld")):
+        await _seed_three_pages(pool, base_id, tag)
+        params = {"country": tag, "order": order}
+
+        pages = [(await client.get("/", params=params)).text]
+        while "after" in _pager(pages[-1]):
+            pages.append((await client.get(_pager(pages[-1])["after"])).text)
+
+        assert len(pages) == 3, f"{order}: expected 101 rows to page as 50/50/1"
+        assert [len(_ids(p)) for p in pages] == [50, 50, 1]
+        assert [END_MESSAGE in p for p in pages] == [False, False, True]
+
+        # Now walk all the way back. No page reached by a `before=` link is the
+        # end of the archive — the reader is standing on the page that follows
+        # it — and every one of them must offer the way forward again.
+        walked_back = [pages[-1]]
+        while "before" in _pager(walked_back[-1]):
+            walked_back.append((await client.get(_pager(walked_back[-1])["before"])).text)
+        for step, page in enumerate(walked_back[1:], start=1):
+            assert END_MESSAGE not in page, f"{order}: step {step} back is not the end"
+            assert "after" in _pager(page), f"{order}: step {step} back lost the way forward"
+
+        # Every row seen once on the way down, once on the way back.
+        assert sorted(i for p in pages for i in _ids(p)) == sorted(
+            i for p in walked_back for i in _ids(p)
+        )
+
+
 async def test_date_jump_at_the_start_of_the_calendar_does_not_500(client, pool):
     """The other end of the representable range.
 
