@@ -324,9 +324,27 @@ async def suggest_authors(
 async def archive_stats(conn: asyncpg.Connection) -> ArchiveStats:
     """What the archive holds and how far collection has reached.
 
-    The span is two InitPlan limits over articles_list_idx — 8 buffers, 0.105ms
-    at 2.8M rows — so it is not the expensive part. The count is; the caller
-    caches this whole result.
+    The count is the expensive part and nothing here can make it cheap: no index
+    answers `count(*)`. Measured against postgres:17, 300 000 seeded rows
+    (29 MB heap), ANALYZEd, warm cache — the whole statement is 3 714 buffers /
+    17.5 ms, of which 3 704 are the count alone, a Parallel Seq Scan on
+    `articles` with `Filter: (hidden_at IS NULL)` and two workers launched. It
+    reads the whole table, so its cost tracks the heap: these seeded rows carry
+    a four-character body and the real ones average roughly 3.4 KB (SPEC.md:
+    ~9.6 GB of text across ~2.8M articles), so the real archive's scan is larger
+    than the figure above by that ratio.
+
+    The span is not the expensive part: 8 buffers, 0.034 ms, two InitPlan Limits
+    over articles_list_idx. This docstring used to say "8 buffers, 0.105 ms" and
+    call them Index Only Scans — that was measured against the same statement
+    without `hidden_at IS NULL`, which is not the statement this function sends.
+    Measured side by side in one session: with the predicate they are Index Scan
+    + `Filter: (hidden_at IS NULL)`, without it Index Only Scan with
+    `Heap Fetches: 1`, and 8 buffers either way. The conclusion survived; the
+    sentence did not.
+
+    The caller caches this whole result and single-flights the refresh — see
+    `routes._stats` for why the cache alone was not enough.
     """
     row = await conn.fetchrow(
         """SELECT (SELECT count(*) FROM articles WHERE hidden_at IS NULL)      AS articles,

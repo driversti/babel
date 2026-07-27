@@ -62,12 +62,29 @@ def _missing_detail(status: str | None, frontier: int | None) -> str:
     return f"This article is not collected yet.{reached}"
 
 
-async def _stats(app, conn) -> browse.ArchiveStats:
-    """Archive-wide totals, on a five-minute clock.
+def _cached_stats(app) -> browse.ArchiveStats | None:
+    """The cached totals if they are still inside the TTL, else None."""
+    cached: tuple[float, browse.ArchiveStats] | None = getattr(app.state, "stats_cache", None)
+    if cached is not None and time.monotonic() - cached[0] < _STATS_TTL_SEC:
+        return cached[1]
+    return None
 
-    The span is two index-only limits and costs nothing; the count is a heap
-    scan at 2.8M rows, which is why this is cached rather than computed per
-    request.
+
+async def _stats(app, conn) -> browse.ArchiveStats:
+    """Archive-wide totals, on a five-minute clock, computed once at a time.
+
+    The count is the expensive part and there is no index that answers it:
+    measured against postgres:17 with 300 000 seeded rows, warm cache, the
+    statement is 3 714 buffers / 17.5 ms and 3 704 of those buffers are a
+    Parallel Seq Scan on `articles` with `Filter: (hidden_at IS NULL)`, against
+    the table the crawler writes to continuously. Hence the cache.
+
+    Hence also the lock. The cache is written only after the query returns, so
+    without it every request that arrives while the entry is stale starts its
+    own scan — up to `web_pool_size` of them, each with its own parallel
+    workers, from one burst of ordinary traffic. The waiters re-check the cache
+    after acquiring, so they return the value the winner just computed instead
+    of queueing up to repeat it. A request never waits on more than one scan.
 
     The cache lives on app.state, not in a module global. A module global
     outlives the app that filled it, and the tests build one app per test
@@ -75,13 +92,16 @@ async def _stats(app, conn) -> browse.ArchiveStats:
     numbers. It is also simply the truthful scope: the cache belongs to a
     running service, not to an imported module.
     """
-    cached: tuple[float, browse.ArchiveStats] | None = getattr(app.state, "stats_cache", None)
-    now = time.monotonic()
-    if cached is not None and now - cached[0] < _STATS_TTL_SEC:
-        return cached[1]
-    stats = await browse.archive_stats(conn)
-    app.state.stats_cache = (now, stats)
-    return stats
+    fresh = _cached_stats(app)
+    if fresh is not None:
+        return fresh
+    async with app.state.stats_lock:
+        fresh = _cached_stats(app)
+        if fresh is not None:
+            return fresh
+        stats = await browse.archive_stats(conn)
+        app.state.stats_cache = (time.monotonic(), stats)
+        return stats
 
 
 def register_routes(app: FastAPI) -> None:

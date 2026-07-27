@@ -5,6 +5,7 @@ which that namespace cannot accept, and its only outbound dependency is
 Postgres on the bridge. The site therefore stays up when the tunnel is down.
 """
 
+import asyncio
 import contextlib
 import logging
 import pathlib
@@ -116,6 +117,10 @@ async def open_pool(settings: Settings) -> asyncpg.Pool:
 def create_app(settings: Settings, pool: object | None = None) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Built here rather than in create_app because a lock belongs to the
+        # loop the app actually runs on, and this is the first place that loop
+        # is running. It guards the archive_stats refresh; see routes._stats.
+        app.state.stats_lock = asyncio.Lock()
         # An injected pool belongs to the caller: used as-is, never closed here.
         # That is the seam the tests drive the app through, and it leaves the
         # production path — pool omitted, open_pool runs — exactly as strict.
