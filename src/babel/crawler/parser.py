@@ -27,6 +27,7 @@ stays None — that is a real, expected outcome, not a parse failure.
 """
 
 import datetime
+import logging
 import re
 import zoneinfo
 
@@ -47,6 +48,28 @@ _BR_RE = re.compile(r"""<br\b(?:[^>"']|"[^"]*"|'[^']*')*>""", re.IGNORECASE)
 _BLOCK_CLOSE_RE = re.compile(
     r"</(?:p|div|li|ul|ol|h[1-6]|tr|table|blockquote|pre)\s*>", re.IGNORECASE
 )
+
+log = logging.getLogger(__name__)
+
+# body_raw is whatever a third-party server sent, and it is now stored. Bodies
+# average 3.4 KB (SPEC.md); one pathological article must not be able to bloat
+# the table. Truncated markup is harmless — the render-time parse is lenient.
+MAX_BODY_RAW_CHARS = 1_000_000
+
+
+def _capture_raw(node: HTMLNode | None) -> str | None:
+    """The node's outer HTML, bounded.
+
+    Outer rather than inner: the renderer unwraps the `div`/`p` wrapper anyway,
+    so there is no string surgery to get wrong.
+    """
+    raw = node.html if node is not None else None
+    if raw is None:
+        return None
+    if len(raw) > MAX_BODY_RAW_CHARS:
+        log.warning("body markup truncated at %d chars", MAX_BODY_RAW_CHARS)
+        return raw[:MAX_BODY_RAW_CHARS]
+    return raw
 
 
 def eday_to_date(eday: int) -> datetime.date:
@@ -84,6 +107,7 @@ def parse_article(html: str, article_id: int) -> Article | None:
         id=article_id,
         title=title,
         body=_body_text(body_node),
+        body_raw=_capture_raw(body_node),
         author_id=author_id,
         author_name=author_name,
         country=country,
@@ -236,6 +260,10 @@ def parse_comments(html: str) -> tuple[Comment, ...]:
         body = body_node.text(separator=" ", strip=True).strip() if body_node else ""
         if not body or body == "[removed]":
             body = None
+        # A removed comment keeps its slot and nothing else. Capturing the
+        # "[removed]" markup would give the renderer a body to render for a
+        # comment whose whole point is that there is no body.
+        body_raw = _capture_raw(body_node) if body is not None else None
 
         out.append(
             Comment(
@@ -246,6 +274,7 @@ def parse_comments(html: str) -> tuple[Comment, ...]:
                 author_name=author_name,
                 posted_at=posted_at,
                 body=body,
+                body_raw=body_raw,
             )
         )
     return tuple(out)

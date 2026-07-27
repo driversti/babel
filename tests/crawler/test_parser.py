@@ -4,7 +4,7 @@ import pathlib
 import pytest
 from selectolax.parser import HTMLParser
 
-from babel.crawler.parser import _body_text, eday_to_date, parse_article
+from babel.crawler.parser import MAX_BODY_RAW_CHARS, _body_text, eday_to_date, parse_article, parse_comments
 
 FIXTURES = pathlib.Path(__file__).parent.parent / "fixtures"
 
@@ -241,3 +241,50 @@ def test_author_name_falls_back_to_the_title_byline_when_meta_author_is_missing(
     article = parse_article(html, 1000)
     assert article is not None
     assert article.author_name == "Ghostwriter"
+
+
+def test_body_raw_keeps_the_markup_the_game_served():
+    article = parse_article(load("article_with_images.html"), 2797005)
+    assert "<b>1000 Q7</b>" in article.body_raw
+    assert "<u>30 ve" in article.body_raw
+    assert "<br>" in article.body_raw
+    assert 'src="https://resmim.net/cdn/2026/07/25/ECBQFR.png"' in article.body_raw
+
+
+def test_body_raw_is_the_outer_node_so_no_string_surgery_is_needed():
+    article = parse_article(load("article_with_images.html"), 2797005)
+    assert article.body_raw.startswith('<div class="postBody"')
+
+
+def test_body_text_is_still_stripped_when_body_raw_is_captured():
+    article = parse_article(load("article_with_images.html"), 2797005)
+    assert "<" not in article.body
+    assert "1000 Q7" in article.body
+
+
+def test_body_raw_is_truncated_at_the_ceiling(caplog):
+    filler = "x" * (MAX_BODY_RAW_CHARS + 500)
+    html = load("article_with_images.html").replace(
+        '<div class="postBody">', f'<div class="postBody">{filler}', 1
+    )
+    article = parse_article(html, 2797005)
+    assert len(article.body_raw) == MAX_BODY_RAW_CHARS
+    assert "truncated" in caplog.text
+
+
+def test_comment_body_raw_keeps_the_link_markup():
+    comments = parse_comments(load("article_with_images.html"))
+    first = comments[0]
+    assert "<br>" in first.body_raw
+    assert 'href="https://www.erepublik.com/tr/article/2797005"' in first.body_raw
+
+
+def test_a_removed_comment_has_no_body_raw():
+    html = """
+    <div id="comment1" class="commentWrapper"><div><div style="padding-left:0px;">
+      <div class="details"><span>Day 6,819, 21:34</span><p>[removed]</p></div>
+    </div></div></div>
+    """
+    comment = parse_comments(html)[0]
+    assert comment.body is None
+    assert comment.body_raw is None
