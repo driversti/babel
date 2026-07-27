@@ -1,12 +1,16 @@
 """Route handlers. No SQL here — everything comes from babel.db.browse."""
 
 import datetime
+import logging
+import pathlib
 import time
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
+from babel.crawler.images import image_path
 from babel.db import browse
+from babel.web.blobs import HEAD_BYTES, parse_digest, serving_type
 from babel.web.cursor import (
     decode_cursor,
     encode_cursor,
@@ -14,6 +18,8 @@ from babel.web.cursor import (
     parse_game_date,
     to_game_time,
 )
+
+log = logging.getLogger(__name__)
 
 _STATS_TTL_SEC = 300
 
@@ -219,3 +225,35 @@ def register_routes(app: FastAPI) -> None:
             },
             headers={"Cache-Control": "public, max-age=300"},
         )
+
+    @app.get("/img/{hex_digest}")
+    async def image(hex_digest: str):
+        digest = parse_digest(hex_digest)
+        if digest is None:
+            raise HTTPException(status_code=404)
+
+        async with app.state.pool.acquire() as conn:
+            blob = await browse.get_blob(conn, digest)
+        if blob is None or blob.withheld_at is not None:
+            raise HTTPException(status_code=404)
+
+        path = image_path(pathlib.Path(app.state.settings.image_root), digest)
+        try:
+            data = path.read_bytes()
+        except OSError:
+            # The row says we have it and the disk says otherwise — IMAGE_ROOT
+            # moved, or the volume is not mounted. Name the blob in the log; the
+            # reader gets a missing image, not a 500.
+            log.warning("blob %s recorded but not readable at %s", hex_digest, path)
+            raise HTTPException(status_code=404) from None
+
+        content_type, inline = serving_type(data[:HEAD_BYTES])
+        headers = {
+            # Not immutable: content addressing would justify it, but this is
+            # other people's content and withholding has to be able to reach it.
+            "Cache-Control": "public, max-age=86400, must-revalidate",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+        }
+        if not inline:
+            headers["Content-Disposition"] = f'attachment; filename="{hex_digest}"'
+        return Response(content=data, media_type=content_type, headers=headers)
