@@ -192,12 +192,35 @@ async def test_capture_never_fetches_a_private_address(tmp_path):
 
 
 async def test_capture_marks_dns_failure_retryable(tmp_path):
+    """A name that will not resolve is 'error', and nothing is dialled.
+
+    Both halves have to be asserted separately, and the getter cannot be the
+    one asserting. This test used to raise `AssertionError("must not be
+    called")` from the getter — which `capture_image`'s own
+    `except Exception` turns into `ImageOutcome(status="error")`, the exact
+    outcome asserted next. The test therefore passed whether the guard ran or
+    was deleted outright, on the path the address guard exists to protect. A
+    flag the getter sets is outside that except, so it survives to be checked.
+
+    The resolver is stubbed rather than pointed at a `.invalid` hostname, which
+    made the result depend on live DNS: a resolver that answers `.invalid` with
+    a captive-portal address would have reached the getter instead.
+    """
+    dialled = False
+
     async def getter(url, max_bytes):
-        raise AssertionError("must not be called")
+        nonlocal dialled
+        dialled = True
+        return 200, b"\x89PNG fake", "image/png"
+
+    async def refuses_to_resolve(_host: str) -> list[tuple]:
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
 
     outcome = await capture_image(
-        getter, tmp_path, "https://no-such-host.invalid/x.png", max_bytes=1024
+        getter, tmp_path, "https://no-such-host.invalid/x.png",
+        max_bytes=1024, resolve=refuses_to_resolve,
     )
+    assert dialled is False, "an unresolvable host must not be fetched"
     assert outcome == ImageOutcome(status="error")
 
 
