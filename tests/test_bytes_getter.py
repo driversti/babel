@@ -9,6 +9,8 @@ the real bytes once these headers were set. So the headers are part of the
 contract, not a cosmetic detail — hence a test.
 """
 
+import asyncio
+
 import pytest
 
 from babel.cli import IMAGE_FETCH_HEADERS, MAX_REDIRECT_HOPS, _bytes_getter
@@ -104,9 +106,27 @@ def test_no_user_agent_override(header):
 class _ScriptedResponse:
     """`chunks` lets a test spread a body over several `aiter_content` yields,
     so a mid-stream abort can be shown to stop partway rather than draining
-    everything; `body` (a single bytes value) is the common-case shorthand."""
+    everything; `body` (a single bytes value) is the common-case shorthand.
 
-    def __init__(self, status_code, *, location=None, body=b"", chunks=None, content_type=None):
+    `chunk_delay` puts a real `await asyncio.sleep(...)` between chunks. With
+    no delay, `aiter_content` never actually suspends — every chunk is
+    produced synchronously once iteration starts — so there is no await point
+    an external `task.cancel()` (what `asyncio.wait_for`'s timeout does) could
+    ever land on mid-stream. A delay gives cancellation somewhere real to
+    interrupt, the way curl_cffi's own `await self.queue.get()` does while
+    waiting on the network.
+    """
+
+    def __init__(
+        self,
+        status_code,
+        *,
+        location=None,
+        body=b"",
+        chunks=None,
+        content_type=None,
+        chunk_delay=0.0,
+    ):
         self.status_code = status_code
         self.headers = {}
         if location is not None:
@@ -114,11 +134,14 @@ class _ScriptedResponse:
         if content_type is not None:
             self.headers["content-type"] = content_type
         self._chunks = list(chunks) if chunks is not None else [body]
+        self._chunk_delay = chunk_delay
         self.events: list[str] = []
         self.quit_now = _RecordingEvent(self.events)
 
     async def aiter_content(self):
         for chunk in self._chunks:
+            if self._chunk_delay:
+                await asyncio.sleep(self._chunk_delay)
             self.events.append("read")
             yield chunk
 
@@ -284,3 +307,50 @@ async def test_an_oversized_stream_is_aborted_via_quit_now_mid_transfer(tmp_path
         "the stream must be abandoned once max_bytes is crossed, not drained to the end"
     )
     assert resp.events[-2:] == ["quit_now", "aclose"], resp.events
+
+
+async def test_a_cancelled_fetch_is_severed_not_drained(tmp_path):
+    """imageworker.py wraps capture_image in asyncio.wait_for(...,
+    timeout=image_timeout_sec) specifically because a host that accepts a
+    connection and then sends nothing once stalled the whole image archive —
+    config.py records that history, and it is the defence image_timeout_sec
+    exists for.
+
+    Round 3 of review: none of the three abort paths fixed in round 2 cover
+    this one. When wait_for's deadline fires, asyncio.CancelledError is
+    raised inside aiter_content's suspension point — not one of the
+    'completed' exits — and CancelledError is BaseException, not Exception,
+    since Python 3.8, so capture_image's own generic handler does not (and
+    must not) catch or hide it. Measured against real curl_cffi (see the
+    report): without severing here, wait_for still raises at its own
+    configured timeout, but curl keeps pulling the whole body in the
+    background regardless — 100% of a 300 MB body pushed, RSS 61 -> 465 MB,
+    for a host that never sends anything at all.
+
+    A `finally` runs on cancellation exactly as it does on any other exit, so
+    the inverted default in _bytes_getter (sever unless `completed` was set)
+    covers this without any code specific to CancelledError — which is the
+    whole point of inverting it: a future exit path does not have to
+    remember to opt in.
+    """
+    chunks = [b"x" * 100 for _ in range(5)]
+    resp = _ScriptedResponse(200, chunks=chunks, content_type="image/png", chunk_delay=0.05)
+    session = _ScriptedSession({f"https://{_PUBLIC_A}/slow.png": resp})
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            capture_image(
+                _bytes_getter(session, 5),
+                tmp_path,
+                f"https://{_PUBLIC_A}/slow.png",
+                max_bytes=10_000,
+            ),
+            timeout=0.12,
+        )
+
+    read_events = [e for e in resp.events if e == "read"]
+    assert len(read_events) < len(chunks), (
+        "cancellation must sever mid-stream, not let the transfer run to completion"
+    )
+    assert resp.quit_now.is_set(), "a cancelled fetch must sever the response, not merely drop it"
+    assert "aclose" in resp.events

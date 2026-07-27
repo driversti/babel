@@ -158,22 +158,26 @@ def _bytes_getter(session: AsyncSession, timeout_sec: int):
                 headers=IMAGE_FETCH_HEADERS,
                 allow_redirects=False,
             )
-            # Whether this response is being abandoned rather than fully read.
-            # curl_cffi's async aclose() is just `await self.astream_task` — it
-            # waits for curl's background fetch to finish, it does not sever it
-            # (I9). Only response.quit_now.set() does that: curl_cffi's write
-            # callback checks quit_now.is_set() on every chunk and tells curl to
-            # abort once it is. So every path below that gives up on a response
-            # without having read all of it — a redirect, a declared
-            # Content-Length already over budget, or a stream that crosses
-            # max_bytes partway through — must set quit_now before aclose(), or
-            # the abort is cosmetic and the whole body is pulled anyway.
-            abort = False
+            # Severing is the default for any response this function stops
+            # reading before its natural end, and `completed` is the one flag
+            # that turns it off — set only once the body has actually been
+            # read in full, just before the return below. Getting this
+            # backwards once already cost a still-open finding (I9): aclose()
+            # alone never severs a curl_cffi stream, it only awaits the
+            # background fetch finishing on its own — response.quit_now.set()
+            # is the one thing that makes curl's write callback abort early,
+            # and a default of "do nothing unless told" meant every new exit
+            # path from this function — a redirect, an oversize abort, and
+            # (found the round after those two were fixed) a timeout
+            # cancelling this coroutine mid-read — silently inherited a full
+            # drain instead. A `finally` runs for a cancellation exactly as it
+            # does for any other exit, so defaulting to sever there closes
+            # all of those the same way, including ones not yet written.
+            completed = False
             try:
                 if response.status_code in _REDIRECT_STATUS_CODES:
                     # A 3xx is a header, not content — its body, if a
                     # misbehaving host sends one, must never be read.
-                    abort = True
                     location = response.headers.get("location")
                     if not location:
                         # A redirect status with nowhere to go is a host
@@ -186,18 +190,17 @@ def _bytes_getter(session: AsyncSession, timeout_sec: int):
 
                 declared = response.headers.get("content-length")
                 if declared and declared.isdigit() and int(declared) > max_bytes:
-                    abort = True
                     raise ImageTooLarge(f"{current} declares {declared} bytes")
                 chunks, total = [], 0
                 async for chunk in response.aiter_content():
                     total += len(chunk)
                     if total > max_bytes:
-                        abort = True
                         raise ImageTooLarge(f"{current} exceeded {max_bytes} bytes")
                     chunks.append(chunk)
+                completed = True
                 return response.status_code, b"".join(chunks), response.headers.get("content-type")
             finally:
-                if abort and response.quit_now:
+                if not completed and response.quit_now:
                     response.quit_now.set()
                 await response.aclose()
         raise RuntimeError(f"{url} exceeded {MAX_REDIRECT_HOPS} redirects")
