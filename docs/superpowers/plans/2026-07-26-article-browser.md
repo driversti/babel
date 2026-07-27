@@ -3257,10 +3257,21 @@ Append to `docker-compose.yml`:
 
 ```
 # BuildKit does not read .gitignore, and pgdata/ and data/images live inside
-# the build context. Without this, `docker compose build` reads the running
-# Postgres data directory and the whole rescued-image tree — hundreds of GB at
-# the projected archive size — and transfers them to the daemon before a single
-# layer is evaluated. None of it reaches the image.
+# the build context. Measured directly (446 MB of dummy content in pgdata/ and
+# data/, `docker compose build --progress=plain web`): under BuildKit, the
+# default builder on Docker 29.4 (this project's deploy host, see SPEC.md
+# "Target host") and on the 29.6 used to measure this, none of it is even
+# read — "transferring context" reported ~4 KB with this file absent or
+# present, because BuildKit only pulls in what the Dockerfile's COPY
+# instructions actually reference, .dockerignore or not. So on the builder
+# this project actually runs, this file is insurance, not a fix for an active
+# problem. The claim this comment used to make — hundreds of GB transferred
+# before a single layer is evaluated — only reproduces under the legacy
+# builder (`DOCKER_BUILDKIT=0`): 498 MB sent for the same 446 MB of dummy
+# content without this file, ~554 KB with it. It still earns its place: it
+# protects that legacy path, protects anyone who runs `docker build` directly
+# instead of through compose, and keeps the build's behaviour from depending
+# on which builder happens to be the default in some future Docker release.
 pgdata/
 data/
 gluetun/
@@ -3333,9 +3344,15 @@ hide writes a tombstone and reports how many articles cite a withheld
 blob — content addressing means withholding one is never a
 single-article act.
 
-.dockerignore is not housekeeping: pgdata/ and data/images sit inside the
-build context, so every build was reading the live Postgres directory and
-the whole image tree before evaluating a layer.
+.dockerignore still earns its place even though BuildKit (this project's
+default builder, Docker 29.4 on the deploy host) already keeps the build
+context small on its own: measured directly, "transferring context" was
+~4 KB whether pgdata/ and data/images were excluded or not, since BuildKit
+only reads what a COPY instruction references. The legacy builder does not
+have that property — DOCKER_BUILDKIT=0 sent 498 MB for 446 MB of dummy
+content in those directories without this file, ~554 KB with it — so this
+file protects that path, anyone running `docker build` directly, and any
+future Docker release that changes the default builder again.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
