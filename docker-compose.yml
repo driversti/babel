@@ -84,7 +84,29 @@ services:
     build: .
     container_name: babel-web
     command: ["babel", "serve"]
-    env_file: .env
+    # Deliberately NOT env_file: .env, unlike every other service here. That
+    # file carries WIREGUARD_PRIVATE_KEY, POSTGRES_PASSWORD, BOT_TOKEN and the
+    # owner's DATABASE_URL, and `babel serve` reads none of them: Settings is
+    # extra="ignore", and open_pool refuses to fall back to DATABASE_URL rather
+    # than using it. This is the one process on the host that accepts inbound
+    # connections from the internet, so it gets the four values it actually
+    # uses and nothing else.
+    #
+    # One consequence, written down because it is not visible from the code:
+    # open_pool's second refusal — WEB_DATABASE_URL must not EQUAL DATABASE_URL
+    # — compares against Settings' placeholder default in this container, since
+    # DATABASE_URL is no longer in its environment and .env is not in the image
+    # (the Dockerfile copies pyproject.toml, uv.lock, src/ and migrations/ and
+    # nothing else). It still fires where that mistake is actually made: `babel
+    # serve` from a checkout, where pydantic-settings reads .env itself. Here
+    # the controls are the role's own — SELECT-only grants and `ALTER ROLE
+    # babel_web SET default_transaction_read_only = on`, both in .env.example —
+    # which is what README already calls the actual enforcement.
+    environment:
+      - WEB_DATABASE_URL=${WEB_DATABASE_URL}
+      - IMAGE_ROOT=${IMAGE_ROOT:-/data/images}
+      - CONTACT=${CONTACT:-}
+      - WEB_POOL_SIZE=${WEB_POOL_SIZE:-10}
     volumes:
       # Read-only: the site serves blobs, it never writes one.
       - ${IMAGE_ROOT_HOST:-./data/images}:/data/images:ro
