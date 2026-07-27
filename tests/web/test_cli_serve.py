@@ -55,6 +55,19 @@ async def test_verify_schema_names_the_missing_migration(pg):
         await verify_schema(pg)
 
 
+async def test_verify_schema_names_the_markup_migration_too(pg):
+    """A skipped migrate must be named, not answered as 503 forever.
+
+    Without 007 the browse queries select body_raw, asyncpg raises
+    UndefinedColumnError, which is a PostgresError, which lands in the
+    database-down handler — so every page reports the database as not answering
+    while /healthz and the compose healthcheck both stay green.
+    """
+    await pg.execute("DELETE FROM schema_migrations WHERE name = '007_body_markup.sql'")
+    with pytest.raises(RuntimeError, match="007_body_markup.sql"):
+        await verify_schema(pg)
+
+
 async def test_verify_schema_treats_a_database_with_no_ledger_as_unmigrated(pg):
     """A database that has never been migrated has no `schema_migrations` at all.
 

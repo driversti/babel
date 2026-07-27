@@ -36,3 +36,13 @@ def test_static_assets_are_tracked_by_git():
     on_disk = {str(p.relative_to(REPO)) for p in STATIC_DIR.glob("*")}
     assert on_disk
     assert on_disk <= tracked
+
+
+def test_no_template_uses_the_safe_filter():
+    """render_body returns Markup, so nothing needs |safe — and body_raw is
+    untrusted, so nothing may have it. Keeping the count at zero is cheaper to
+    enforce than auditing each use."""
+    for path in (pathlib.Path(__file__).parents[2]
+                 / "src/babel/web/templates").rglob("*.html"):
+        assert "|safe" not in path.read_text(), f"{path.name} uses |safe"
+        assert "| safe" not in path.read_text(), f"{path.name} uses | safe"

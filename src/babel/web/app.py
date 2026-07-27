@@ -46,7 +46,7 @@ CSP = (
 # 006 is not listed for the same reason: it only drops indexes 005 made
 # redundant, and no browse query names one of them. A future browse migration
 # belongs in this tuple, added by the commit that adds the migration.
-REQUIRED_MIGRATIONS = ("005_browse.sql",)
+REQUIRED_MIGRATIONS = ("005_browse.sql", "007_body_markup.sql")
 
 
 def web_dsn(settings: Settings) -> str:
