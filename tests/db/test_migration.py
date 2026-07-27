@@ -44,20 +44,42 @@ async def test_article_images_records_dead_links_without_bytes(pg):
 
 
 async def test_browse_indexes_and_tombstones_exist(pg):
-    names = {
-        r["indexname"]
+    # Definitions, not just names: an index built with a swapped column or a
+    # missing DESC keeps the name the brief asks for, but the list query
+    # (`ORDER BY published_at DESC, id DESC` with optional equality filters)
+    # silently falls back to a sort instead of an index scan as the table
+    # grows. pg_indexes.indexdef is exactly the CREATE INDEX text Postgres
+    # would replay (it wraps pg_get_indexdef), so comparing it pins column
+    # order and direction, not merely presence of the name.
+    defs = {
+        r["indexname"]: r["indexdef"]
         for r in await pg.fetch(
-            "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
+            "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'"
         )
     }
-    assert "articles_list_idx" in names
-    assert "articles_country_list_idx" in names
-    assert "articles_author_list_idx" in names
-    assert "articles_country_author_list_idx" in names
-    assert "article_images_sha256_idx" in names
+    assert defs["articles_list_idx"] == (
+        "CREATE INDEX articles_list_idx ON public.articles "
+        "USING btree (published_at DESC, id DESC)"
+    )
+    assert defs["articles_country_list_idx"] == (
+        "CREATE INDEX articles_country_list_idx ON public.articles "
+        "USING btree (country, published_at DESC, id DESC)"
+    )
+    assert defs["articles_author_list_idx"] == (
+        "CREATE INDEX articles_author_list_idx ON public.articles "
+        "USING btree (lower(author_name), published_at DESC, id DESC)"
+    )
+    assert defs["articles_country_author_list_idx"] == (
+        "CREATE INDEX articles_country_author_list_idx ON public.articles "
+        "USING btree (country, lower(author_name), published_at DESC, id DESC)"
+    )
+    assert defs["article_images_sha256_idx"] == (
+        "CREATE INDEX article_images_sha256_idx ON public.article_images "
+        "USING btree (sha256)"
+    )
     # 006 removes what 005 supersedes.
-    assert "articles_published_at_idx" not in names
-    assert "articles_country_idx" not in names
+    assert "articles_published_at_idx" not in defs
+    assert "articles_country_idx" not in defs
 
     columns = {
         (r["table_name"], r["column_name"])

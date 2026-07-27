@@ -3,10 +3,20 @@
 -- APPLY THIS DELIBERATELY, never as a side effect of `docker compose up -d`.
 -- Both `babel run` and `babel images` call apply_migrations at startup, and
 -- apply_migrations wraps a whole file in one transaction, so a per-service
--- restart would run this DDL against a live walk and hold ACCESS EXCLUSIVE on
--- `articles` for the length of the build. lock_timeout makes a contended run
--- fail fast instead of blocking save_article indefinitely. The runbook is in
--- README.md.
+-- restart would run this DDL against a live walk. Plain CREATE INDEX takes
+-- ShareLock, which blocks concurrent writers — not readers — for the whole
+-- build, not just while the lock is being acquired; the two ADD COLUMN
+-- statements below take ACCESS EXCLUSIVE, but neither column has a default,
+-- so both are metadata-only and effectively instant. lock_timeout changes
+-- neither hold: it only bounds how long this migration itself waits to
+-- *acquire* a lock, so a session already holding a conflicting one makes
+-- this fail in 5s instead of queueing behind it. That queueing is the actual
+-- danger: once an ACCESS EXCLUSIVE request is waiting, Postgres's lock queue
+-- is FIFO, so every later reader and writer queues behind it too, even ones
+-- that would otherwise coexist fine with whatever lock is currently held.
+-- What keeps this migration from doing that to the live walk is the
+-- runbook, not lock_timeout: stop `crawler` and `images` first, then
+-- migrate. The runbook is in README.md.
 --
 -- CREATE INDEX CONCURRENTLY is not available through this runner: it is illegal
 -- inside a transaction block, and asyncpg wraps a multi-statement file in an
