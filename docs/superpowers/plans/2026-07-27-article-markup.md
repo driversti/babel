@@ -1120,7 +1120,12 @@ def _emit_image(item: Image, images: Mapping[str, ImageState]) -> Markup:
     if state is not None and state.state == "ok" and state.sha256 is not None:
         return Markup('<img src="/img/%s" alt="" loading="lazy">') % state.sha256.hex()
 
-    caption = _CAPTIONS[state.state if state is not None else None]
+    # .get, not a bare subscript: line 342 above explicitly anticipates
+    # state="ok" with a null digest, and a subscript KeyErrors on exactly that,
+    # taking the whole article page down instead of degrading one image slot.
+    # 'pending' and 'error' — the raw article_images statuses — do the same if a
+    # query ever passes one through.
+    caption = _CAPTIONS.get(state.state if state is not None else None, _CAPTIONS[None])
     href = None if (state is not None and state.state in _UNLINKED) else _href(item.source_url)
     if href is None:
         return Markup('<span class="missing-image">%s</span>') % caption

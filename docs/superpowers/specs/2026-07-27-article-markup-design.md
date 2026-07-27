@@ -224,8 +224,29 @@ the same string `_parse_images` recorded at ingest, so the match is exact.
   original URL. No automatic request to a third-party host; following it stays
   the reader's deliberate choice.
 
-`<a href><img></a>`, which the fixture contains, needs no special case: the image
-stays an inline node and `display: block; max-width: 100%` in CSS does the rest.
+`<a href><img></a>` is the BBCode idiom `[url=…][img]…[/img][/url]`, and both body
+images in `tests/fixtures/article_with_images.html` use it. **This document
+originally said it needs no special case. That was wrong**, and review found two
+defects behind the claim:
+
+- **The takedown rule breaks.** Suppressing the placeholder's own link for a
+  withheld blob does nothing about the author's anchor around it, so
+  `<a href="https://h/1.png"><img src="https://h/1.png"></a>` at `withheld` still
+  renders a live link to the original of a blob `babel hide --image` was run on.
+- **Nested `<a>` does not survive parsing.** Re-parsed with lexbor — the same
+  HTML5 tree construction a browser performs — the adoption-agency algorithm
+  hoists the placeholder's "original" link out of `.missing-image` *and* out of
+  the author's anchor, so the placeholder's styling misses it and the caption
+  text inherits the author's href.
+
+The rule adopted instead: **an `<a>` containing an image is dropped, its children
+kept, unless every image inside it renders as a real `<img>`.** The anchor exists
+to make the image clickable; with no image there is nothing to click, and
+dropping it satisfies the takedown rule outright rather than by case analysis on
+hrefs.
+
+For a present image nothing more is needed: it stays an inline node and
+`display: block; max-width: 100%` in CSS does the rest.
 
 ### The foot-of-page gallery changes purpose
 
