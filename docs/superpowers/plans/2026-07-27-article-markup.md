@@ -732,10 +732,11 @@ def render_body(raw: str, images: Mapping[str, object]) -> RenderedBody:
     )
 ```
 
-Note on `span`: it is in `KEPT` mapping to itself only so that
-`ALLOWED_ATTRIBUTES`/`KEPT.values()` stay a single source of truth for the
-invariant test once Task 5 emits `<span class="missing-image">`. `_convert`
-unwraps it, so no author `<span>` survives.
+Note on `span`, and **do not "fix" this**: `span` is deliberately NOT in `KEPT`.
+An author's `<span>` is unwrapped like any other unrecognised tag. It appears
+only in `EMITTED_TAGS`, because Task 5 emits a `<span class="missing-image">` of
+this module's own. Adding `"span": "span"` to `KEPT` would let author `<span>`s
+through — the two sets are separate precisely so that cannot happen by accident.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 

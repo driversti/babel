@@ -141,7 +141,11 @@ def _convert(node: Node, depth: int) -> tuple[object, ...]:
     if kept == "br":
         return (Break(),)
     if kept == "img":
-        src = (node.attributes.get("src") or "").strip()
+        # Same scheme check as an <a> href -- Image.source_url is exactly
+        # what Task 5 will fetch and render, and _emit renders it as
+        # Markup("") for now regardless, so an unchecked value here would sit
+        # inert only until Task 5 starts consuming it.
+        src = _href(node.attributes.get("src"))
         return (Image(src),) if src else ()
 
     children: list[object] = []
@@ -182,6 +186,17 @@ def render_body(raw: str, images: Mapping[str, object]) -> RenderedBody:
     root = HTMLParser(raw or "").body
     if root is None:
         return RenderedBody(html=Markup(""), image_urls=frozenset())
+    # Remove every DROPPED subtree once, up front, rather than relying only
+    # on the per-node check inside _convert. The depth ceiling's flatten path
+    # calls node.text(), which walks descendant text nodes in C and does not
+    # know about DROPPED -- so a <script> or <style> sitting deeper than
+    # MAX_DEPTH would otherwise have its source text resurrected as escaped
+    # but visible text. Decomposing first means there is nothing left under
+    # a too-deep node for that flatten to find. The check inside _convert
+    # stays as defense in depth; it is simply never reached for these tags
+    # once this has run.
+    for dropped in root.css(",".join(DROPPED)):
+        dropped.decompose()
     items: list[object] = []
     for child in root.iter(include_text=True):
         items.extend(_convert(child, 0))
