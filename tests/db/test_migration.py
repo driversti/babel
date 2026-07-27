@@ -41,3 +41,30 @@ async def test_article_images_records_dead_links_without_bytes(pg):
     row = await pg.fetchrow("SELECT sha256, status FROM article_images WHERE article_id = 2")
     assert row["sha256"] is None
     assert row["status"] == "dead"
+
+
+async def test_browse_indexes_and_tombstones_exist(pg):
+    names = {
+        r["indexname"]
+        for r in await pg.fetch(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
+        )
+    }
+    assert "articles_list_idx" in names
+    assert "articles_country_list_idx" in names
+    assert "articles_author_list_idx" in names
+    assert "articles_country_author_list_idx" in names
+    assert "article_images_sha256_idx" in names
+    # 006 removes what 005 supersedes.
+    assert "articles_published_at_idx" not in names
+    assert "articles_country_idx" not in names
+
+    columns = {
+        (r["table_name"], r["column_name"])
+        for r in await pg.fetch(
+            """SELECT table_name, column_name FROM information_schema.columns
+               WHERE table_schema = 'public'"""
+        )
+    }
+    assert ("articles", "hidden_at") in columns
+    assert ("images", "withheld_at") in columns
