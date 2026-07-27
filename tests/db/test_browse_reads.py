@@ -328,3 +328,29 @@ async def test_a_hidden_article_yields_an_empty_image_map(pg):
            VALUES (7005, 0, 'https://h/x.png', 'pending')"""
     )
     assert await browse.get_image_map(pg, 7005) == {}
+
+
+async def test_the_map_key_is_the_verbatim_unstripped_source_url(pg):
+    """The map's key must not be normalised — it has to match the renderer's lookup key exactly.
+
+    crawler/parser.py stores `img.attributes.get("src")` with no `.strip()`,
+    and markup.py looks up `images.get(item.source_url)` with that same
+    unstripped attribute. Two review rounds on this branch were spent
+    establishing that both ends have to agree byte-for-byte: normalising the
+    key at either end — a stray TRIM() or LOWER() here, or a .strip() there —
+    silently misses a blob that is actually on disk, because the lookup key
+    the renderer builds from body_raw no longer matches the key this map
+    produces. tests/web/test_markup.py's padded-key test already pins the
+    renderer side; this pins the database side that has to agree with it.
+    """
+    await pg.execute(
+        """INSERT INTO articles (id, title, body, published_at, comment_count)
+           VALUES (7006, 't', 'text', now(), 0)"""
+    )
+    await pg.execute(
+        """INSERT INTO article_images (article_id, position, source_url, status)
+           VALUES (7006, 0, $1, 'pending')""",
+        " https://h/padded.png ",
+    )
+    mapping = await browse.get_image_map(pg, 7006)
+    assert list(mapping) == [" https://h/padded.png "]
