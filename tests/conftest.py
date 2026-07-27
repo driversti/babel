@@ -60,3 +60,14 @@ def fake_pool():
         return FakePool(conn)
 
     return build
+
+
+@pytest.fixture
+def pool(pg, fake_pool):
+    """A pool-shaped façade over the per-test connection.
+
+    Application code takes an asyncpg.Pool and calls `async with pool.acquire()`.
+    Handing it this keeps the tests' database access identical to production's
+    without a second container per test.
+    """
+    return fake_pool(pg)

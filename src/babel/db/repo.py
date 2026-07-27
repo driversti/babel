@@ -1,4 +1,6 @@
-"""Every SQL statement in the project lives here.
+"""Every write-path SQL statement in the project lives here.
+
+The read path lives in browse.py. SQL still never appears outside this package.
 
 Article saves are idempotent by design: a re-fetch replaces the row and its
 children rather than erroring, which is what makes retrying a partially failed
