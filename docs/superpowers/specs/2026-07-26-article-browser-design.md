@@ -21,11 +21,13 @@ Keyword search is the other half of phase 2 and is deliberately not here.
 
 Taken with the operator before design, and not open in implementation:
 
-1. **Public on the internet**, fronted by the existing Cloudflare Tunnel — the same token-based
-   `cloudflared` in jupiter LXC 100 (`192.168.10.4`) that serves `battle-stats.yurii.live`,
-   `articles.yurii.live` and the rest. This is the SPEC.md risk "Publishing a mirror of other
-   players' content is a deliberate decision to make before phase 2 goes live" being decided, in
-   the affirmative, with the mitigations below.
+1. **Public on the internet**, fronted by the operator's existing token-based Cloudflare Tunnel —
+   the same one that already serves this operator's other services, so a new site is a hostname in
+   the Zero Trust dashboard pointing at an internal address, and the origin stays hidden. The
+   tunnel's own location and the hostnames it already carries are deliberately not recorded here,
+   for the reason `config.py` gives: this repository is public. This is the SPEC.md risk
+   "Publishing a mirror of other players' content is a deliberate decision to make before phase 2
+   goes live" being decided, in the affirmative, with the mitigations below.
 2. **A full archived read**, not a link-out index. Our own page, our own copy of the text, the
    comments and the images. An index that sends the reader to erepublik.com is worthless for
    exactly the articles the archive exists to hold.

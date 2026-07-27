@@ -110,7 +110,7 @@ async def test_loopback_is_blocked():
 
 async def test_rfc1918_literal_is_blocked():
     assert await classify_url("http://172.18.0.5:8080/internal") == "blocked"
-    assert await classify_url("http://192.168.10.18/internal") == "blocked"
+    assert await classify_url("http://192.168.1.1/internal") == "blocked"
     assert await classify_url("http://10.0.0.1/internal") == "blocked"
 
 
