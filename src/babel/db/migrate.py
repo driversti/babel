@@ -17,6 +17,23 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 """
 
 
+async def applied_migrations(conn: asyncpg.Connection) -> set[str]:
+    """The names already in the ledger, for a caller that may not write.
+
+    Deliberately does not create the ledger first, which is the one thing
+    `apply_migrations` does before reading it. `babel serve` connects as a
+    SELECT-only role, so `CREATE TABLE IF NOT EXISTS` is not a harmless no-op
+    there — it raises before the read it was meant to enable. A database with no
+    ledger at all is simply a database with nothing applied, which is what the
+    empty set says.
+    """
+    try:
+        rows = await conn.fetch("SELECT name FROM schema_migrations")
+    except asyncpg.UndefinedTableError:
+        return set()
+    return {r["name"] for r in rows}
+
+
 async def apply_migrations(conn: asyncpg.Connection, directory: pathlib.Path) -> list[str]:
     """Run any migration not yet recorded. Returns the names applied this call."""
     await conn.execute(_LEDGER)

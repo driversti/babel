@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from babel.config import Settings
+from babel.db.migrate import applied_migrations
 
 log = logging.getLogger(__name__)
 
@@ -36,17 +37,22 @@ CSP = (
 )
 
 
-async def open_pool(settings: Settings) -> asyncpg.Pool:
-    """The read-only pool.
+# The migrations the read path cannot work without — not "every file in
+# migrations/". One image carries one migrations/ directory for all four
+# services, so an all-or-nothing check would stop the public site from booting
+# over a crawler-only migration it never reads, during exactly the window the
+# documented deploy order creates (stop the writers, migrate, start everything).
+# 006 is not listed for the same reason: it only drops indexes 005 made
+# redundant, and no browse query names one of them. A future browse migration
+# belongs in this tuple, added by the commit that adds the migration.
+REQUIRED_MIGRATIONS = ("005_browse.sql",)
 
-    The read-only guarantee is a property of the ROLE, not of this call. asyncpg
-    runs `RESET ALL` on every connection release, which returns
-    default_transaction_read_only to the role default — measured against
-    postgres:17, a pool built with `init=` had acquire #1 blocked and acquire #2
-    writing successfully. So `ALTER ROLE babel_web SET
-    default_transaction_read_only = on` is the control, and it is an operator
-    step because the role's password does not belong in this repository. See
-    README.md.
+
+def web_dsn(settings: Settings) -> str:
+    """The SELECT-only DSN, or a named refusal.
+
+    Split out of `open_pool` because the startup schema check needs the same
+    two refusals to have run before it dials anything.
     """
     dsn = settings.web_database_url
     if not dsn:
@@ -59,7 +65,52 @@ async def open_pool(settings: Settings) -> asyncpg.Pool:
             "WEB_DATABASE_URL equals DATABASE_URL. The public site must not connect "
             "as the crawler's own role. See README.md for the role setup."
         )
-    return await asyncpg.create_pool(dsn, min_size=1, max_size=settings.web_pool_size)
+    return dsn
+
+
+async def verify_schema(conn: asyncpg.Connection) -> None:
+    """Refuse to serve against a database the browse schema was never applied to.
+
+    Reads the ledger; writes nothing. That is a requirement, not an
+    observation — this runs as the SELECT-only role, so the
+    `CREATE TABLE IF NOT EXISTS schema_migrations` that `apply_migrations` opens
+    with would raise here rather than be a no-op.
+
+    Without this the failure is silent and misattributed. Measured with
+    `hidden_at` dropped from `articles`: every page answered 503 "The database
+    is not answering" — `asyncpg.UndefinedColumnError` is a `PostgresError`, so
+    it lands in the database-down handler — while `/healthz` stayed 200 and the
+    compose healthcheck stayed green. An operator would spend that outage
+    looking at Postgres. Crash-looping with this message instead is the same
+    answer the two crawler commands already give, and what
+    `restart: unless-stopped` is for.
+    """
+    applied = await applied_migrations(conn)
+    missing = [name for name in REQUIRED_MIGRATIONS if name not in applied]
+    if missing:
+        raise RuntimeError(
+            f"the browse schema is not applied: {', '.join(missing)} is not in "
+            "schema_migrations. Run `docker compose run --rm crawler babel migrate` "
+            "first (stop crawler and images before you do — see README.md). Serving "
+            "without it answers 503 on every page as though the database were down."
+        )
+
+
+async def open_pool(settings: Settings) -> asyncpg.Pool:
+    """The read-only pool.
+
+    The read-only guarantee is a property of the ROLE, not of this call. asyncpg
+    runs `RESET ALL` on every connection release, which returns
+    default_transaction_read_only to the role default — measured against
+    postgres:17, a pool built with `init=` had acquire #1 blocked and acquire #2
+    writing successfully. So `ALTER ROLE babel_web SET
+    default_transaction_read_only = on` is the control, and it is an operator
+    step because the role's password does not belong in this repository. See
+    README.md.
+    """
+    return await asyncpg.create_pool(
+        web_dsn(settings), min_size=1, max_size=settings.web_pool_size
+    )
 
 
 def create_app(settings: Settings, pool: object | None = None) -> FastAPI:

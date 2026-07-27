@@ -526,13 +526,23 @@ def serve() -> None:
 async def _serve() -> None:
     import uvicorn
 
-    from babel.web.app import create_app
+    from babel.web.app import create_app, verify_schema, web_dsn
 
     settings = Settings()
     # Deliberately does not migrate the schema here. Both long-running crawler
     # commands do that at startup; this one connects as a SELECT-only role and
     # would crash-loop under restart: unless-stopped. Applying the schema is the
     # operator's step, documented in README.md.
+    #
+    # It does check that the step was taken, on one throwaway connection before
+    # anything is served. An unapplied 005 is otherwise invisible in exactly the
+    # wrong way: every page 503s "The database is not answering" while /healthz
+    # and the compose healthcheck stay green.
+    conn = await asyncpg.connect(web_dsn(settings))
+    try:
+        await verify_schema(conn)
+    finally:
+        await conn.close()
     app = create_app(settings)
     config = uvicorn.Config(app, host="0.0.0.0", port=8080, log_level="info")  # noqa: S104
     await uvicorn.Server(config).serve()
