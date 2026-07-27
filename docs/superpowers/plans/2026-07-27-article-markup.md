@@ -1886,6 +1886,206 @@ No re-crawl — this is the property the storage decision bought.
 
 ---
 
+### Task 11: Bound what a hostile body can cost the web process
+
+Added after Task 3's third review round measured it. Not in the original spec.
+
+**Files:**
+- Modify: `src/babel/web/markup.py`
+- Test: `tests/web/test_markup.py`
+
+**Interfaces:**
+- Consumes: `render_body`, `MAX_DEPTH` (Task 3), `_paragraphs` (Task 4),
+  `ImageState` (Task 5).
+- Produces: `render_body(raw, images) -> RenderedBody | None`. **The return type
+  gains `None`** — it means "this markup is too deeply nested to parse safely,
+  do not render it as markup". Task 7's route already writes
+  `rendered = render_body(detail.body_raw, image_map) if detail.body_raw else None`
+  and falls back to the stored plain text when `rendered` is falsy, so the
+  fallback path this needs already exists and is already tested. Also produces
+  `MAX_NESTING: int = 1000` and `GUARD_MIN_BYTES: int = 32 * 1024`.
+
+**Why this task exists.** selectolax's *parse* — not the walk, not `strip_tags` —
+is quadratic in nesting depth. Measured on this machine, against a `body_raw` at
+the 1,000,000-character ceiling `crawler/parser.py` enforces:
+
+| body, all exactly 1 MB | parse |
+|---|---|
+| nested 90,909 deep | **17,662 ms** |
+| nested 2,000 deep | 14.7 ms |
+| nested 1,000 deep | 7.9 ms |
+| nested 200 deep | 5.6 ms |
+| flat `<p>` siblings | 51.2 ms |
+| flat `<br>` run | 35.9 ms |
+
+Route handlers are `async def`, so a single such render occupies the event loop
+for the whole `web` process — every other request, `/healthz` included, which
+turns one slow page into a failing compose healthcheck.
+
+Task 3's review called this pre-existing, and within `markup.py`'s own history it
+is. It is **not** pre-existing in the deployed system: before this branch `web`
+never parsed HTML at all, because `body` was plain text. This branch is what
+creates the exposure, so it does not ship without a bound.
+
+**No threadpool.** Moving the render off the loop was considered and rejected:
+the measurements above say the whole problem is nesting depth, and a depth bound
+removes it outright. A threadpool would add a hop to every article page to
+mitigate a cost that no longer exists.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/web/test_markup.py`:
+
+```python
+import time
+
+from babel.web.markup import GUARD_MIN_BYTES, MAX_NESTING
+
+
+def test_a_body_nested_past_the_limit_is_refused_rather_than_parsed():
+    raw = "<div>" * (MAX_NESTING + 50) + "text" + "</div>" * (MAX_NESTING + 50)
+    assert len(raw) > GUARD_MIN_BYTES          # the guard only runs above this
+    assert render_body(raw, {}) is None
+
+
+def test_a_body_within_the_limit_still_renders():
+    raw = "<div>" * (MAX_NESTING - 50) + "<p>text</p>" + "</div>" * (MAX_NESTING - 50)
+    rendered = render_body(raw, {})
+    assert rendered is not None
+    assert "text" in str(rendered.html)
+
+
+def test_a_small_body_is_never_refused_however_nested():
+    """Below GUARD_MIN_BYTES the guard does not run, because it cannot matter.
+
+    Measured: a 32 KiB body nested as deeply as its own length allows (depth
+    2,978) parses in 19.5 ms, and the average archived body is 3.4 KB. Paying a
+    scan on every article to bound a cost that small would be the wrong trade.
+    """
+    n = 400
+    raw = "<div>" * n + "deep" + "</div>" * n
+    assert len(raw) < GUARD_MIN_BYTES
+    assert n > MAX_NESTING // 4                # genuinely nested, just small
+    rendered = render_body(raw, {})
+    assert rendered is not None
+    assert "deep" in str(rendered.html)
+
+
+def test_void_and_self_closing_tags_do_not_inflate_the_depth_count():
+    """200k <br> is a flat document, not a 200k-deep one.
+
+    A naive '<' counter would refuse this. The archive is full of <br> runs —
+    one fixture has 76 in a single body — so a false refusal here would drop
+    real articles to the plain-text fallback.
+    """
+    raw = "<p>" + "<br>" * 60_000 + "x</p>"
+    assert len(raw) > GUARD_MIN_BYTES
+    rendered = render_body(raw, {})
+    assert rendered is not None
+    assert "x" in str(rendered.html)
+
+    raw = "<p>" + '<img src="https://h/a.png"/>' * 3_000 + "y</p>"
+    assert len(raw) > GUARD_MIN_BYTES
+    assert render_body(raw, {}) is not None
+
+
+def test_the_pathological_body_renders_in_well_under_a_second():
+    """The whole point. Without the guard this exact input takes ~17.7 s."""
+    n = 1_000_000 // 11
+    raw = "<div>" * n + "x" + "</div>" * n
+    start = time.perf_counter()
+    assert render_body(raw, {}) is None
+    assert time.perf_counter() - start < 1.0
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `uv run pytest tests/web/test_markup.py -k "nested or guard or void or pathological" -v`
+Expected: FAIL — `ImportError: cannot import name 'GUARD_MIN_BYTES'`.
+
+- [ ] **Step 3: Implement the guard**
+
+In `src/babel/web/markup.py`, beside the other ceilings:
+
+```python
+# selectolax's parse is quadratic in nesting depth. Measured against a body at
+# crawler/parser.py's 1,000,000-character ceiling: 17,662 ms nested 90,909 deep,
+# against 7.9 ms at depth 1,000 and 51.2 ms for a flat 1 MB of <p> siblings. The
+# route handlers are `async def`, so one such render stalls the whole web
+# process's event loop — /healthz with it, which reads to an operator as the
+# database being down rather than as one bad article.
+#
+# 1,000 is ten times MAX_DEPTH, past which _convert flattens a subtree to its
+# text anyway, so a refused body loses nothing a reader would have seen: the
+# route falls back to `articles.body`, which holds every word regardless.
+MAX_NESTING = 1000
+
+# Below this the scan is skipped, because nesting cannot cost anything at this
+# size: a 32 KiB body nested as deeply as its own length permits (depth 2,978)
+# parses in 19.5 ms, and 16 KiB in 5.3 ms. The average archived body is 3.4 KB
+# (SPEC.md), so in practice the scan never runs. It is not free — 79 ms over a
+# flat 1 MB document — which is exactly why it is gated on size.
+GUARD_MIN_BYTES = 32 * 1024
+
+# HTML5's void elements. A naive counter that treats every `<tag` as a descent
+# would refuse a flat run of <br>, which the archive is full of.
+_VOID_ELEMENTS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+})
+
+_TAG_RE = re.compile(r"""<(/?)([a-zA-Z][a-zA-Z0-9]*)((?:[^>"']|"[^"]*"|'[^']*')*)>""")
+
+
+def _too_deeply_nested(raw: str) -> bool:
+    """A cheap upper bound on nesting, without parsing.
+
+    Deliberately approximate: it counts what the markup *says*, not what an
+    HTML5 tree builder would make of it. Over-counting only costs a body the
+    plain-text fallback; under-counting is impossible, because every descent the
+    parser makes is an open tag here too.
+    """
+    if len(raw) < GUARD_MIN_BYTES:
+        return False
+    depth = 0
+    for match in _TAG_RE.finditer(raw):
+        closing, name, rest = match.group(1), match.group(2).lower(), match.group(3)
+        if closing:
+            depth = max(0, depth - 1)
+        elif name not in _VOID_ELEMENTS and not rest.rstrip().endswith("/"):
+            depth += 1
+            if depth > MAX_NESTING:
+                return True
+    return False
+```
+
+`re` is already imported by this module. Then, at the top of `render_body`:
+
+```python
+def render_body(raw: str, images: Mapping[str, ImageState]) -> RenderedBody | None:
+    if _too_deeply_nested(raw or ""):
+        log.warning("refusing to render a body nested past %d", MAX_NESTING)
+        return None
+```
+
+Add `import logging` and `log = logging.getLogger(__name__)` if the module does
+not have them yet.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `uv run pytest tests/web/test_markup.py -v`
+Expected: PASS, including every test from Tasks 3, 4 and 5.
+
+- [ ] **Step 5: Commit**
+
+```bash
+uv run ruff check src tests
+git add src/babel/web/markup.py tests/web/test_markup.py
+git commit -m "Refuse a body whose nesting would stall the event loop"
+```
+
+---
+
 ## Plan self-review
 
 **Spec coverage.** Schema → Task 2. Parser capture and the size ceiling → Task 1.
