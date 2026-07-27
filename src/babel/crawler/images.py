@@ -17,10 +17,13 @@ these links die, so the cost of a wasted retry is nothing beside the cost of
 recording a live image as gone.
 """
 
+import asyncio
 import hashlib
+import ipaddress
 import logging
 import pathlib
 import shutil
+import socket
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -146,6 +149,52 @@ def store_bytes(root: pathlib.Path, data: bytes) -> bytes:
     return digest
 
 
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+
+async def classify_url(url: str) -> str:
+    """Whether this image URL may be fetched at all: ok | blocked | unresolved.
+
+    `source_url` is raw `img@src` from article HTML written by anyone, and the
+    worker runs inside gluetun's namespace with FIREWALL_OUTBOUND_SUBNETS
+    covering the whole Docker bridge range. Without this an author could point an
+    <img> at an internal service; once the browser publishes /img/{sha256} they
+    could then read the response back off their own article page.
+
+    The three outcomes are not cosmetic. 'blocked' is a permanent property of the
+    URL and maps to 'dead'; 'unresolved' is a resolver having a bad minute and
+    must stay retryable, because a false 'dead' is the expensive mistake in this
+    project and DNS is exactly the kind of thing that fails transiently.
+
+    Residual, deliberately accepted: the address is checked before the fetch, so
+    a host that answers this lookup publicly and the fetch privately (DNS
+    rebinding) is not covered. Closing that needs connect-time pinning inside
+    curl_cffi, which is a larger change than the exposure warrants.
+    """
+    parts = urlsplit(normalise_url(url))
+    if parts.scheme.lower() not in _ALLOWED_SCHEMES:
+        return "blocked"
+    host = parts.hostname
+    if not host:
+        return "blocked"
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, None)
+    except socket.gaierror:
+        return "unresolved"
+    if not infos:
+        return "unresolved"
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return "blocked"
+        # is_global is False for loopback, link-local, private, reserved,
+        # multicast and CGNAT alike, which is exactly the set we refuse.
+        if not address.is_global:
+            return "blocked"
+    return "ok"
+
+
 async def capture_image(
     get_bytes: BytesGetter,
     root: pathlib.Path,
@@ -159,6 +208,12 @@ async def capture_image(
     the correct response to a full disk is to sleep with the row still queued,
     and only the loop can do that.
     """
+    verdict = await classify_url(source_url)
+    if verdict == "blocked":
+        log.warning("%s is not a publicly routable address, refusing", url_host(source_url))
+        return ImageOutcome(status="dead")
+    if verdict == "unresolved":
+        return ImageOutcome(status="error")
     try:
         status_code, data, mime = await get_bytes(normalise_url(source_url), max_bytes)
     except ImageTooLarge:

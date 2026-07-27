@@ -49,7 +49,7 @@ async def noop_sleep(_seconds):
 
 
 async def test_drains_the_queue_and_stores_bytes(pg, tmp_path, fake_pool):
-    await seed(pg, 1, ["https://a.example/1.png", "https://a.example/2.png"])
+    await seed(pg, 1, ["https://example.com/1.png", "https://example.com/2.png"])
 
     async def get_bytes(url, max_bytes):
         return 200, b"\x89PNG " + url.encode(), "image/png"
@@ -65,8 +65,8 @@ async def test_drains_the_queue_and_stores_bytes(pg, tmp_path, fake_pool):
 
 
 async def test_drains_newest_article_first(pg, tmp_path, fake_pool):
-    await seed(pg, 10, ["https://a.example/old.png"])
-    await seed(pg, 20, ["https://a.example/new.png"])
+    await seed(pg, 10, ["https://example.com/old.png"])
+    await seed(pg, 20, ["https://example.com/new.png"])
     order: list[str] = []
 
     async def get_bytes(url, max_bytes):
@@ -82,7 +82,7 @@ async def test_drains_newest_article_first(pg, tmp_path, fake_pool):
 
 
 async def test_a_dead_host_marks_dead_and_does_not_stop_the_batch(pg, tmp_path, fake_pool):
-    await seed(pg, 1, ["https://a.example/gone.png", "https://b.example/fine.png"])
+    await seed(pg, 1, ["https://example.com/gone.png", "https://example.net/fine.png"])
 
     async def get_bytes(url, max_bytes):
         if "gone" in url:
@@ -125,7 +125,7 @@ async def test_an_errored_image_is_retried_until_the_ceiling(pg, tmp_path, fake_
     be exercised. That interaction is real and wanted; it is just not what this
     test is about.
     """
-    await seed(pg, 1, ["https://a.example/flaky.png"])
+    await seed(pg, 1, ["https://example.com/flaky.png"])
     calls = {"n": 0}
 
     async def get_bytes(url, max_bytes):
@@ -156,7 +156,7 @@ async def test_a_host_having_a_bad_minute_does_not_burn_every_attempt(pg, tmp_pa
     storm or a brief tunnel blip therefore wrote off living images permanently,
     with no log line, because a clean 429 raises nothing.
     """
-    await seed(pg, 1, ["https://a.example/flaky.png"])
+    await seed(pg, 1, ["https://example.com/flaky.png"])
     calls = {"n": 0}
 
     async def get_bytes(url, max_bytes):
@@ -202,7 +202,7 @@ async def test_a_hanging_host_cannot_wedge_the_worker(pg, tmp_path, fake_pool):
     container reporting healthy, nothing collected for as long as it stayed up.
     A stuck fetch must cost one row, not the worker.
     """
-    await seed(pg, 1, ["https://hangs.example/1.png", "https://works.example/2.png"])
+    await seed(pg, 1, ["https://example.com/hangs-1.png", "https://example.net/works-2.png"])
 
     async def get_bytes(url, max_bytes):
         if "hangs" in url:
@@ -217,8 +217,8 @@ async def test_a_hanging_host_cannot_wedge_the_worker(pg, tmp_path, fake_pool):
     )
 
     rows = dict(await pg.fetch("SELECT source_url, status FROM article_images"))
-    assert rows["https://works.example/2.png"] == "ok", "the healthy image must still be collected"
-    assert rows["https://hangs.example/1.png"] == "error", (
+    assert rows["https://example.net/works-2.png"] == "ok", "the healthy image must still be collected"
+    assert rows["https://example.com/hangs-1.png"] == "error", (
         "a timeout is not evidence the image is gone, so it must stay retryable"
     )
 
@@ -233,7 +233,10 @@ async def test_a_slow_host_does_not_idle_the_rate_budget(pg, tmp_path, fake_pool
     load, so politeness is unchanged; what changes is that a slow host no longer
     spends everyone else's budget waiting.
     """
-    await seed(pg, 1, [f"https://h{i}.example/x.png" for i in range(8)])
+    # Three distinct real hosts, cycled: measured live, this is the actual split
+    # (39 of 50 rows on three hosts) — see _capture_batch's docstring.
+    hosts = ["example.com", "example.net", "example.org"]
+    await seed(pg, 1, [f"https://{hosts[i % 3]}/x{i}.png" for i in range(8)])
     in_flight = 0
     peak = 0
 
@@ -330,7 +333,9 @@ async def test_the_rate_token_is_taken_after_the_host_slot(tmp_path):
     async def noop(*a, **kw):
         return None
 
-    item = repo.PendingImage(article_id=1, position=0, source_url="https://a.example/x.png", attempts=0)
+    item = repo.PendingImage(
+        article_id=1, position=0, source_url="https://example.com/x.png", attempts=0
+    )
     original = repo.record_image_result, repo.save_image_blob
     repo.record_image_result, repo.save_image_blob = noop, noop
     try:
@@ -349,13 +354,13 @@ async def test_a_failing_host_is_held_off_while_others_keep_going(pg, tmp_path, 
     every batch was postimg at 20s each — 0.04 images/second while every other
     host answered in under a second.
     """
-    await seed(pg, 1, [f"https://bad.example/{i}.png" for i in range(4)])
-    await seed(pg, 2, [f"https://good.example/{i}.png" for i in range(4)])
+    await seed(pg, 1, [f"https://example.com/bad-{i}.png" for i in range(4)])
+    await seed(pg, 2, [f"https://example.net/good-{i}.png" for i in range(4)])
     attempted: list[str] = []
 
     async def get_bytes(url, max_bytes):
         attempted.append(url)
-        if "bad.example" in url:
+        if "bad-" in url:
             raise TimeoutError("stalled")
         return 200, b"\x89PNG ok", "image/png"
 
@@ -367,7 +372,7 @@ async def test_a_failing_host_is_held_off_while_others_keep_going(pg, tmp_path, 
         sleep=noop_sleep, max_cycles=6,
     )
 
-    bad_attempts = [u for u in attempted if "bad.example" in u]
+    bad_attempts = [u for u in attempted if "bad-" in u]
     assert len(bad_attempts) == 3, (
         f"the host should be left alone after 3 consecutive failures, got {len(bad_attempts)}"
     )
@@ -380,7 +385,7 @@ async def test_a_dead_link_is_an_answer_not_a_host_failure(pg, tmp_path, fake_po
     """A 404 means the host is working and the image is gone. Counting those as
     host failures would hold off exactly the hosts still answering — and old
     articles are full of dead links by design."""
-    await seed(pg, 1, [f"https://alive.example/{i}.png" for i in range(5)])
+    await seed(pg, 1, [f"https://example.com/alive-{i}.png" for i in range(5)])
 
     async def get_bytes(url, max_bytes):
         return 404, b"", None

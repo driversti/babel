@@ -4,8 +4,10 @@ import hashlib
 import pytest
 
 from babel.crawler.images import (
+    ImageOutcome,
     ImageTooLarge,
     capture_image,
+    classify_url,
     have_space,
     image_path,
     normalise_url,
@@ -83,12 +85,64 @@ def test_have_space_walks_up_to_an_existing_ancestor(tmp_path):
     assert not have_space(deep, 10**18)
 
 
+async def test_public_host_is_ok():
+    assert await classify_url("https://example.com/a.png") == "ok"
+
+
+async def test_non_http_scheme_is_blocked():
+    assert await classify_url("file:///etc/passwd") == "blocked"
+    assert await classify_url("ftp://example.com/a.png") == "blocked"
+
+
+async def test_loopback_is_blocked():
+    assert await classify_url("http://127.0.0.1/internal") == "blocked"
+    assert await classify_url("http://[::1]/internal") == "blocked"
+
+
+async def test_rfc1918_literal_is_blocked():
+    assert await classify_url("http://172.18.0.5:8080/internal") == "blocked"
+    assert await classify_url("http://192.168.10.18/internal") == "blocked"
+    assert await classify_url("http://10.0.0.1/internal") == "blocked"
+
+
+async def test_link_local_metadata_address_is_blocked():
+    assert await classify_url("http://169.254.169.254/latest/meta-data/") == "blocked"
+
+
+async def test_unresolvable_host_is_unresolved_not_blocked():
+    # A DNS failure is transient. Calling it 'blocked' would write a permanent
+    # 'dead' for an image that is merely behind a flaky resolver.
+    assert await classify_url("https://no-such-host.invalid/a.png") == "unresolved"
+
+
+async def test_capture_never_fetches_a_private_address(tmp_path):
+    calls = []
+
+    async def getter(url, max_bytes):
+        calls.append(url)
+        raise AssertionError("must not be called")
+
+    outcome = await capture_image(getter, tmp_path, "http://127.0.0.1/x.png", max_bytes=1024)
+    assert outcome == ImageOutcome(status="dead")
+    assert calls == []
+
+
+async def test_capture_marks_dns_failure_retryable(tmp_path):
+    async def getter(url, max_bytes):
+        raise AssertionError("must not be called")
+
+    outcome = await capture_image(
+        getter, tmp_path, "https://no-such-host.invalid/x.png", max_bytes=1024
+    )
+    assert outcome == ImageOutcome(status="error")
+
+
 async def test_capture_stores_a_live_image(tmp_path):
     async def get_bytes(url, max_bytes):
         return 200, b"\x89PNG fake", "image/png"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
     )
     assert outcome.status == "ok"
     assert outcome.mime == "image/png"
@@ -100,7 +154,7 @@ async def test_capture_marks_a_404_as_dead(tmp_path):
         return 404, b"", None
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/gone.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://example.com/gone.png", max_bytes=10_000
     )
     assert outcome.status == "dead"
     assert outcome.digest is None
@@ -111,7 +165,7 @@ async def test_capture_marks_a_non_image_response_as_dead(tmp_path):
         return 200, b"<html>parked domain</html>", "text/html"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
     )
     assert outcome.status == "dead"
 
@@ -123,7 +177,7 @@ async def test_capture_marks_a_410_as_dead(tmp_path):
         return 410, b"", None
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/gone.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://example.com/gone.png", max_bytes=10_000
     )
     assert outcome.status == "dead"
 
@@ -142,7 +196,7 @@ async def test_a_host_refusing_us_is_retryable_not_dead(tmp_path, status_code):
         return status_code, b"", "application/json"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
     )
     assert outcome.status == "error", f"{status_code} must stay retryable"
 
@@ -154,7 +208,7 @@ async def test_an_empty_200_is_retryable_not_dead(tmp_path):
         return 200, b"", "image/png"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
     )
     assert outcome.status == "error"
 
@@ -209,7 +263,7 @@ async def test_capture_stores_an_image_mislabelled_as_octet_stream(tmp_path):
         return 200, PNG, "application/octet-stream"
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
     )
     assert outcome.status == "ok"
     assert outcome.mime == "image/png", "the stored type must be the real one, not the claimed one"
@@ -221,7 +275,7 @@ async def test_capture_refuses_an_oversized_image(tmp_path):
         raise ImageTooLarge
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/big.png", max_bytes=1000
+        get_bytes, tmp_path, "https://example.com/big.png", max_bytes=1000
     )
     assert outcome.status == "error"
 
@@ -231,6 +285,6 @@ async def test_transport_failure_is_an_error_not_a_dead_link(tmp_path):
         raise TimeoutError("slow host")
 
     outcome = await capture_image(
-        get_bytes, tmp_path, "https://x.example/a.png", max_bytes=10_000
+        get_bytes, tmp_path, "https://example.com/a.png", max_bytes=10_000
     )
     assert outcome.status == "error"
