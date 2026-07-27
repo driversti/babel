@@ -101,12 +101,25 @@ def create_app(settings: Settings, pool: object | None = None) -> FastAPI:
         return "ok"
 
     def render_error(request: Request, status: int, heading: str, detail: str) -> HTMLResponse:
-        return app.state.templates.TemplateResponse(
+        response = app.state.templates.TemplateResponse(
             request=request,
             name="error.html",
             context={"heading": heading, "detail": detail, "settings": settings},
             status_code=status,
         )
+        # Normally security_headers adds these after call_next returns. But a
+        # handler registered for the bare Exception class runs inside
+        # ServerErrorMiddleware, which sits *outside* security_headers — its
+        # response never passes back through that middleware's post-call_next
+        # code. Setting them here too means every error page carries them
+        # regardless of which layer built it. setdefault for the CSP so a
+        # caller — task 12's image route — can still ask for something
+        # stricter than the site-wide default.
+        response.headers["X-Robots-Tag"] = "noindex, nofollow"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers.setdefault("Content-Security-Policy", CSP)
+        return response
 
     @app.exception_handler(404)
     async def not_found(request: Request, exc: Exception) -> HTMLResponse:
@@ -121,6 +134,21 @@ def create_app(settings: Settings, pool: object | None = None) -> FastAPI:
         return render_error(
             request, 503, "The archive is unavailable",
             "The database is not answering. This is usually brief.",
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled_error(request: Request, exc: Exception) -> HTMLResponse:
+        # Anything not caught above is a bug, not an expected failure mode.
+        # FastAPI/Starlette pull a handler registered for the bare Exception
+        # class out of the usual per-route dict and hand it to
+        # ServerErrorMiddleware itself (Starlette.build_middleware_stack), so
+        # this one runs at the outermost layer instead of being skipped —
+        # without it, this exact case reaches Starlette's own fallback, which
+        # is a bare "Internal Server Error" with none of the headers below.
+        log.exception("unhandled error serving %s", request.url.path)
+        return render_error(
+            request, 500, "Something went wrong",
+            "An unexpected error occurred. This is usually brief.",
         )
 
     from babel.web.routes import register_routes  # noqa: PLC0415 — avoids a cycle
