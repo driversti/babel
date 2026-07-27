@@ -187,6 +187,17 @@ HOSTILE = [
     '<ol><li formaction="/x">item</li></ol>',
     '<h2 onclick="alert(1)">H2</h2><h4 onclick="alert(1)">H4</h4>'
     '<h5 onclick="alert(1)">H5</h5><h6 onclick="alert(1)">H6</h6>',
+    # Closes the "span" half of the gap the comment above used to leave open.
+    # This sweep always calls render_body(raw, {}) -- an empty image map --
+    # so every <img> in it takes the missing-image placeholder path, never
+    # the "ok" branch; "img" itself stays excluded below for that reason,
+    # since its src is always this module's own literal (a hex digest), never
+    # attacker-controlled, and no HOSTILE shape can reach it. The placeholder
+    # path DOES put author bytes into an attribute -- the "original" link's
+    # href, built from source_url -- so this entry targets exactly that: a
+    # quoted attribute-breakout attempt inside an <img src>, the same shape
+    # already proven safe for <a href> above.
+    '<p><img src="https://evil.example/x.png&quot; onmouseover=&quot;alert(3)"></p>',
 ]
 
 
@@ -217,11 +228,17 @@ def test_hostile_input_sweep_actually_exercises_attributes():
     the whole suite -- it could not have caught a hostile byte breaking out
     of the one attribute an author's bytes actually reach, an href.
 
-    The tag check is pinned to every EMITTED_TAGS member this task can
-    actually reach -- everything except "img" and "span", which stay
-    unreachable until Task 5 renders a real <img> and its own
-    "missing-image" <span>. Asserting the full reachable set, not a handful
-    of representative tags, is what turns "the sweep observes most of
+    The tag check is pinned to every EMITTED_TAGS member this sweep can
+    actually reach. Task 5 closed the "span" half of what used to be excluded
+    here by adding a HOSTILE case whose image has no queue row, so it takes
+    the missing-image placeholder path and emits a real
+    <span class="missing-image">. "img" stays excluded on purpose, not by
+    omission: every case in HOSTILE renders through render_body(raw, {}), an
+    empty image map, so no case can ever reach the "ok" branch that emits a
+    real <img> -- and that branch's only attribute value (a hex digest this
+    module computes itself) never carries author bytes anyway, so excluding
+    it costs this test nothing. Asserting the full reachable set, not a
+    handful of representative tags, is what turns "the sweep observes most of
     EMITTED_TAGS" from a one-time review finding into something a later
     change can't quietly regress.
     """
@@ -235,7 +252,7 @@ def test_hostile_input_sweep_actually_exercises_attributes():
             seen_tags.add(node.tag)
             seen_attrs.update(node.attributes)
     assert seen_attrs, "no HOSTILE payload emitted any attribute"
-    assert (EMITTED_TAGS - {"img", "span"}) <= seen_tags
+    assert (EMITTED_TAGS - {"img"}) <= seen_tags
 
 
 def test_an_image_with_a_disallowed_scheme_is_dropped_before_task_5_sees_it():
