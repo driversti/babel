@@ -17,6 +17,8 @@ body, `<br>` for line breaks, a run of two or more for a paragraph, and `<q
 class="emoji ...">` around emoji. See SPEC.md.
 """
 
+import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -25,6 +27,8 @@ from markupsafe import Markup, escape
 from selectolax.parser import HTMLParser, Node
 
 from babel.db.browse import ImageState
+
+log = logging.getLogger(__name__)
 
 # Source tag -> the tag we emit. The only source of tag names in the output.
 KEPT: dict[str, str] = {
@@ -71,6 +75,72 @@ ALLOWED_ATTRIBUTES: frozenset[str] = frozenset({
 # selectolax parses arbitrarily deep markup; a recursive emitter would exhaust
 # the stack on it. See _convert for why the remedy is flattening, not unwrapping.
 MAX_DEPTH = 100
+
+# selectolax's parse is quadratic in nesting depth. Measured against a body at
+# crawler/parser.py's 1,000,000-character ceiling: 17,662 ms nested 90,909 deep,
+# against 7.9 ms at depth 1,000 and 51.2 ms for a flat 1 MB of <p> siblings. The
+# route handlers are `async def`, so one such render stalls the whole web
+# process's event loop -- /healthz with it, which reads to an operator as the
+# database being down rather than as one bad article.
+#
+# 1,000 is ten times MAX_DEPTH, past which _convert flattens a subtree to its
+# text anyway, so a refused body loses nothing a reader would have seen: the
+# route falls back to `articles.body`, which holds every word regardless.
+MAX_NESTING = 1000
+
+# Below this the scan is skipped, because nesting cannot cost anything at this
+# size: a 32 KiB body nested as deeply as its own length permits (depth 2,978)
+# parses in 19.5 ms, and 16 KiB in 5.3 ms. The average archived body is 3.4 KB
+# (SPEC.md), so in practice the scan never runs. It is not free -- 79 ms over a
+# flat 1 MB document -- which is exactly why it is gated on size.
+GUARD_MIN_BYTES = 32 * 1024
+
+# HTML5's void elements. A naive counter that treats every `<tag` as a descent
+# would refuse a flat run of <br>, which the archive is full of.
+_VOID_ELEMENTS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+})
+
+_TAG_RE = re.compile(r"""<(/?)([a-zA-Z][a-zA-Z0-9]*)((?:[^>"']|"[^"]*"|'[^']*')*)>""")
+
+
+def _too_deeply_nested(raw: str) -> bool:
+    """A cheap upper bound on nesting, without parsing.
+
+    Deliberately approximate: it counts what the markup *says*, not what an
+    HTML5 tree builder would make of it. Over-counting only costs a body the
+    plain-text fallback; under-counting is impossible, because every descent the
+    parser makes is an open tag here too.
+
+    A trailing "/" on the tag (`<div/>`) is NOT treated as self-closing here,
+    on purpose, for anything outside `_VOID_ELEMENTS`. HTML5 has no general
+    self-closing syntax -- the trailing slash is only meaningful on a void
+    element, where it is a no-op, and is otherwise ignored by a conformant
+    parser, which still opens a real, nested element. Verified directly
+    against selectolax: 2,000 consecutive `<div class="x"/>` (no closing
+    tags at all) parse to an actual tree 2,000 levels deep, identically to
+    the same input without the slashes -- so treating the slash as closing
+    the tag here would have under-counted exactly the shape this guard
+    exists to catch, silently reopening the DoS this task closes for any
+    tag an attacker writes with a trailing "/". `<img src="x"/>` still
+    costs nothing, because `img` is void regardless of how it is spelled --
+    confirmed the same way, depth 2 either with or without the slash -- so
+    this is not a case the archive's own image markup depends on.
+    """
+    if len(raw) < GUARD_MIN_BYTES:
+        return False
+    depth = 0
+    for match in _TAG_RE.finditer(raw):
+        closing, name = match.group(1), match.group(2).lower()
+        if closing:
+            depth = max(0, depth - 1)
+        elif name not in _VOID_ELEMENTS:
+            depth += 1
+            if depth > MAX_NESTING:
+                return True
+    return False
+
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 _VOID = frozenset({"br", "img"})
@@ -441,7 +511,10 @@ def _image_urls(items: Sequence[object]) -> set[str]:
     return found
 
 
-def render_body(raw: str, images: Mapping[str, ImageState]) -> RenderedBody:
+def render_body(raw: str, images: Mapping[str, ImageState]) -> RenderedBody | None:
+    if _too_deeply_nested(raw or ""):
+        log.warning("refusing to render a body nested past %d", MAX_NESTING)
+        return None
     tree = HTMLParser(raw or "")
     # Remove every DROPPED subtree once, before the walk, rather than
     # relying only on the per-node check inside _convert. The depth

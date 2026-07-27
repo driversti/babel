@@ -12,7 +12,15 @@ import pytest
 from selectolax.parser import HTMLParser
 
 from babel.db.browse import ImageState
-from babel.web.markup import ALLOWED_ATTRIBUTES, EMITTED_TAGS, Image, _convert, render_body
+from babel.web.markup import (
+    ALLOWED_ATTRIBUTES,
+    EMITTED_TAGS,
+    GUARD_MIN_BYTES,
+    MAX_NESTING,
+    Image,
+    _convert,
+    render_body,
+)
 
 FIXTURES = pathlib.Path(__file__).parent.parent / "fixtures"
 
@@ -645,3 +653,125 @@ def test_anchor_unwrap_examines_every_image_not_just_the_first_one_it_meets():
     out = str(render_body(raw, images).html)
     assert 'href="https://src.example/"' not in out
     assert out.count("<a ") == 1
+
+
+def test_a_body_nested_past_the_limit_is_refused_rather_than_parsed():
+    """Padded past the brief's own literal shape: at depth MAX_NESTING + 50,
+    plain <div>...</div> nesting is only ~11.3 KB (5 + 6 bytes per level),
+    nowhere near GUARD_MIN_BYTES (32 KiB) -- reaching 32 KiB through pure div
+    nesting alone needs a depth around 2,979. The brief's own version of this
+    test asserted `len(raw) > GUARD_MIN_BYTES` against exactly that shape and
+    fails: 11,554 is not greater than 32,768. Confirmed directly rather than
+    assumed. The inert text padding (no tags, so it cannot change the depth
+    count) pushes the body over the size floor while leaving the nesting
+    depth at MAX_NESTING + 50, which is the boundary this test exists to
+    check.
+    """
+    n = MAX_NESTING + 50
+    raw = "<div>" * n + "text" + ("z" * 25_000) + "</div>" * n
+    assert len(raw) > GUARD_MIN_BYTES          # the guard only runs above this
+    assert render_body(raw, {}) is None
+
+
+def test_a_body_within_the_limit_still_renders():
+    """Padded for the same reason as the refusal test above: at depth
+    MAX_NESTING - 50, plain div nesting is only ~10.5 KB, under
+    GUARD_MIN_BYTES -- so the brief's literal version of this test never
+    actually reaches `_too_deeply_nested`'s scanning loop at all; the size
+    check returns False before any tag is counted, and the test would pass
+    identically even if the depth-counting logic were entirely broken. The
+    padding makes the guard's scan actually run and correctly clear a body
+    that is large but not too deep.
+    """
+    n = MAX_NESTING - 50
+    raw = "<div>" * n + "<p>text</p>" + ("z" * 25_000) + "</div>" * n
+    assert len(raw) > GUARD_MIN_BYTES
+    rendered = render_body(raw, {})
+    assert rendered is not None
+    assert "text" in str(rendered.html)
+
+
+def test_a_small_body_is_never_refused_however_nested():
+    """Below GUARD_MIN_BYTES the guard does not run, because it cannot matter.
+
+    Measured: a 32 KiB body nested as deeply as its own length allows (depth
+    2,978) parses in 19.5 ms, and the average archived body is 3.4 KB. Paying a
+    scan on every article to bound a cost that small would be the wrong trade.
+
+    Strengthened past the brief's own n=400: at that depth, `_too_deeply_
+    nested`'s scan -- if it ran at all -- would report "not too deep" anyway,
+    since 400 never gets near MAX_NESTING (1000). So the brief's version of
+    this test cannot tell "the size gate correctly skipped the scan" from "the
+    scan ran and correctly said no", and mutating away the size gate entirely
+    (`if len(raw) < GUARD_MIN_BYTES: return False` deleted) leaves it green.
+    Confirmed directly. Depth here is MAX_NESTING + 50 -- past the ceiling a
+    body this size can never reach in real HTML anyway (11 bytes/level of
+    plain <div> puts 1,050 levels at ~11.5 KB, well under the 32 KiB floor) --
+    so a body that really would be refused if it were bigger is asserted NOT
+    refused purely because it stays under the floor: the case the size gate
+    exists for. That combination is what makes this version fail if the size
+    gate is removed: the scan then finds depth 1,050 > MAX_NESTING and refuses
+    it, flipping `rendered is not None` to False.
+    """
+    n = MAX_NESTING + 50
+    raw = "<div>" * n + "deep" + "</div>" * n
+    assert len(raw) < GUARD_MIN_BYTES
+    assert n > MAX_NESTING              # past the depth ceiling, just too small to cost anything
+    rendered = render_body(raw, {})
+    assert rendered is not None
+    assert "deep" in str(rendered.html)
+
+
+def test_void_and_self_closing_tags_do_not_inflate_the_depth_count():
+    """200k <br> is a flat document, not a 200k-deep one.
+
+    A naive '<' counter would refuse this. The archive is full of <br> runs --
+    one fixture has 76 in a single body -- so a false refusal here would drop
+    real articles to the plain-text fallback.
+    """
+    raw = "<p>" + "<br>" * 60_000 + "x</p>"
+    assert len(raw) > GUARD_MIN_BYTES
+    rendered = render_body(raw, {})
+    assert rendered is not None
+    assert "x" in str(rendered.html)
+
+    # img is void, so a trailing "/" is a no-op either way -- this exercises
+    # _VOID_ELEMENTS membership, not any special handling of the slash itself.
+    raw = "<p>" + '<img src="https://h/a.png"/>' * 3_000 + "y</p>"
+    assert len(raw) > GUARD_MIN_BYTES
+    assert render_body(raw, {}) is not None
+
+
+def test_a_self_closed_non_void_tag_still_counts_toward_depth():
+    """A trailing "/" on a non-void tag is not self-closing in HTML5, and an
+    earlier version of `_too_deeply_nested` treated it as if it were --
+    `elif name not in _VOID_ELEMENTS and not rest.rstrip().endswith("/")` --
+    which under-counted exactly the shape this guard exists to catch.
+
+    Confirmed directly against selectolax, not assumed: 2,000 consecutive
+    `<div class="x"/>` with no closing tags at all parse to a real tree
+    2,000 levels deep, identically to the same input with the slashes
+    removed -- a conformant HTML5 parser only treats the trailing slash as
+    a no-op on a void element (img, br, ...) and otherwise ignores it,
+    still opening a real, nested element. The version with the self-closing
+    exemption let this exact input through as "not too deeply nested" while
+    selectolax's own parse was genuinely 2,000 deep -- reopening the DoS
+    this task exists to close for any tag an attacker spells with a
+    trailing slash. Mutation check: restoring
+    `and not rest.rstrip().endswith("/")` to the guard's condition turns
+    this from PASS to FAIL (rendered is not None instead of None), which is
+    what makes this test capable of catching a regression back to it.
+    """
+    n = MAX_NESTING + 50
+    raw = "<p>" + '<div class="x"/>' * n + "DEEP" + ("z" * 25_000) + "</p>"
+    assert len(raw) > GUARD_MIN_BYTES
+    assert render_body(raw, {}) is None
+
+
+def test_the_pathological_body_renders_in_well_under_a_second():
+    """The whole point. Without the guard this exact input takes ~17.7 s."""
+    n = 1_000_000 // 11
+    raw = "<div>" * n + "x" + "</div>" * n
+    start = time.perf_counter()
+    assert render_body(raw, {}) is None
+    assert time.perf_counter() - start < 1.0

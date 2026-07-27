@@ -1,5 +1,7 @@
 import datetime
 
+from babel.web.markup import MAX_NESTING
+
 UTC = datetime.UTC
 
 
@@ -355,3 +357,32 @@ async def test_an_empty_rendered_body_does_not_falsely_flag_the_gallery(client, 
     body = (await client.get("/article/2110")).text
     assert 'class="body-text"' in body
     assert "no longer in the article" not in body
+
+
+async def test_a_comment_nested_past_the_limit_falls_back_to_plain_text(client, pool):
+    """render_body returns None for a body nested past MAX_NESTING (Task 11).
+
+    The route used to build comment_html unconditionally --
+    `render_body(c.body_raw, {}).html` -- so a single deeply-nested COMMENT
+    body raised AttributeError on the None and 500'd the whole article page,
+    not just that one comment. article.html's `comment_html.get(c.id)`
+    already falls back to the comment's own plain-text `body` when the id is
+    missing from the dict -- the same path a comment with no body_raw at all
+    takes (see test_comments_render_with_depth_and_removed_markers) -- so the
+    fix only has to omit a None render from the dict rather than store one;
+    no template change was needed. The article's own body is untouched by
+    this fixture (plain default text, no body_raw), isolating this to the
+    comment path the bug was in.
+    """
+    await _article(pool, 2111, comment_count=1)
+    nested = "<div>" * (MAX_NESTING + 50) + "text" + ("z" * 25_000) + "</div>" * (MAX_NESTING + 50)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO comments (id, article_id, position, depth, author_name,
+                                     body, body_raw)
+               VALUES (92, 2111, 0, 0, 'bob', 'plain fallback text', $1)""",
+            nested,
+        )
+    response = await client.get("/article/2111")
+    assert response.status_code == 200
+    assert "plain fallback text" in response.text

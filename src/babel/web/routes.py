@@ -330,8 +330,18 @@ def register_routes(app: FastAPI) -> None:
             counts = await browse.image_status_counts(conn, article_id)
 
         rendered = render_body(detail.body_raw, image_map) if detail.body_raw else None
+        # render_body returns None for a body nested past MAX_NESTING (Task 11):
+        # a comment section holds one render per comment, so one hostile comment
+        # among many real ones must degrade only that comment, not crash the
+        # whole article page the way an unguarded `.html` would. A comment
+        # missing from this dict falls back to its stored plain text, the exact
+        # path `c.body_raw` being falsy already takes -- article.html tests
+        # `comment_html.get(c.id)`, not membership, so simply omitting the entry
+        # is enough; no sentinel value is needed.
         comment_html = {
-            c.id: render_body(c.body_raw, {}).html for c in comments if c.body_raw
+            c.id: rendered_comment.html
+            for c in comments
+            if c.body_raw and (rendered_comment := render_body(c.body_raw, {})) is not None
         }
 
         # With markup, every image the article still cites is shown in place, so
