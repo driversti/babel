@@ -911,6 +911,92 @@ def test_an_unbalanced_quote_cannot_swallow_the_rest_of_the_document(quote):
     assert render_body(raw, {}) is None
 
 
+@pytest.mark.parametrize("tag", ["div", "i", "b"])
+def test_a_close_tag_inside_a_comment_cannot_defeat_the_depth_counter(tag):
+    """Found in review, round 5, pre-existing since the very first version
+    of `_TAG_RE` (not introduced by any of the previous four fixes):
+    `_TAG_RE` has no notion of an HTML comment. `<!--` never matched as an
+    opener, but a close tag written *inside* a comment -- `</div>` in
+    `"<div><!--</div>-->"` -- matched as a real close, and matched the TOP
+    of the stack exactly, so the round-2 "pop only the top" rule gave it no
+    protection at all: from the regex's point of view there was nothing to
+    distinguish a real close from one sitting inside comment data. The real
+    tokenizer treats the whole `<!-- ... -->` span as comment content start
+    to finish; the `<div>` just before it is never closed by anything
+    inside. Measured before the fix: `"<div><!--</div>-->" * 55555`
+    (999,990 B) rendered -- not refused -- in 6,443 ms, counted depth
+    peaking at 1 (open, immediately "closed" by the fake close every
+    iteration) while real depth reached 55,557.
+
+    Fixed by walking the string with an explicit position pointer instead
+    of handing the whole document to `finditer` as one flat sequence of
+    tag-shaped substrings: on `<!--`, the scan jumps straight past the
+    matching `-->` without looking at anything in between, so a close tag
+    written inside a comment is never even offered to the tag matcher.
+    """
+    raw = f"<{tag}><!--</{tag}>-->" * 20_000
+    assert len(raw) > GUARD_MIN_BYTES
+    assert render_body(raw, {}) is None
+
+
+def test_an_unterminated_comment_swallows_everything_after_it():
+    """An unterminated `<!--` is exactly like EOF-inside-a-comment to the
+    real HTML5 tokenizer: once in the comment state with no closing `-->`
+    anywhere in the rest of the document, every remaining character is
+    comment data, and tokenization simply ends -- no further tag, real or
+    fake, is ever recognised again. So the ~90,909-deep nesting run this
+    module's own pathological-body test uses is, placed after an
+    unterminated comment, not an attack at all: there is nothing left for
+    the real parser to nest through.
+
+    This isn't merely the safe guess -- confirmed directly against
+    selectolax: the real parse of this exact body takes ~3 ms, not ~17.7 s,
+    because the "nesting" after the unterminated comment is comment data to
+    selectolax too, never real elements. Refusing this body would be a
+    false positive, not a safety margin, so `render_body` must NOT refuse
+    it: the guard's own scan stops at the unterminated `<!--` (nothing past
+    it is real, so nothing past it needs scanning), leaving the small,
+    genuinely-nested prefix -- one `<p>`, opened and closed -- as the only
+    thing that was ever counted.
+    """
+    n = 1_000_000 // 11
+    raw = "<p>hello</p>" + "<!--" + ("<div>" * n) + "x" + ("</div>" * n)
+    assert len(raw) > GUARD_MIN_BYTES
+    assert "-->" not in raw  # genuinely unterminated, not accidentally closed
+    rendered = render_body(raw, {})
+    assert rendered is not None
+    assert "hello" in str(rendered.html)
+
+
+def test_a_doctype_declaration_does_not_confuse_the_depth_counter():
+    """`<!doctype html>` (and any other `<!...>` that isn't a real comment)
+    is a bogus-comment-state markup declaration to the tokenizer -- it runs
+    to the next `>` and nothing inside is a tag. A scan that didn't skip it
+    as a unit could, in principle, misread characters inside it as tag
+    syntax; asserting the legitimate body after it still renders is the
+    regression guard for that.
+    """
+    raw = "<!doctype html>" + "<p>" + ("x" * 40_000) + "</p>"
+    assert len(raw) > GUARD_MIN_BYTES
+    rendered = render_body(raw, {})
+    assert rendered is not None
+    assert "x" in str(rendered.html)
+
+
+def test_a_processing_instruction_does_not_confuse_the_depth_counter():
+    """`<?x?>` is a bogus comment to an HTML5 tokenizer (there is no XML
+    processing-instruction state in HTML parsing) -- it runs to the next
+    `>` the same as a stray `<!...>` does. The `?` inside it must not be
+    mistaken for anything tag-shaped, and the legitimate body after it must
+    still render.
+    """
+    raw = "<?x?>" + "<p>" + ("y" * 40_000) + "</p>"
+    assert len(raw) > GUARD_MIN_BYTES
+    rendered = render_body(raw, {})
+    assert rendered is not None
+    assert "y" in str(rendered.html)
+
+
 def test_the_pathological_body_renders_in_well_under_a_second():
     """The whole point. Without the guard this exact input takes ~17.7 s."""
     n = 1_000_000 // 11

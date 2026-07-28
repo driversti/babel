@@ -97,7 +97,9 @@ MAX_NESTING = 1000
 # budget this guard exists to protect, which is what makes the floor safe --
 # just not free. 16 KiB nested (div) is 5.3 ms. The average archived body is
 # 3.4 KB (SPEC.md), so in practice the scan never runs. The scan itself is
-# not free either -- 69 ms over a flat 1 MB document -- which is exactly why
+# not free either -- ~94 ms over a flat 1 MB document (round 5 traded some of
+# this for correctness: the position-walking scan that skips comment spans
+# costs more per tag than the `finditer` it replaced) -- which is exactly why
 # it is gated on size rather than run unconditionally.
 GUARD_MIN_BYTES = 32 * 1024
 
@@ -121,7 +123,7 @@ def _too_deeply_nested(raw: str) -> bool:
     choice below is made to never under-count, even at the cost of sometimes
     over-counting a body that would actually have parsed cheaply.
 
-    This function has been wrong four times before landing on the rule
+    This function has been wrong five times before landing on the rule
     below, and every one of those times was a *clever* attempt to track HTML5
     tree construction more exactly. Read this history before changing
     anything here again:
@@ -187,6 +189,35 @@ def _too_deeply_nested(raw: str) -> bool:
        that split is an *extra* phantom open or close, which can only ever
        grow the counted depth, never shrink it. Over-counting, the safe
        side, again.
+    5. Pre-existing since the very first version, same as (3): `_TAG_RE` has
+       no notion of an HTML comment. `<!--` does not itself match as an
+       opener, but a `</div>` sitting *inside* a comment matched as a real
+       close -- and matched the TOP of the stack exactly, so the round-2
+       "pop only the top" rule gave it no protection at all, because from
+       the regex's point of view there was nothing to tell it the close
+       wasn't real. The tokenizer treats the whole `<!-- ... -->` span as
+       comment data start to finish; the `<div>` just before it is never
+       closed by anything inside. `"<div><!--</div>-->" * 55555`
+       (999,990 B): counted depth peaked at 1 (open, immediately "closed"
+       by the fake close every iteration) while real depth reached 55,557.
+       Measured 6,443 ms unrefused; also reproduced with `<i>` and `<b>` at
+       ~3.4 s.
+       Fixed by no longer treating the whole document as one flat sequence
+       of tag-shaped substrings for `finditer` to find. `_too_deeply_
+       nested` now walks the string with an explicit position pointer:
+       on `<!--`, it jumps straight to just past the matching `-->` without
+       looking at anything in between (an unterminated `<!--` makes it stop
+       scanning entirely, since the tokenizer treats the rest of the
+       document as comment data too and nothing after it can be a real tag
+       either); on `<!` or `<?` that isn't a comment start (a DOCTYPE, a
+       processing instruction, any bogus-comment-state markup declaration),
+       it skips to just past the next `>`, the same way the tokenizer's
+       bogus comment state does, treating everything in between as inert
+       either way. Counting *nothing* inside these spans is not merely the
+       safe choice, it is the exact match for the tokenizer: neither a real
+       open nor a real close ever occurs inside a comment or a bogus
+       comment, so this is one of the few places in this function where
+       "crude" and "correct" happen to be the same rule.
 
     **The rule that actually holds, this time because it stops trying to be
     exact: pop only when a close matches the TOP of the stack. Never search
@@ -235,7 +266,34 @@ def _too_deeply_nested(raw: str) -> bool:
     if len(raw) < GUARD_MIN_BYTES:
         return False
     stack: list[str] = []
-    for match in _TAG_RE.finditer(raw):
+    length = len(raw)
+    pos = 0
+    while True:
+        lt = raw.find("<", pos)
+        if lt == -1:
+            break
+        if raw.startswith("<!--", lt):
+            end = raw.find("-->", lt + 4)
+            if end == -1:
+                # Unterminated: the tokenizer treats everything from here to
+                # EOF as comment data too, so there is no real tag left to
+                # find -- stop scanning rather than keep looking for one.
+                break
+            pos = end + 3
+            continue
+        if lt + 1 < length and raw[lt + 1] in "!?":
+            # A DOCTYPE, a processing instruction, or any other bogus
+            # comment -- the tokenizer runs to the next '>' in all of these
+            # states and nothing in between is a tag, opening or closing.
+            gt = raw.find(">", lt)
+            if gt == -1:
+                break  # runs to EOF the same way an unterminated comment does
+            pos = gt + 1
+            continue
+        match = _TAG_RE.match(raw, lt)
+        if match is None:
+            pos = lt + 1
+            continue
         closing, name = match.group(1), match.group(2).lower()
         if closing:
             if stack and stack[-1] == name:
@@ -246,6 +304,7 @@ def _too_deeply_nested(raw: str) -> bool:
             stack.append(name)
             if len(stack) > MAX_NESTING:
                 return True
+        pos = match.end()
     return False
 
 
