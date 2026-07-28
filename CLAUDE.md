@@ -123,34 +123,32 @@ article walk produces, so `article_images` still grows. Four separate causes wer
 (see the commits) and the queue is no longer growing for a *broken* reason — but whether the drain
 keeps up over a month is unmeasured. Watch the pending count and `docker compose logs images`.
 
-Not from either review, found during Task 11's own review rounds (the markup render guard) rather
-than live, and not yet resolved:
+Found during Task 11's own review rounds (the markup render guard) rather than live, and now closed
+by the whole-branch review's fix wave — see
+`.superpowers/sdd/2026-07-27-article-markup/final-fix-report.md` for the full measurements and
+mutation results:
 
-- **The render cap's value admits a body over its own budget.** `MAX_MARKUP_BYTES`
-  (`src/babel/web/markup.py`) is 64 KiB, and a body of exactly 65,536 code points built from
-  four-byte list elements (`<ul>`, `<ol>`, `<dd>`, `<dt>`, `<li>`) interleaved with `<a>`/`<nobr>`
-  renders in **1,215 ms** — over the 1 s budget the cap exists to enforce. Cost is roughly quadratic
-  in size: 32 KiB → 307 ms, 40 → 478, 48 → 687, 56 → 932, 64 → 1,216 (independently reproduced at
-  308/686/1,234). The value that shipped was chosen against a 354 ms figure that only searched
-  five-byte-per-level shapes (`<div>`); the four-byte list elements above are not scope boundaries,
-  so each additionally triggers HTML5's "have a p element in button scope" walk over the whole
-  open-element stack — plain `<ul>` × 16,384 alone costs 580 ms. The remedy is a one-line constant,
-  `MAX_MARKUP_BYTES = 32 * 1024`, restoring the ~350 ms margin the current value was believed to
-  have. Deliberately not applied yet: the branch is unmerged, so nothing is at risk while it waits
-  for a decision, and 32 vs. 64 KiB is a real trade — worst-case event-loop time against how many
-  long articles keep their formatting.
-- **The cap's own test doesn't cover the shape above.** `tests/web/test_markup.py`'s timing test
-  pins the cap's value using the `<div>` shape (356 ms, 2.8x headroom) while its own docstring calls
-  that "the single worst shape measured across every round." It cannot fail for an over-large cap,
-  which is why 64 KiB survived to be committed. Whatever resolves the finding above should also
-  swap this test's unit string to the `<ol>`-family shape that actually reaches the worst measured
-  cost.
-- **The cap bounds one body, not one request.** `render_body` runs once per article body and once
-  per comment, inside a single `async def` route handler, and `get_comments` has no `LIMIT` — so a
-  page's total render cost is the sum of every capped body on it, not the cap itself. Measured: one
-  body plus four comments, all at the cap, is **6.11 s** of event-loop stall from a single GET,
-  which takes `/healthz` down with it too. Closing it needs a per-request budget, a comment `LIMIT`,
-  or moving the render off the loop — a design decision, not a constant.
+- **The render cap's value is settled at 32 KiB, not 64.** `MAX_MARKUP_BYTES`
+  (`src/babel/web/markup.py`) shipped at 64 KiB against a 354 ms figure that only searched
+  five-byte-per-level shapes (`<div>`, `<dir>`); it missed that four-byte list elements (`<ul>`,
+  `<ol>`, `<dd>`, `<dt>`, `<li>`) reach 16,384 levels in the same space instead of 13,107 and are not
+  scope boundaries, so each additionally triggers HTML5's "have a p element in button scope" walk —
+  and that `<a>`/`<nobr>` stack adoption-agency walks on top of that. The hill-climbed worst shape
+  found this way, `"<ol><ol><dd><ol><li><ul><a><ol><nobr><ul>"`, measured **1,215 ms** at 64 KiB —
+  over the 1 s budget the cap exists to enforce — and ~308 ms at the new 32 KiB, restoring the
+  margin the old value was believed to have.
+- **The cap's own test now covers that shape.** `tests/web/test_markup.py`'s timing test pinned the
+  cap's value using `<div>` (356 ms, 2.8x headroom) while calling it "the single worst shape measured
+  across every round" — it could not fail for an over-large cap, which is how 64 KiB survived to be
+  committed. It now uses the hill-climbed shape above; killed by mutation, it fails at 64 KiB and
+  passes at 32 KiB.
+- **The cap is now per request, not just per body.** `render_body` still runs once per article body
+  and once per comment inside a single `async def` route handler, with no `LIMIT` on `get_comments`
+  — but `web/routes.py`'s `article` route now accumulates elapsed render time across the whole
+  handler and stops calling `render_body` once `_RENDER_BUDGET_SEC` (1.0 s) is spent. The article
+  renders first and unconditionally, so a hostile comment thread can only cost the *comments* their
+  markup, never the article's own. Ten comments at the cap measured 3.4 s unbounded before this fix
+  and ~1.0-1.3 s after, regardless of comment count.
 
 ## Operating the live run
 
@@ -177,6 +175,16 @@ docker compose run --rm crawler babel migrate
 docker compose build web
 docker compose up -d crawler images web
 ```
+
+**Rolling the crawler back after migration 007 leaves `body_raw` stale beside a freshly-updated
+`body`.** A rollback reverts the application image, not the schema — migration 007's `body_raw`
+column stays on the table regardless. The pre-`feat/article-markup` `save_article` never mentions
+that column, so its `ON CONFLICT ... DO UPDATE SET` has no `body_raw = EXCLUDED.body_raw` clause in
+it: any article or comment the rolled-back crawler re-fetches (a re-poll, a sweep, a manual
+`refetch`) gets `body` refreshed to the newer plain text while `body_raw` is left exactly as it was
+at the moment of the rollback — increasingly out of step with the `body` sitting next to it, for as
+long as the rollback lasts. Nothing crashes and nothing is lost; the two columns simply stop
+agreeing until the crawler is rolled forward again.
 
 **Two things gate the site being reachable, and both come before the hostname exists, not after.**
 The runbook for each is in README.md under "One-time setup"; they are named here because CLAUDE.md
@@ -221,14 +229,16 @@ it never reads the markup at all: it is the one bound in this function's history
 shape cannot defeat. The full account is in `docs/superpowers/plans/2026-07-27-article-markup.md`'s
 Task 11 section and the comment above `MAX_MARKUP_BYTES` itself.
 
-The cap's byte value is under review, not settled: a later measurement found a list-heavy shape
-(rather than plain nesting) that renders in 1,215 ms at the current 64 KiB, over the 1 s budget the
-guard exists to enforce, and 32 KiB has been measured as restoring the margin — but the constant has
-not been changed pending that review. Do not treat 64 KiB as a proven worst case in anything you write
-or build against it. The cap is also per body, not per request: one article page renders the article
-plus every comment, each checked against the cap independently, in a single `async` handler with no
-`LIMIT` on comments — so a page with enough comments can still stall the event loop for seconds even
-though every individual body stayed under the cap.
+The cap's byte value is settled at 32 KiB, not 64: a list-heavy shape (rather than plain nesting),
+`"<ol><ol><dd><ol><li><ul><a><ol><nobr><ul>"`, renders in 1,215 ms at the old 64 KiB — over the 1 s
+budget the guard exists to enforce — and ~308 ms at the current 32 KiB, which is why the constant
+moved. Do not treat either figure as a proven worst case without re-measuring first: the 64 KiB
+value was itself believed safe on the strength of a search that only tried five-byte-per-level
+shapes, and missed this one. The cap is also now per request, not just per body:
+`web/routes.py`'s `article` route accumulates render time across the article body and every comment
+inside the same `async` handler and stops calling `render_body` once `_RENDER_BUDGET_SEC` (1.0 s) is
+spent, so a page with many comments no longer stalls the event loop for the sum of all of them — see
+`.superpowers/sdd/2026-07-27-article-markup/final-fix-report.md` for the measurements.
 
 **The deploy host tracks `main`, and `main` is where work happens.** Phase 1 was built on
 `feat/phase-1-crawler` and fast-forwarded in; that branch is history now. Anything pushed to `main`
