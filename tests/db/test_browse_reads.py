@@ -318,6 +318,47 @@ async def test_a_withheld_blob_reports_withheld_not_ok(pg):
     assert mapping["https://h/x.png"].state == "withheld"
 
 
+async def test_image_status_counts_do_not_report_a_withheld_blob_as_ok(pg):
+    """N2: image_status_counts had no join to `images` at all, so a row whose
+    status is 'ok' in article_images counted toward the 'ok' bucket even
+    after `babel hide --image` set images.withheld_at on its blob --
+    get_image_map (test_a_withheld_blob_reports_withheld_not_ok above)
+    already excludes it correctly; this query did not agree with it. A
+    withheld row is excluded from every bucket here rather than moved to
+    one of the other three: 'dead'/'waiting'/'exhausted' describe capture
+    *attempts*, and a withheld blob was captured fine -- it is a takedown,
+    not a capture failure, and image_status_counts is documented (see
+    ImageState's own docstring in browse.py) as exactly four buckets, not
+    five; only get_image_map gains a fifth ('withheld') for the renderer to
+    act on.
+    """
+    await pg.execute(
+        """INSERT INTO articles (id, title, body, published_at, comment_count)
+           VALUES (7007, 't', 'text', now(), 0)"""
+    )
+    withheld_digest = bytes.fromhex("11" * 32)
+    ok_digest = bytes.fromhex("22" * 32)
+    await pg.execute(
+        """INSERT INTO images (sha256, bytes, mime, withheld_at) VALUES
+           ($1, 3, 'image/png', now()),
+           ($2, 3, 'image/png', NULL)""",
+        withheld_digest, ok_digest,
+    )
+    await pg.executemany(
+        """INSERT INTO article_images (article_id, position, source_url, status, sha256)
+           VALUES (7007, $1, $2, 'ok', $3)""",
+        [
+            (0, "https://h/withheld.png", withheld_digest),
+            (1, "https://h/ok.png", ok_digest),
+        ],
+    )
+    counts = await browse.image_status_counts(pg, 7007)
+    assert counts["ok"] == 1
+    assert counts["dead"] == 0
+    assert counts["waiting"] == 0
+    assert counts["exhausted"] == 0
+
+
 async def test_a_hidden_article_yields_an_empty_image_map(pg):
     await pg.execute(
         """INSERT INTO articles (id, title, body, published_at, comment_count, hidden_at)

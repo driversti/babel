@@ -253,16 +253,31 @@ async def image_status_counts(conn: asyncpg.Connection, article_id: int) -> dict
     article reports every bucket as zero rather than the queue's real counts,
     because "how many images does this article have" is itself something a
     takedown must stop answering.
+
+    The same LEFT JOIN to `images` as get_image_map, for the same reason: a
+    row can be `status = 'ok'` in article_images and still cite a blob
+    `babel hide --image` has since withheld, and an 'ok' count the page
+    never actually shows a picture for is wrong regardless of whether
+    anything renders it. A withheld row is excluded from every bucket here
+    rather than moved into one of the other three — dead/waiting/exhausted
+    describe capture *attempts*, and a withheld blob was captured fine, so
+    none of those three is the truth about it either. Only get_image_map
+    gains a fifth bucket ('withheld') for the renderer to act on; this stays
+    four, as documented on ImageState above.
     """
     row = await conn.fetchrow(
         """SELECT
-             count(*) FILTER (WHERE status = 'ok')                              AS ok,
-             count(*) FILTER (WHERE status = 'dead')                            AS dead,
-             count(*) FILTER (WHERE status = 'pending'
-                                 OR (status = 'error' AND attempts < $2))       AS waiting,
-             count(*) FILTER (WHERE status = 'error' AND attempts >= $2)        AS exhausted
-           FROM article_images
-          WHERE article_id = $1
+             count(*) FILTER (WHERE ai.status = 'ok'
+                                 AND i.withheld_at IS NULL)                   AS ok,
+             count(*) FILTER (WHERE ai.status = 'dead')                      AS dead,
+             count(*) FILTER (WHERE ai.status = 'pending'
+                                 OR (ai.status = 'error'
+                                     AND ai.attempts < $2))                   AS waiting,
+             count(*) FILTER (WHERE ai.status = 'error'
+                                 AND ai.attempts >= $2)                       AS exhausted
+           FROM article_images ai
+           LEFT JOIN images i ON i.sha256 = ai.sha256
+          WHERE ai.article_id = $1
             AND EXISTS (SELECT 1 FROM articles WHERE id = $1 AND hidden_at IS NULL)""",
         article_id, MAX_IMAGE_ATTEMPTS,
     )
