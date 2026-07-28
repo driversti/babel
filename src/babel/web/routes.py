@@ -35,6 +35,21 @@ _STATS_ERROR_TTL_SEC = 5
 # id the archive could ever hold — and the largest asyncpg will bind at all.
 MAX_ARTICLE_ID = 2**63 - 1
 
+# render_body is synchronous CPU with no `await`, and the article route calls
+# it once for the article body and once per comment, with no LIMIT on
+# `browse.get_comments` — so before this budget existed, a page's total
+# render cost was the *sum* of every body on it, not any single body's own
+# cost, and that sum ran on the event loop, freezing the whole `web` process
+# — every other concurrent reader, and `/healthz` — for as long as it took.
+# Measured on the machine that chose this value: ten comments at
+# MAX_MARKUP_BYTES (each ~0.3s to render at the current 32 KiB cap) cost
+# 3.4s unbounded for a single GET; see
+# tests/web/test_article_page.py::test_the_render_budget_bounds_a_page_with_
+# many_expensive_comments for the reproduction. 1.0s matches the budget the
+# render cap itself (`MAX_MARKUP_BYTES`) is chosen to respect for one body,
+# so a single body can no longer exhaust it alone.
+_RENDER_BUDGET_SEC = 1.0
+
 
 class _ImageFileResponse(FileResponse):
     """A FileResponse scoped to the blob route.
@@ -329,7 +344,31 @@ def register_routes(app: FastAPI) -> None:
             image_map = await browse.get_image_map(conn, article_id)
             counts = await browse.image_status_counts(conn, article_id)
 
+        # The article renders first and unconditionally, before any budget
+        # check: a hostile comment thread must never be able to cost the
+        # article itself its own markup, only the comments after it. Its
+        # time still counts toward `_RENDER_BUDGET_SEC` below — the budget is
+        # for the whole page, not just the comments.
+        render_started = time.monotonic()
         rendered = render_body(detail.body_raw, image_map) if detail.body_raw else None
+        render_elapsed = time.monotonic() - render_started
+
+        # Comments get the withheld subset of the article's own image_map,
+        # not the whole thing, not `{}`. `babel hide --image` is a takedown,
+        # and a comment citing the exact URL an article's own body hid must
+        # not be able to route around it by rendering the ordinary "not
+        # archived" placeholder (which links to the source) instead of
+        # "withheld"'s (which does not) -- see _UNLINKED in markup.py. Every
+        # other state (ok/dead/waiting/exhausted) is deliberately left out:
+        # comments are not tracked in article_images at all, so this module
+        # has no real per-comment image status to report for them, and
+        # widening this to the full map would start rendering real `<img>`
+        # tags for any URL a comment happens to share with the article's own
+        # captured images -- a behaviour change well beyond this takedown fix.
+        withheld_images = {
+            url: state for url, state in image_map.items() if state.state == "withheld"
+        }
+
         # render_body returns None for a body over MAX_MARKUP_BYTES (Task 11):
         # a comment section holds one render per comment, so one oversized comment
         # among many real ones must degrade only that comment, not crash the
@@ -338,11 +377,26 @@ def register_routes(app: FastAPI) -> None:
         # path `c.body_raw` being falsy already takes -- article.html tests
         # `comment_html.get(c.id)`, not membership, so simply omitting the entry
         # is enough; no sentinel value is needed.
-        comment_html = {
-            c.id: rendered_comment.html
-            for c in comments
-            if c.body_raw and (rendered_comment := render_body(c.body_raw, {})) is not None
-        }
+        #
+        # The budget (B1) reuses that same fallback path: once
+        # `render_elapsed` reaches `_RENDER_BUDGET_SEC`, the loop stops
+        # calling render_body altogether rather than rendering the rest —
+        # every comment past that point is simply never visited, so it is
+        # never added to the dict and falls back to plain text exactly like
+        # an over-cap comment does. Checked *before* each render, not after:
+        # the loop can therefore overshoot the budget by at most one render's
+        # worth of time, never call two renders' worth over it.
+        comment_html = {}
+        for c in comments:
+            if render_elapsed >= _RENDER_BUDGET_SEC:
+                break
+            if not c.body_raw:
+                continue
+            comment_started = time.monotonic()
+            rendered_comment = render_body(c.body_raw, withheld_images)
+            render_elapsed += time.monotonic() - comment_started
+            if rendered_comment is not None:
+                comment_html[c.id] = rendered_comment.html
 
         # With markup, every image the article still cites is shown in place, so
         # the strip below holds only blobs whose URL the article has dropped

@@ -1,8 +1,21 @@
 import datetime
+import time
 
 from babel.web.markup import MAX_MARKUP_BYTES
 
 UTC = datetime.UTC
+
+# Same hill-climbed worst shape as test_markup.py's
+# test_the_worst_known_shape_at_the_cap_renders_well_under_a_second: at
+# MAX_MARKUP_BYTES (32 KiB) it costs ~0.3s per render on this machine, real
+# enough to exercise B1's per-request budget cheaply without needing an
+# implausibly large comment count.
+_EXPENSIVE_UNIT = "<ol><ol><dd><ol><li><ul><a><ol><nobr><ul>"
+
+
+def _body_at_cap() -> str:
+    n = MAX_MARKUP_BYTES // len(_EXPENSIVE_UNIT)
+    return _EXPENSIVE_UNIT * n
 
 
 async def _article(pool, article_id, **kw):
@@ -391,3 +404,102 @@ async def test_a_comment_over_the_markup_cap_falls_back_to_plain_text(client, po
     response = await client.get("/article/2111")
     assert response.status_code == 200
     assert "plain fallback text" in response.text
+
+
+async def test_the_render_budget_bounds_a_page_with_many_expensive_comments(client, pool):
+    """B1: render_body is synchronous CPU with no `await`, called once for
+    the article and once per comment inside a single `async def` route
+    handler, and get_comments has no LIMIT -- so before this fix, the whole
+    `web` process (every concurrent reader, plus /healthz) froze for the sum
+    of every render on the page. Ten comments at MAX_MARKUP_BYTES, each
+    costing ~0.3s to render (see _EXPENSIVE_UNIT above), measured 3.40s
+    unbounded on this machine for the article plus all ten -- and climbing
+    linearly with comment count, not bounded by anything -- before the fix
+    below existed. The budget stops calling render_body once 1.0s of render
+    time has been spent on the page, so wall time stays close to the budget
+    regardless of how many comments there are, and it is measured end to
+    end here (HTTP request in, response out), not just at the render_body
+    call site, so a fix that only bounds *some* of the renders would still
+    be caught.
+
+    Rather than asserting exactly which comment index the cutoff lands on --
+    fragile across machines, since it depends on exact render timing -- this
+    checks the two invariants the budget actually promises: not every
+    comment can have rendered (the wall-time bound proves that on its own),
+    and at least the first must have (the article's own render leaves most
+    of the 1.0s budget unspent, so the very first comment is never skipped).
+    """
+    await _article(pool, 2112, body="fallback body text")
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE articles SET body_raw = $1 WHERE id = 2112", "<p>short</p>")
+        await conn.executemany(
+            """INSERT INTO comments (id, article_id, position, depth, author_name,
+                                     body, body_raw)
+               VALUES ($1, 2112, $2, 0, 'bob', $3, $4)""",
+            [
+                (300 + i, i, f"plain fallback {i}", _body_at_cap())
+                for i in range(10)
+            ],
+        )
+    start = time.perf_counter()
+    response = await client.get("/article/2112")
+    elapsed = time.perf_counter() - start
+    assert response.status_code == 200
+    # Bounded: the 1.0s budget plus at most one render's worth of overshoot
+    # (~0.3s at the cap, since the budget is only checked *before* a render,
+    # not during one) plus generous HTTP/DB/test-harness overhead -- nowhere
+    # near the ~3.4s ten unbounded renders cost on this machine.
+    assert elapsed < 2.5, f"took {elapsed:.2f}s -- render budget may not be enforced"
+    body = response.text
+    fell_back = sum(1 for i in range(10) if f"plain fallback {i}" in body)
+    # Some, but not all, comments fell back to plain text: proof both that
+    # rendering still happens at all (the first one always does -- the
+    # article's own render is short and leaves most of the budget unspent)
+    # and that the budget actually stopped later ones rather than silently
+    # doing nothing.
+    assert 0 < fell_back < 10, f"{fell_back} of 10 comments fell back to plain text"
+
+
+async def test_a_withheld_image_cited_in_a_comment_is_not_linked_around(client, pool):
+    """N1: comments render with `images={}` (before this fix), so a withheld
+    blob's URL cited in a comment never resolves to the 'withheld' state the
+    article's own body correctly special-cases -- it looks up the empty map,
+    gets None, and falls to the ordinary "not archived" placeholder, which
+    (unlike 'withheld') gets a link to the original source. `babel hide
+    --image` is a takedown, and a comment can cite the very URL the article
+    hid to route straight around it. No blob or digest is exposed by this --
+    the bug is only that the link and caption are wrong, not that content
+    leaks -- but the takedown mechanism should not be bypassable through the
+    comment thread it does not otherwise touch.
+
+    Both the article body and a comment cite the identical URL here so the
+    two can be compared directly: the article's own placeholder already gets
+    this right (test_browse_reads.py covers get_image_map's 'withheld'
+    state), so this test only has to show the comment now matches it.
+    """
+    await _article(pool, 2113, body="see the image")
+    digest = bytes.fromhex("7a" * 32)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE articles SET body_raw = $1 WHERE id = 2113",
+            '<p><img src="https://h/withheld.png"></p>',
+        )
+        await conn.execute(
+            "INSERT INTO images (sha256, bytes, mime, withheld_at) "
+            "VALUES ($1, 3, 'image/png', now())",
+            digest,
+        )
+        await conn.execute(
+            """INSERT INTO article_images (article_id, position, source_url, status, sha256)
+               VALUES (2113, 0, 'https://h/withheld.png', 'ok', $1)""",
+            digest,
+        )
+        await conn.execute(
+            """INSERT INTO comments (id, article_id, position, depth, author_name,
+                                     body, body_raw)
+               VALUES (301, 2113, 0, 0, 'bob', 'plain fallback',
+                       '<p><img src="https://h/withheld.png"></p>')"""
+        )
+    body = (await client.get("/article/2113")).text
+    assert body.count("Image not available") == 2  # article body + comment
+    assert 'href="https://h/withheld.png"' not in body
