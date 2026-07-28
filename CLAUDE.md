@@ -123,6 +123,35 @@ article walk produces, so `article_images` still grows. Four separate causes wer
 (see the commits) and the queue is no longer growing for a *broken* reason — but whether the drain
 keeps up over a month is unmeasured. Watch the pending count and `docker compose logs images`.
 
+Not from either review, found during Task 11's own review rounds (the markup render guard) rather
+than live, and not yet resolved:
+
+- **The render cap's value admits a body over its own budget.** `MAX_MARKUP_BYTES`
+  (`src/babel/web/markup.py`) is 64 KiB, and a body of exactly 65,536 code points built from
+  four-byte list elements (`<ul>`, `<ol>`, `<dd>`, `<dt>`, `<li>`) interleaved with `<a>`/`<nobr>`
+  renders in **1,215 ms** — over the 1 s budget the cap exists to enforce. Cost is roughly quadratic
+  in size: 32 KiB → 307 ms, 40 → 478, 48 → 687, 56 → 932, 64 → 1,216 (independently reproduced at
+  308/686/1,234). The value that shipped was chosen against a 354 ms figure that only searched
+  five-byte-per-level shapes (`<div>`); the four-byte list elements above are not scope boundaries,
+  so each additionally triggers HTML5's "have a p element in button scope" walk over the whole
+  open-element stack — plain `<ul>` × 16,384 alone costs 580 ms. The remedy is a one-line constant,
+  `MAX_MARKUP_BYTES = 32 * 1024`, restoring the ~350 ms margin the current value was believed to
+  have. Deliberately not applied yet: the branch is unmerged, so nothing is at risk while it waits
+  for a decision, and 32 vs. 64 KiB is a real trade — worst-case event-loop time against how many
+  long articles keep their formatting.
+- **The cap's own test doesn't cover the shape above.** `tests/web/test_markup.py`'s timing test
+  pins the cap's value using the `<div>` shape (356 ms, 2.8x headroom) while its own docstring calls
+  that "the single worst shape measured across every round." It cannot fail for an over-large cap,
+  which is why 64 KiB survived to be committed. Whatever resolves the finding above should also
+  swap this test's unit string to the `<ol>`-family shape that actually reaches the worst measured
+  cost.
+- **The cap bounds one body, not one request.** `render_body` runs once per article body and once
+  per comment, inside a single `async def` route handler, and `get_comments` has no `LIMIT` — so a
+  page's total render cost is the sum of every capped body on it, not the cap itself. Measured: one
+  body plus four comments, all at the cap, is **6.11 s** of event-loop stall from a single GET,
+  which takes `/healthz` down with it too. Closing it needs a per-request budget, a comment `LIMIT`,
+  or moving the render off the loop — a design decision, not a constant.
+
 ## Operating the live run
 
 It runs as five compose services on the deploy host (see SPEC.md "Target host"; the address is not
