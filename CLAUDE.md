@@ -150,6 +150,24 @@ mutation results:
   markup, never the article's own. Ten comments at the cap measured 3.4 s unbounded before this fix
   and ~1.0-1.3 s after, regardless of comment count.
 
+- **Two gaps in what pins that budget, both still open.** The behaviour above is correct — the final
+  review verified it directly — but neither half of it is defended by a test, on a module whose
+  history is eight tests that passed for the wrong reason.
+
+  First, "the article renders first and unconditionally" is asserted in a comment at
+  `web/routes.py` and by nothing else: a mutation that moves the article render below the comment
+  loop and gates it on the remaining budget — precisely what the comment forbids — survives all 190
+  tests in `tests/web`. Every existing test uses a tiny article, so the budget is never spent before
+  the article render in any of them.
+
+  Second, the budget test's `0 < fell_back` half is coupled to machine speed. It needs ten renders
+  to exceed 1.0 s, i.e. more than 0.1 s each against ~0.33 s today — about a 3.3x margin, so on
+  hardware roughly four times faster all ten comments would render inside the budget and the
+  assertion would pass vacuously. Its slow-machine half is fine.
+
+  One deterministic test closes both, with no wall clock: monkeypatch `_RENDER_BUDGET_SEC` to `0.0`
+  and assert that no comment renders while the article still does.
+
 ## Operating the live run
 
 It runs as five compose services on the deploy host (see SPEC.md "Target host"; the address is not
