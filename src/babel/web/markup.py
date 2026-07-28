@@ -111,8 +111,11 @@ MAX_DEPTH = 100
 # list elements (`<ul>`, `<ol>`, `<dd>`, `<dt>`, `<li>`) reach 16,384 levels
 # in the same space instead of 13,107, and none of them is a scope boundary,
 # so each additionally triggers HTML5's "have a p element in button scope"
-# walk over the whole open-element stack -- `<ol>` alone is 564 ms and `<ul>`
-# 587 ms at 64 KiB, matched or exceeded by `<dir>` and `<ul><ol>`. Stacking
+# walk over the whole open-element stack -- `<ol>` alone is 561 ms and `<ul>`
+# 562 ms at 64 KiB, matched by `<ul><ol>` at 564. (`<dir>` is *not* in this
+# group, despite an earlier draft of this comment saying so: it is five bytes
+# per level and measures 359 ms, indistinguishable from `<div>`'s 360 --
+# which is what the paragraph above already puts it beside.) Stacking
 # `<a>` and `<nobr>` on top adds adoption-agency walks for the same reason.
 # Hill-climbing from there found `"<ol><ol><dd><ol><li><ul><a><ol><nobr><ul>"`,
 # which measured **1,215 ms** at exactly 64 KiB -- over the 1 s budget this
