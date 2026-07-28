@@ -168,11 +168,18 @@ INDEX CONCURRENTLY` is unavailable through this project's transaction-wrapped mi
 `ShareLock` for the entire build, which blocks concurrent writers — not readers — for as long as the
 build takes, not just while the lock is being acquired. Stop the writers first:
 
+**Build before you migrate.** The Dockerfile does `COPY migrations ./migrations` and nothing
+bind-mounts that directory (the crawler's only volumes are `data/images` and `tests/fixtures`), so a
+`babel migrate` run before the rebuild executes inside the *old* image and cannot see a migration
+that arrived with `git pull`. It reports nothing to apply and exits 0 — and then `web` refuses to
+start, naming a migration the operator just watched "succeed". Verified against this repository's
+own Dockerfile.
+
 ```bash
 git pull
 docker compose stop crawler images
+docker compose build crawler images web
 docker compose run --rm crawler babel migrate
-docker compose build web
 docker compose up -d crawler images web
 ```
 
@@ -182,8 +189,8 @@ problem. It still goes through stop/migrate/start, because `web` refuses to serv
 
 ```bash
 docker compose stop crawler images
-docker compose run --rm crawler babel migrate
 docker compose build crawler images web
+docker compose run --rm crawler babel migrate
 docker compose up -d web
 ```
 

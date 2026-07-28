@@ -187,10 +187,16 @@ stop/migrate/start, never a bare `up -d`, because plain `CREATE INDEX` (`CONCURR
 unavailable through this project's transaction-wrapped migration runner) takes `ShareLock` for the
 whole build, which blocks concurrent writers — not readers — for as long as the build takes:
 
+**Build before you migrate**, which is the opposite of what this file said until 2026-07-28. The
+Dockerfile does `COPY migrations ./migrations` and nothing bind-mounts that directory, so
+`babel migrate` run before the rebuild executes inside the *old* image and cannot see a migration
+that arrived with `git pull`. It reports nothing to apply and exits 0, and then `web` refuses to
+start naming a migration the operator just watched "succeed".
+
 ```bash
 docker compose stop crawler images
+docker compose build crawler images web
 docker compose run --rm crawler babel migrate
-docker compose build web
 docker compose up -d crawler images web
 ```
 
