@@ -160,11 +160,12 @@ used to sequence the first one *after* deployment, which is the wrong way round.
    `ok` today. Publishing `/img/{sha256}` is precisely what turns a blind fetch into a readable one,
    so the audit belongs before that happens. `source_url` is retained for every row, which makes the
    check one query; it is in README, and it is a heuristic over stored text, not a re-resolution.
-2. **Re-collect the article bodies.** The parser only started emitting `"\n"` at block boundaries on
-   this branch, and that changes new fetches only — every article collected earlier is one unbroken
-   block of text, and launching publishes it that way. It is a deliberate stop/sweep/restart pass,
-   not a queued job, because of M1 above: a running service does not reach its sweep phase until the
-   walk bottoms out. Three commands, in README.
+2. **Re-collect the article bodies.** Every article and comment collected before migration 007 has
+   no `body_raw`, so it renders through the plain-text fallback: no paragraphs for the oldest rows,
+   and no emphasis, links or in-position images for any of them. Re-collection is what fills the
+   column; it remains a deliberate stop/sweep/restart pass, not a queued job, because of M1 above: a
+   running service does not reach its sweep phase until the walk bottoms out. Three commands, in
+   README.
 
 Neither is optional and neither is automatic; the site should not be pointed at a hostname until both
 have been done.
@@ -177,6 +178,28 @@ before it ever looks at a registered Exception handler — `FastAPI(debug=True)`
 handler still installed still serves the traceback, not this handler's sentence. So turning on
 debug here would silently bypass this handler and leak schema and file-path detail on the public
 site it exists to protect; it must stay off in production.
+
+**The render guard (`MAX_MARKUP_BYTES`, `src/babel/web/markup.py`) is a size cap, not a cleverness —
+do not reintroduce a markup-aware guard.** `babel serve` refuses to render markup for a body over the
+cap and falls back to the stored plain text instead. That plainness is deliberate, paid for the hard
+way: five successive attempts to bound the same risk by scanning the markup for how deeply it would
+nest were each bypassed by a different HTML5 tokenizer behaviour — `<div/>` is not self-closing; a
+close tag matching no open element is ignored; scope markers and RAWTEXT elements swallow close tags;
+a quoted string is only an attribute value right after `=`; a close tag sitting inside a comment is
+text, not markup — with measured stalls of 6 to 90 seconds each, and one round's fix opened four new
+bypasses while closing the one it targeted. A byte count has no tokenizer state to get wrong, because
+it never reads the markup at all: it is the one bound in this function's history that a cleverer input
+shape cannot defeat. The full account is in `docs/superpowers/plans/2026-07-27-article-markup.md`'s
+Task 11 section and the comment above `MAX_MARKUP_BYTES` itself.
+
+The cap's byte value is under review, not settled: a later measurement found a list-heavy shape
+(rather than plain nesting) that renders in 1,215 ms at the current 64 KiB, over the 1 s budget the
+guard exists to enforce, and 32 KiB has been measured as restoring the margin — but the constant has
+not been changed pending that review. Do not treat 64 KiB as a proven worst case in anything you write
+or build against it. The cap is also per body, not per request: one article page renders the article
+plus every comment, each checked against the cap independently, in a single `async` handler with no
+`LIMIT` on comments — so a page with enough comments can still stall the event loop for seconds even
+though every individual body stayed under the cap.
 
 **The deploy host tracks `main`, and `main` is where work happens.** Phase 1 was built on
 `feat/phase-1-crawler` and fast-forwarded in; that branch is history now. Anything pushed to `main`
@@ -240,8 +263,8 @@ measurement was cheap.
 - `babel serve` — run the public read-only web archive; the `web` compose service. Refuses to start
   if `WEB_DATABASE_URL` is unset or equal to `DATABASE_URL`, and never applies migrations itself —
   see "Operating the live run" for why and for the deploy order. It does *check* them: one throwaway
-  connection reads `schema_migrations` before anything is served and refuses, naming
-  `005_browse.sql`, if the browse migration is absent. Without that check a skipped migrate step
+  connection reads `schema_migrations` before anything is served and refuses, naming whichever of
+  `005_browse.sql`/`007_body_markup.sql` is missing. Without that check a skipped migrate step
   answers 503 on every page — `UndefinedColumnError` is a `PostgresError`, so it lands in the
   database-down handler — while `/healthz` and the compose healthcheck stay green, which points the
   operator at Postgres instead of at the deploy

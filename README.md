@@ -93,8 +93,9 @@ applies migrations: `crawler` and `images` both do that at startup, and a third 
 same way would connect as a SELECT-only role and crash-loop under `restart: unless-stopped`.
 Applying the schema is an explicit operator step (below). It does check that the step was taken —
 one throwaway connection reads `schema_migrations` before anything is served, and the process
-refuses to start, naming `005_browse.sql`, if the browse migration is missing. A skipped migrate
-step otherwise answers 503 on every page while `/healthz` and the compose healthcheck stay green.
+refuses to start, naming whichever of `005_browse.sql`/`007_body_markup.sql` is missing. A skipped
+migrate step otherwise answers 503 on every page while `/healthz` and the compose healthcheck stay
+green.
 
 `web` is also the one service that does not get `env_file: .env`. It is handed `WEB_DATABASE_URL`,
 `IMAGE_ROOT`, `CONTACT` and `WEB_POOL_SIZE` and nothing else, because it is the only process here
@@ -121,10 +122,10 @@ service in `docker-compose.yml` for what that costs and what carries the weight 
 
 ### Re-collect the bodies before launch
 
-The parser only started emitting `"\n"` at `<br>`, `</p>`, `</div>` and `</li>` on this branch, and
-that changes new fetches only. Every article collected before it is one unbroken block of text in
-the database, and publishing the site publishes that. Re-collection is a deliberate three-step pass,
-not a queued job:
+Every article and comment collected before migration 007 has no `body_raw`, so it renders through
+the plain-text fallback: no paragraphs for the oldest rows, and no emphasis, links or in-position
+images for any of them. Re-collection is what fills the column, and it is a deliberate three-step
+pass, not a queued job:
 
 ```bash
 docker compose run --rm crawler babel refetch --from 1 --to 2797025 --yes
@@ -174,6 +175,21 @@ docker compose run --rm crawler babel migrate
 docker compose build web
 docker compose up -d crawler images web
 ```
+
+Migration 007 adds two nullable columns and rewrites nothing, so it does not carry 005's `ShareLock`
+problem. It still goes through stop/migrate/start, because `web` refuses to serve without it (see
+`REQUIRED_MIGRATIONS` in `src/babel/web/app.py`) and all three images are being rebuilt anyway:
+
+```bash
+docker compose stop crawler images
+docker compose run --rm crawler babel migrate
+docker compose build crawler images web
+docker compose up -d web
+```
+
+`web` is safe to bring up straight away, before any re-collection: rows without `body_raw` render
+exactly as they do today, through the plain-text fallback. Then run the re-collection pass below, and
+finally `docker compose up -d crawler images`.
 
 ### Taking a page down
 

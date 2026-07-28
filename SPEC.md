@@ -76,6 +76,38 @@ as `<i>[removed]</i>`.
 
 Comment IDs are globally sequential (~44.8M as of 2026-07).
 
+### The body is BBCode rendered to HTML
+
+Measured against `tests/fixtures/*.html` (2026-07). The whole body sits in one `<p>`; `<br>` is the
+line break and a run of two or more is a paragraph — but the game writes `<br>` newline newline
+`<br>`, never `<br><br>`. Measured across all three fixtures: 0 of the 35 real paragraph boundaries
+are strictly adjacent; every one has that whitespace-only text node sitting between the pair. An
+implementation that only recognised the adjacent form rendered every archived article as a single
+paragraph while its whole test suite passed, because none of the fixtures happened to exercise the
+adjacent form either — the bug was invisible until it was checked against the actual source.
+Emphasis arrives as `<b>`, `<i>`, `<u>`; links as `<a target="_blank">`; images as `<img
+class="bbcode_img">`. Emoji are elements, not characters: `<q class="emoji
+emoji_1f635">😵</q>` — produced by the game's own emoji pass, sometimes by accident (one fixture
+turns the literal `100%)` into a face).
+
+A linked image is the norm, not an edge case: `[url=…][img]…[/img][/url]` is the BBCode idiom, and
+both body images in `article_with_images.html` use it — an `<a target="_blank">` wrapping a single
+`<img class="bbcode_img">` and nothing else. Two consequences followed from that. First, suppressing
+a placeholder's own "original" link does nothing about the author's anchor around it — the placeholder
+correctly drops its link for a withheld blob, but the author's own href commonly points at the very
+same URL, so leaving that outer anchor alone kept a withheld image reachable. Second, the nesting this
+idiom implies when an image renders as a missing-image placeholder — which already carries its own
+`<a>` — does not survive parsing at all: the HTML5 adoption-agency algorithm hoists the inner `<a>` out
+from under the outer one, so escaped markup that nested them would not even describe the tree a real
+browser builds. The shipped rule, in `babel/web/markup.py`: an `<a>` containing an image is dropped,
+its children kept, unless every image inside it renders as a real `<img>`.
+
+Tag counts across the three fixtures — body: `br` 76, `p` 2, `b` 2, `a` 2, `img` 2, `u` 1, `q` 1.
+Comments: `br` 20, `a` 9, `i` 1. That is three pages from 2026 against twenty years of BBCode, so the
+allowlist in `src/babel/web/markup.py` is a floor, not a survey. Task 10 of
+`docs/superpowers/plans/2026-07-27-article-markup.md` widens it from the archive itself; widening
+costs a redeploy, which is the whole point of storing the markup.
+
 ### Images
 
 Articles average **6.2 images**, embedded from wherever the author happened to host them. Of 344
@@ -387,6 +419,18 @@ backfill's sweep phase retries `error` and `stale` rows on a cooldown, and `babe
 --ids/--from/--to` lets an operator queue a known-bad range for re-collection by hand after a fix
 ships. The 30-day window stays dropped — deliberately now, with the capability that makes dropping
 it safe actually built, rather than assumed.
+
+**The article's own markup *is* archived, as of 2026-07-27.** The entry above rejected 118 GB of
+whole pages and still does. What is stored now is `postBody` and each comment's `<p>` — about 1.4x
+the text already held, so roughly 13 GB across the full archive. The reason is the one this project
+keeps paying for: a rendering or parsing mistake becomes a redeploy instead of another 32-day walk.
+`migrations/004_image_identity.sql` records what its absence cost — with the markup stripped,
+`source_url` was the only surviving record of an article's images and there was nothing left to
+reconcile against. Storing the text alone also meant articles served as one unbroken block, because
+the parser dropped every paragraph boundary before the row was written.
+
+The column is `body_raw`, never `body_html`: it is untrusted bytes from a third-party server, and
+only `babel.web.markup.render_body` may render it.
 
 **Comments come free.** They arrive in the same request as the article, so there is never a reason
 to fetch an article without them.
