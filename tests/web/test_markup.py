@@ -15,8 +15,7 @@ from babel.db.browse import ImageState
 from babel.web.markup import (
     ALLOWED_ATTRIBUTES,
     EMITTED_TAGS,
-    GUARD_MIN_BYTES,
-    MAX_NESTING,
+    MAX_MARKUP_BYTES,
     Image,
     _convert,
     render_body,
@@ -331,17 +330,26 @@ def test_thousands_of_dropped_elements_render_well_under_a_second():
     long enough to stall the `web` process's async event loop (and its
     /healthz) for every other in-flight request. render_body now uses
     HTMLParser.strip_tags(), which runs in selectolax's C layer and is
-    linear. body_raw is capped at 1,000,000 characters (crawler/parser.py),
-    so a stored body can hold several times the 4,000-element payload here;
-    "well under a second" is a generous ceiling against a ~5ms measurement,
-    chosen to be robust to slower CI hardware while still catching a
-    regression back to quadratic behaviour.
+    linear.
+
+    2,500 elements, not the original 4,000: this body must now fit under
+    MAX_MARKUP_BYTES (64 KiB) too, since render_body refuses anything
+    larger before strip_tags ever runs -- 4,000 of these elements is
+    86,897 bytes, over the cap, and would have been refused outright
+    rather than exercising this cost path at all. 2,500 is 53,897 bytes,
+    comfortably under, and a hypothetical regression back to O(n^2) at
+    this count would still cost roughly a tenth of the original 25.3s
+    measurement (~2.5s) -- easily enough to trip the assertion below.
+    "well under a second" is a generous ceiling against a ~5ms
+    measurement, chosen to be robust to slower CI hardware while still
+    catching that regression.
     """
-    raw = "<p>" + "".join(f"<script>x{i}</script>" for i in range(4000)) + "</p>"
+    raw = "<p>" + "".join(f"<script>x{i}</script>" for i in range(2500)) + "</p>"
+    assert len(raw) <= MAX_MARKUP_BYTES
     started = time.perf_counter()
     out = html(raw)
     elapsed = time.perf_counter() - started
-    assert "x0" not in out and "x3999" not in out
+    assert "x0" not in out and "x2499" not in out
     assert elapsed < 1.0, f"took {elapsed:.2f}s -- DROPPED removal may have regressed to O(n^2)"
 
 
@@ -655,352 +663,138 @@ def test_anchor_unwrap_examines_every_image_not_just_the_first_one_it_meets():
     assert out.count("<a ") == 1
 
 
-def test_a_body_nested_past_the_limit_is_refused_rather_than_parsed():
-    """Padded past the brief's own literal shape: at depth MAX_NESTING + 50,
-    plain <div>...</div> nesting is only ~11.3 KB (5 + 6 bytes per level),
-    nowhere near GUARD_MIN_BYTES (32 KiB) -- reaching 32 KiB through pure div
-    nesting alone needs a depth around 2,979. The brief's own version of this
-    test asserted `len(raw) > GUARD_MIN_BYTES` against exactly that shape and
-    fails: 11,554 is not greater than 32,768. Confirmed directly rather than
-    assumed. The inert text padding (no tags, so it cannot change the depth
-    count) pushes the body over the size floor while leaving the nesting
-    depth at MAX_NESTING + 50, which is the boundary this test exists to
-    check.
-    """
-    n = MAX_NESTING + 50
-    raw = "<div>" * n + "text" + ("z" * 25_000) + "</div>" * n
-    assert len(raw) > GUARD_MIN_BYTES          # the guard only runs above this
-    assert render_body(raw, {}) is None
+# --- MAX_MARKUP_BYTES -------------------------------------------------------
+#
+# Five rounds tried to bound selectolax's quadratic parse cost by scanning
+# body_raw for how deeply it would nest, before ever handing it to the real
+# parser -- a running balance, then a stack, widened to HTML5's tag-name
+# grammar, taught to stop searching past the top, stripped of quote-
+# awareness, then taught to skip comments. Each round closed one HTML5
+# tokenizer state's bypass; the comment round opened four more from states
+# it didn't yet model, and read a single 1,000,000-byte body past a two-
+# minute timeout. See MAX_MARKUP_BYTES's own comment in markup.py for the
+# full history and the measurements behind the number chosen here. This
+# section replaces every test that used to exercise that scanning code
+# (`_too_deeply_nested`, `_TAG_RE`, `_VOID_ELEMENTS`, `MAX_NESTING`,
+# `GUARD_MIN_BYTES`) -- none of it exists any more, so none of those tests
+# can either; the whole bypass battery went with it, because no HTML shape
+# can defeat a check that never looks at HTML at all.
 
 
-def test_a_body_within_the_limit_still_renders():
-    """Padded for the same reason as the refusal test above: at depth
-    MAX_NESTING - 50, plain div nesting is only ~10.5 KB, under
-    GUARD_MIN_BYTES -- so the brief's literal version of this test never
-    actually reaches `_too_deeply_nested`'s scanning loop at all; the size
-    check returns False before any tag is counted, and the test would pass
-    identically even if the depth-counting logic were entirely broken. The
-    padding makes the guard's scan actually run and correctly clear a body
-    that is large but not too deep.
-    """
-    n = MAX_NESTING - 50
-    raw = "<div>" * n + "<p>text</p>" + ("z" * 25_000) + "</div>" * n
-    assert len(raw) > GUARD_MIN_BYTES
-    rendered = render_body(raw, {})
-    assert rendered is not None
-    assert "text" in str(rendered.html)
-
-
-def test_a_small_body_is_never_refused_however_nested():
-    """Below GUARD_MIN_BYTES the guard does not run, because it cannot matter.
-
-    Measured: a 32 KiB body nested as deeply as its own length allows (depth
-    2,978) parses in 19.5 ms, and the average archived body is 3.4 KB. Paying a
-    scan on every article to bound a cost that small would be the wrong trade.
-
-    Strengthened past the brief's own n=400: at that depth, `_too_deeply_
-    nested`'s scan -- if it ran at all -- would report "not too deep" anyway,
-    since 400 never gets near MAX_NESTING (1000). So the brief's version of
-    this test cannot tell "the size gate correctly skipped the scan" from "the
-    scan ran and correctly said no", and mutating away the size gate entirely
-    (`if len(raw) < GUARD_MIN_BYTES: return False` deleted) leaves it green.
-    Confirmed directly. Depth here is MAX_NESTING + 50 -- past the ceiling a
-    body this size can never reach in real HTML anyway (11 bytes/level of
-    plain <div> puts 1,050 levels at ~11.5 KB, well under the 32 KiB floor) --
-    so a body that really would be refused if it were bigger is asserted NOT
-    refused purely because it stays under the floor: the case the size gate
-    exists for. That combination is what makes this version fail if the size
-    gate is removed: the scan then finds depth 1,050 > MAX_NESTING and refuses
-    it, flipping `rendered is not None` to False.
-    """
-    n = MAX_NESTING + 50
-    raw = "<div>" * n + "deep" + "</div>" * n
-    assert len(raw) < GUARD_MIN_BYTES
-    assert n > MAX_NESTING              # past the depth ceiling, just too small to cost anything
-    rendered = render_body(raw, {})
-    assert rendered is not None
-    assert "deep" in str(rendered.html)
-
-
-def test_void_and_self_closing_tags_do_not_inflate_the_depth_count():
-    """200k <br> is a flat document, not a 200k-deep one.
-
-    A naive '<' counter would refuse this. The archive is full of <br> runs --
-    one fixture has 76 in a single body -- so a false refusal here would drop
-    real articles to the plain-text fallback.
-    """
-    raw = "<p>" + "<br>" * 60_000 + "x</p>"
-    assert len(raw) > GUARD_MIN_BYTES
+def test_a_body_just_under_the_cap_renders():
+    raw = "<p>" + ("x" * (MAX_MARKUP_BYTES - 10)) + "</p>"
+    assert len(raw) <= MAX_MARKUP_BYTES
     rendered = render_body(raw, {})
     assert rendered is not None
     assert "x" in str(rendered.html)
 
-    # img is void, so a trailing "/" is a no-op either way -- this exercises
-    # _VOID_ELEMENTS membership, not any special handling of the slash itself.
-    raw = "<p>" + '<img src="https://h/a.png"/>' * 3_000 + "y</p>"
-    assert len(raw) > GUARD_MIN_BYTES
-    assert render_body(raw, {}) is not None
 
-
-def test_a_self_closed_non_void_tag_still_counts_toward_depth():
-    """A trailing "/" on a non-void tag is not self-closing in HTML5, and an
-    earlier version of `_too_deeply_nested` treated it as if it were --
-    `elif name not in _VOID_ELEMENTS and not rest.rstrip().endswith("/")` --
-    which under-counted exactly the shape this guard exists to catch.
-
-    Confirmed directly against selectolax, not assumed: 2,000 consecutive
-    `<div class="x"/>` with no closing tags at all parse to a real tree
-    2,000 levels deep, identically to the same input with the slashes
-    removed -- a conformant HTML5 parser only treats the trailing slash as
-    a no-op on a void element (img, br, ...) and otherwise ignores it,
-    still opening a real, nested element. The version with the self-closing
-    exemption let this exact input through as "not too deeply nested" while
-    selectolax's own parse was genuinely 2,000 deep -- reopening the DoS
-    this task exists to close for any tag an attacker spells with a
-    trailing slash. Mutation check: restoring
-    `and not rest.rstrip().endswith("/")` to the guard's condition turns
-    this from PASS to FAIL (rendered is not None instead of None), which is
-    what makes this test capable of catching a regression back to it.
-    """
-    n = MAX_NESTING + 50
-    raw = "<p>" + '<div class="x"/>' * n + "DEEP" + ("z" * 25_000) + "</p>"
-    assert len(raw) > GUARD_MIN_BYTES
+def test_a_body_just_over_the_cap_is_refused():
+    raw = "<p>" + ("x" * MAX_MARKUP_BYTES) + "</p>"
+    assert len(raw) > MAX_MARKUP_BYTES
     assert render_body(raw, {}) is None
 
 
 @pytest.mark.parametrize(
-    "raw",
+    ("filename", "expected_paragraphs"),
     [
-        "<div></x>" * 20_000,
-        "<div></p>" * 20_000,
-        "<x></y>" * 20_000,
-        "<b></x>" * 20_000,
+        ("article_with_images.html", 6),
+        ("article_with_comments.html", 12),
+        ("article_indonesia.html", 19),
     ],
-    ids=["div-x", "div-p", "x-y", "b-x"],
 )
-def test_a_mismatched_close_tag_cannot_defeat_the_depth_counter(raw):
-    """Found in review: a running balance -- +1 on open, -1 on ANY close --
-    is defeated by pairing every open with a close that names something
-    else. The balance drops back to 0 (or oscillates 0/1) after every pair,
-    so it never crosses MAX_NESTING, while selectolax's real parser ignores
-    the mismatched close -- there is no open <x>, <p>, or <y> in scope for
-    it to match -- and keeps the outer tag genuinely open, nesting tens of
-    thousands of levels deep.
-
-    Reproduced directly (this exact table, before the fix): "<div></x>" *
-    90000 (810 KB, inside crawler/parser.py's 1,000,000-character ceiling)
-    parsed in 18,157 ms -- worse than the 17,662 ms balanced attack this
-    guard was written to stop -- while the running-balance counter never
-    tripped on it. Also reproduced with `<div></br>`, `<DIV></X>`,
-    `<div\\n></x>`, and `<div a=">"></x>`; not exercised individually here
-    because the fix -- a real stack that ignores a close with no matching
-    open, per HTML5 tree construction -- closes all of them the same way,
-    by construction, not by pattern-matching this specific list.
-
-    N=20,000 here (not the worst-case 90,000 above) because refusal, once
-    fixed, is a fast early-exit -- the size only matters for how long the
-    *unfixed* counter takes to falsely clear it, which this test does not
-    need to demonstrate again.
+def test_the_three_real_fixtures_still_render_at_their_established_paragraph_counts(
+    filename, expected_paragraphs
+):
+    """Regression guard for the round-6 rewrite: replacing the whole markup-
+    scanning guard with a byte-size cap must not change how any real,
+    legitimate article renders. All three fixtures' postBody divs are well
+    under MAX_MARKUP_BYTES, so none of them are refused; this only pins
+    that the render itself -- paragraph grouping included -- still
+    produces exactly what it did before this rewrite. article_with_images
+    .html's own six-paragraph count is also pinned, with more surrounding
+    detail, by test_the_real_fixture_gains_paragraphs above.
     """
-    assert len(raw) > GUARD_MIN_BYTES
-    assert render_body(raw, {}) is None
-
-
-def test_a_scope_boundary_cannot_defeat_the_depth_counter():
-    """Found in review, round 3: `object`, `marquee`, `applet`, `template`,
-    `table`, `td`, `th`, and `caption` are HTML5 scope boundaries -- a close
-    tag whose named element sits on the far side of one of these is ignored
-    by the real parser, because the element is not "in scope" even though it
-    is still open. `"<div><object></div>"` repeated: the `</div>` never
-    closes the `div` (the open `object` blocks scope), so the real parser
-    keeps nesting both, genuinely two levels deeper per repetition. The
-    round-2 stack fix (pop down to a same-named entry anywhere in the stack,
-    not just the top) didn't know about scope at all -- it found `div` two
-    entries down and popped straight through the `object`, undercounting.
-    Measured directly, before this fix: `"<div><object></div>" * 52631`
-    (999,989 B, crawler/parser.py's own ceiling) rendered -- not refused --
-    in 29,488 ms, 1.7x the original 17,662 ms attack this guard exists to
-    stop, built from ordinary tags with no trickery at all.
-
-    The fix (pop only on a top-of-stack match, never search deeper) doesn't
-    need to know `object` is special -- it only ever sees that the top of
-    the stack is `object`, not `div`, and leaves both open, which happens to
-    be the same outcome the real parser reaches for a different reason.
-    """
-    raw = "<div><object></div>" * 20_000
-    assert len(raw) > GUARD_MIN_BYTES
-    assert render_body(raw, {}) is None
-
-
-def test_rawtext_content_cannot_defeat_the_depth_counter():
-    """Found in review, round 3: inside `textarea`, `style`, `title`,
-    `iframe`, `script`, `xmp`, and `noembed`, anything that looks like a
-    close tag is literal text to the real HTML5 parser, not markup -- these
-    elements' content model is RAWTEXT/RCDATA, scanned only for their own
-    literal terminator. `_TAG_RE` has no notion of RAWTEXT and matches
-    `</div>` inside a `<style>` block as a real close tag regardless, so the
-    round-2 stack fix (pop down to a same-named entry anywhere in the
-    stack) popped the outer `div` on a "close" the real parser treats as
-    plain text -- undercounting. Measured directly, before this fix:
-    `"<div><style></div></style>" * 37036` (962,936 B) rendered -- not
-    refused -- in 3,547 ms.
-
-    The fix doesn't model RAWTEXT either. It only ever compares against the
-    top of the stack, which is `style` at the point the phantom `</div>`
-    close is seen (nothing else could be on top, since nothing real opens
-    inside RAWTEXT content) -- so the phantom close doesn't match and is
-    ignored, leaving `div` open, same as the real parser's RAWTEXT handling
-    reaches by a completely different route.
-    """
-    raw = "<div><style></div></style>" * 20_000
-    assert len(raw) > GUARD_MIN_BYTES
-    assert render_body(raw, {}) is None
-
-
-def test_a_hyphenated_tag_name_cannot_defeat_the_depth_counter():
-    """Found in review, round 3: the original `_TAG_RE` used
-    `[a-zA-Z][a-zA-Z0-9]*` for a tag name, which stops at the first `-`,
-    `:`, or `_` -- narrower than what HTML5 actually accepts in a tag name.
-    `<div-x>` was therefore recorded as an open `div`, not `div-x`, so a
-    later `</div>` matched that phantom `div` and the round-2 stack fix
-    popped it -- while the real parser has no `div` in scope at all (the
-    only open element is named `div-x`, a different name) and keeps
-    nesting. Measured directly, before this fix: `"<div-x></div>" * 76924`
-    (999,999 B) rendered -- not refused -- in 24,332 ms.
-
-    Fixed by widening `_TAG_RE`'s name class to `[a-zA-Z][^\\s/>"']*`,
-    which captures the tag name HTML5 actually sees (`div-x`, whole), not a
-    truncated prefix of it -- so the mismatched close no longer has a
-    phantom entry to (mis)match against at all.
-    """
-    raw = "<div-x></div>" * 20_000
-    assert len(raw) > GUARD_MIN_BYTES
-    assert render_body(raw, {}) is None
-
-
-@pytest.mark.parametrize("quote", ['"', "'"])
-def test_an_unbalanced_quote_cannot_swallow_the_rest_of_the_document(quote):
-    """Found in review, round 4: the original `_TAG_RE` let a quote mark
-    ANYWHERE after the tag name open a quoted run that swallows everything
-    up to the matching quote -- including any `>` inside it. HTML5 only
-    enters "attribute value (quoted)" state right after a real `=`; a stray
-    quote in the before-attribute-name state just starts a new (malformed)
-    attribute *name* and does not change how `>` is recognised -- the real
-    tag still ends at the very next `>`. So an unbalanced quote right after
-    the tag name (`<a"`, with no closing quote until far later) was ONE tag
-    to the old regex and genuinely deep to the real parser: confirmed
-    directly, `<a"<div><div><div><div>">` produced regex opens `['a']`
-    (the whole thing swallowed as one tag) against a real parser depth of
-    4. Measured at crawler/parser.py's 1,000,000-character ceiling:
-    `"<a\"" + "<div>" * 166000 + "\">"` (830,005 B) rendered -- not refused
-    -- in 58,688 ms, the worst of the four bypasses found on this function
-    and worse than the first three combined were individually.
-
-    Fixed by deleting quote-awareness from `_TAG_RE` entirely: a tag now
-    ends at the first `>`, full stop, matching the real tokenizer's
-    before-attribute-name state for everything except a `>` that arrives
-    genuinely inside a quoted value opened by a real `="` or `='`. That
-    under-recognises real attribute values containing a literal `>` --
-    splitting one real tag into a phantom open plus leftover text -- but
-    every consequence of that split can only add extra phantom opens,
-    never remove real ones. Over-counting, the safe side.
-    """
-    n = 20_000
-    raw = f"<a{quote}" + "<div>" * n + f"{quote}>"
-    assert len(raw) > GUARD_MIN_BYTES
-    assert render_body(raw, {}) is None
-
-
-@pytest.mark.parametrize("tag", ["div", "i", "b"])
-def test_a_close_tag_inside_a_comment_cannot_defeat_the_depth_counter(tag):
-    """Found in review, round 5, pre-existing since the very first version
-    of `_TAG_RE` (not introduced by any of the previous four fixes):
-    `_TAG_RE` has no notion of an HTML comment. `<!--` never matched as an
-    opener, but a close tag written *inside* a comment -- `</div>` in
-    `"<div><!--</div>-->"` -- matched as a real close, and matched the TOP
-    of the stack exactly, so the round-2 "pop only the top" rule gave it no
-    protection at all: from the regex's point of view there was nothing to
-    distinguish a real close from one sitting inside comment data. The real
-    tokenizer treats the whole `<!-- ... -->` span as comment content start
-    to finish; the `<div>` just before it is never closed by anything
-    inside. Measured before the fix: `"<div><!--</div>-->" * 55555`
-    (999,990 B) rendered -- not refused -- in 6,443 ms, counted depth
-    peaking at 1 (open, immediately "closed" by the fake close every
-    iteration) while real depth reached 55,557.
-
-    Fixed by walking the string with an explicit position pointer instead
-    of handing the whole document to `finditer` as one flat sequence of
-    tag-shaped substrings: on `<!--`, the scan jumps straight past the
-    matching `-->` without looking at anything in between, so a close tag
-    written inside a comment is never even offered to the tag matcher.
-    """
-    raw = f"<{tag}><!--</{tag}>-->" * 20_000
-    assert len(raw) > GUARD_MIN_BYTES
-    assert render_body(raw, {}) is None
-
-
-def test_an_unterminated_comment_swallows_everything_after_it():
-    """An unterminated `<!--` is exactly like EOF-inside-a-comment to the
-    real HTML5 tokenizer: once in the comment state with no closing `-->`
-    anywhere in the rest of the document, every remaining character is
-    comment data, and tokenization simply ends -- no further tag, real or
-    fake, is ever recognised again. So the ~90,909-deep nesting run this
-    module's own pathological-body test uses is, placed after an
-    unterminated comment, not an attack at all: there is nothing left for
-    the real parser to nest through.
-
-    This isn't merely the safe guess -- confirmed directly against
-    selectolax: the real parse of this exact body takes ~3 ms, not ~17.7 s,
-    because the "nesting" after the unterminated comment is comment data to
-    selectolax too, never real elements. Refusing this body would be a
-    false positive, not a safety margin, so `render_body` must NOT refuse
-    it: the guard's own scan stops at the unterminated `<!--` (nothing past
-    it is real, so nothing past it needs scanning), leaving the small,
-    genuinely-nested prefix -- one `<p>`, opened and closed -- as the only
-    thing that was ever counted.
-    """
-    n = 1_000_000 // 11
-    raw = "<p>hello</p>" + "<!--" + ("<div>" * n) + "x" + ("</div>" * n)
-    assert len(raw) > GUARD_MIN_BYTES
-    assert "-->" not in raw  # genuinely unterminated, not accidentally closed
-    rendered = render_body(raw, {})
+    fixture_html = (FIXTURES / filename).read_text(encoding="utf-8")
+    body_node = HTMLParser(fixture_html).css_first("div.postBody")
+    assert body_node is not None
+    body_html = body_node.html
+    assert len(body_html) <= MAX_MARKUP_BYTES
+    rendered = render_body(body_html, {})
     assert rendered is not None
-    assert "hello" in str(rendered.html)
+    assert str(rendered.html).count("<p>") == expected_paragraphs
 
 
-def test_a_doctype_declaration_does_not_confuse_the_depth_counter():
-    """`<!doctype html>` (and any other `<!...>` that isn't a real comment)
-    is a bogus-comment-state markup declaration to the tokenizer -- it runs
-    to the next `>` and nothing inside is a tag. A scan that didn't skip it
-    as a unit could, in principle, misread characters inside it as tag
-    syntax; asserting the legitimate body after it still renders is the
-    regression guard for that.
+def _historical_attack_shapes() -> dict[str, str]:
+    """One representative body per bypass found across five rounds of trying
+    to bound nesting depth by scanning body_raw, each sized to fit under
+    MAX_MARKUP_BYTES. None of these need to be recognised as dangerous any
+    more -- that was the whole problem with scanning markup instead of just
+    measuring it -- so this exists only to prove each one now renders
+    quickly regardless of which tokenizer state it used to defeat.
     """
-    raw = "<!doctype html>" + "<p>" + ("x" * 40_000) + "</p>"
-    assert len(raw) > GUARD_MIN_BYTES
-    rendered = render_body(raw, {})
-    assert rendered is not None
-    assert "x" in str(rendered.html)
+    cap = MAX_MARKUP_BYTES
+
+    def repeated(unit: str) -> str:
+        return unit * (cap // len(unit))
+
+    def prefixed(prefix: str, unit: str = "<div>") -> str:
+        return prefix + unit * ((cap - len(prefix)) // len(unit))
+
+    return {
+        "unclosed div, the worst shape found across every round": repeated("<div>"),
+        "mismatched close (round 2)": repeated("<div></x>"),
+        "scope boundary (round 3)": repeated("<div><object>"),
+        "rawtext content (round 3)": repeated("<div><style>"),
+        "hyphenated tag name (round 3)": repeated("<div-x>"),
+        "unbalanced quote (round 4)": prefixed('<a"'),
+        "close tag hidden in a comment (round 5)": repeated("<div><!--</div>-->"),
+        "bare comment-start, <!--> (round 6 hole)": prefixed("<!-->"),
+        "comment-start-dash, <!---> (round 6 hole)": prefixed("<!--->"),
+        "comment-end-bang, <!-- --!> (round 6 hole)": prefixed("<!-- --!>"),
+    }
 
 
-def test_a_processing_instruction_does_not_confuse_the_depth_counter():
-    """`<?x?>` is a bogus comment to an HTML5 tokenizer (there is no XML
-    processing-instruction state in HTML parsing) -- it runs to the next
-    `>` the same as a stray `<!...>` does. The `?` inside it must not be
-    mistaken for anything tag-shaped, and the legitimate body after it must
-    still render.
+_SHAPES = _historical_attack_shapes()
+
+
+@pytest.mark.parametrize("label", list(_SHAPES.keys()))
+def test_every_historical_attack_shape_renders_harmlessly_under_the_cap(label):
+    """The point of replacing five rounds of markup-scanning with a size-only
+    cap: none of these shapes are dangerous any more, because none of them
+    can grow past MAX_MARKUP_BYTES without being refused outright, and none
+    of them are refused while under it either -- there is no HTML shape a
+    size check can be tricked by. Every one of these used to cost anywhere
+    from seconds (round 2's mismatched close) to a two-minute timeout
+    (round 6's comment-end-bang hole) at sizes comparable to this one;
+    under the cap, all of them render in well under a second.
     """
-    raw = "<?x?>" + "<p>" + ("y" * 40_000) + "</p>"
-    assert len(raw) > GUARD_MIN_BYTES
-    rendered = render_body(raw, {})
-    assert rendered is not None
-    assert "y" in str(rendered.html)
-
-
-def test_the_pathological_body_renders_in_well_under_a_second():
-    """The whole point. Without the guard this exact input takes ~17.7 s."""
-    n = 1_000_000 // 11
-    raw = "<div>" * n + "x" + "</div>" * n
+    raw = _SHAPES[label]
+    assert len(raw) <= MAX_MARKUP_BYTES
     start = time.perf_counter()
-    assert render_body(raw, {}) is None
-    assert time.perf_counter() - start < 1.0
+    rendered = render_body(raw, {})
+    elapsed = time.perf_counter() - start
+    assert rendered is not None
+    assert elapsed < 1.0, f"{label} took {elapsed:.2f}s -- MAX_MARKUP_BYTES may be too large"
+
+
+def test_the_worst_known_shape_at_the_cap_renders_well_under_a_second():
+    """The single worst shape measured across every round of this guard's
+    history: unclosed, one-sided `<div>` tags, 5 bytes each with nothing
+    spent on a matching close, reaching the deepest real nesting per byte
+    of anything tried. Measured with no guard of any kind at exactly
+    MAX_MARKUP_BYTES (64 KiB): 352-354 ms, confirmed independently rather
+    than trusted from the review that chose this cap. This is the test
+    that actually pins the cap's value: raise MAX_MARKUP_BYTES enough (128
+    KiB measures ~1.4 s for this same shape) and this is the test that
+    fails, not the correctness ones above, because correctness doesn't
+    care how large the cap is -- only timing does.
+    """
+    n = MAX_MARKUP_BYTES // len("<div>")
+    raw = "<div>" * n
+    assert len(raw) <= MAX_MARKUP_BYTES
+    start = time.perf_counter()
+    rendered = render_body(raw, {})
+    elapsed = time.perf_counter() - start
+    assert rendered is not None
+    assert elapsed < 1.0

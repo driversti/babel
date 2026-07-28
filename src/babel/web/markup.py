@@ -18,7 +18,6 @@ class="emoji ...">` around emoji. See SPEC.md.
 """
 
 import logging
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -76,236 +75,47 @@ ALLOWED_ATTRIBUTES: frozenset[str] = frozenset({
 # the stack on it. See _convert for why the remedy is flattening, not unwrapping.
 MAX_DEPTH = 100
 
-# selectolax's parse is quadratic in nesting depth. Measured against a body at
-# crawler/parser.py's 1,000,000-character ceiling: 17,662 ms nested 90,909 deep,
-# against 7.9 ms at depth 1,000 and 51.2 ms for a flat 1 MB of <p> siblings. The
-# route handlers are `async def`, so one such render stalls the whole web
-# process's event loop -- /healthz with it, which reads to an operator as the
-# database being down rather than as one bad article.
+# selectolax's parse is quadratic in nesting depth, and a body's own markup
+# is the only thing that decides how deep it nests -- so bounding the markup
+# a reader can be exposed to is what actually bounds the parse. Five rounds
+# tried to bound it more precisely than that, by scanning body_raw for how
+# deep it *would* nest before ever handing it to the real parser: a running
+# balance of opens and closes, then a stack, widened to match HTML5's tag-name
+# grammar, taught to stop searching past the top of the stack, stripped of
+# quote-awareness, then taught to skip HTML comments. Each round closed one
+# HTML5 tokenizer state's bypass and, in the comment round, opened four more
+# from tokenizer states it didn't yet model: a bare `<!-->`, `<!--->`, and
+# `<!-- --!>` -- three more ways a comment can end besides `-->` -- each read
+# the scan's own comment-skip as "unterminated" and made it abandon the rest
+# of the document, worse than doing nothing at all. Measured on the last of
+# those: a single 1,000,000-byte body rendered past a two-minute timeout.
+# HTML5's tokenizer has more than eighty states; a regex-and-stack scan that
+# tries to track it well enough to bound depth safely does not converge, and
+# the fifth failure in a row is the signal to stop trying rather than to
+# patch a sixth.
 #
-# 1,000 is ten times MAX_DEPTH, past which _convert flattens a subtree to its
-# text anyway, so a refused body loses nothing a reader would have seen: the
-# route falls back to `articles.body`, which holds every word regardless.
-MAX_NESTING = 1000
-
-# Below this the scan is skipped, because nesting cannot cost *much* at this
-# size, not because it costs nothing: a 32 KiB body of plain <div>...</div>,
-# nested as deeply as its own length permits (depth 2,978), parses in 19.5 ms.
-# A tag-dense shape costs more at the same size -- not a claimed maximum,
-# just a higher measured figure: "<div>" * 6,553 (32,765 B, unclosed, so
-# every byte buys a level) parses in 89 ms. Still comfortably inside the 1 s
-# budget this guard exists to protect, which is what makes the floor safe --
-# just not free. 16 KiB nested (div) is 5.3 ms. The average archived body is
-# 3.4 KB (SPEC.md), so in practice the scan never runs. The scan itself is
-# not free either -- ~94 ms over a flat 1 MB document (round 5 traded some of
-# this for correctness: the position-walking scan that skips comment spans
-# costs more per tag than the `finditer` it replaced) -- which is exactly why
-# it is gated on size rather than run unconditionally.
-GUARD_MIN_BYTES = 32 * 1024
-
-# HTML5's void elements. A naive counter that treats every `<tag` as a descent
-# would refuse a flat run of <br>, which the archive is full of.
-_VOID_ELEMENTS = frozenset({
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
-    "meta", "param", "source", "track", "wbr",
-})
-
-_TAG_RE = re.compile(r"""<(/?)([a-zA-Z][^\s/>"']*)[^>]*>""")
-
-
-def _too_deeply_nested(raw: str) -> bool:
-    """A cheap upper bound on nesting, without parsing.
-
-    Deliberately approximate: it counts what the markup *says*, not what an
-    HTML5 tree builder would make of it. Over-counting only costs a body the
-    plain-text fallback; under-counting is the dangerous direction, because it
-    is what lets a hostile body reach the real parser unbounded -- so every
-    choice below is made to never under-count, even at the cost of sometimes
-    over-counting a body that would actually have parsed cheaply.
-
-    This function has been wrong five times before landing on the rule
-    below, and every one of those times was a *clever* attempt to track HTML5
-    tree construction more exactly. Read this history before changing
-    anything here again:
-
-    1. A running balance (+1 on open, -1 on ANY close) doesn't know a close
-       needs a matching open at all. selectolax ignores a close tag that
-       names no open element currently in scope, so pairing each open with a
-       close that names something else (`"<div></x>" * 90000`, 810 KB)
-       drops the balance back down every pair while the real parser, with
-       nothing to close, keeps genuinely nesting the `<div>`. Measured:
-       18,157 ms unrefused, worse than the 17,662 ms attack this guard
-       exists to stop.
-    2. A stack that pops down to and including a same-named entry anywhere
-       in it (not just the top) assumed every close either matches nothing
-       or matches cleanly. Three more ways that's false, all measured at
-       crawler/parser.py's 1,000,000-character ceiling:
-       - **Scope boundaries.** HTML5 ignores a close tag when the named
-         element is not *in scope* -- `object`, `marquee`, `applet`,
-         `template`, `table`, `td`, `th`, `caption` all block scope the same
-         way. `"<div><object></div>" * 52631` (999,989 B): the real parser
-         never closes the `div` (blocked by the open `object`), but a
-         search-any-depth stack finds `div` two entries down and pops both.
-         Measured 29,488 ms unrefused -- 1.7x the original attack, built
-         from ordinary tags.
-       - **RAWTEXT/RCDATA content.** Inside `textarea`, `style`, `title`,
-         `iframe`, `script`, `xmp`, `noembed`, anything that looks like a
-         close tag is literal text to the real parser, not a tag.
-         `"<div><style></div></style>"` (999,986 B): the `</div>` inside
-         `<style>` is text, but this function's regex can't tell RAWTEXT
-         content from markup and matched it as a real close anyway.
-         Measured 3,547 ms unrefused.
-       - **A tag-name class narrower than HTML5's.** The previous regex,
-         `[a-zA-Z][a-zA-Z0-9]*`, stops at the first `-`, `:` or `_`, so
-         `<div-x>` was recorded as an open `div` -- and a later `</div>`
-         matched that phantom and popped it, while the real parser has no
-         `div` in scope at all (the open element is named `div-x`, a
-         different name) and keeps nesting. Measured 24,332 ms unrefused via
-         `"<div-x></div>"` (999,999 B); same defect via `:`.
-       Fixed here too: `_TAG_RE`'s name class widened to
-       `[a-zA-Z][^\\s/>"']*`, matching everything HTML5 accepts in a tag
-       name (letters, digits, and the punctuation real tag names use).
-    3. `_TAG_RE` itself, from the very first version of this function, let a
-       `"` ANYWHERE after the tag name open a quoted run that swallows
-       everything up to the matching quote, including any `>` inside it.
-       HTML5 only enters "attribute value (quoted)" state right after an
-       `=`; a stray `"` in the before-attribute-name state just starts a new
-       (malformed) attribute *name* and does not change how `>` is
-       recognised at all -- the tag still ends at the next real `>`. So
-       `"<a\"" + "<div>" * N + "\">"` is ONE tag to this regex (the
-       unbalanced `"` right after `a` opens a quoted run that swallows every
-       `<div>` up to the matching `"`) and genuinely `N` deep to the real
-       parser, which has no such rule to trip over. Measured at
-       crawler/parser.py's 1,000,000-character ceiling: `N=166,000`
-       (830,005 B) parsed in 58,688 ms unrefused -- the worst of the four,
-       and worse than the first three combined were on their own.
-       Fixed by deleting quote-awareness from `_TAG_RE` entirely: a tag now
-       ends at the first `>`, full stop, exactly like the real tokenizer's
-       before-attribute-name state does for everything except a `>` that
-       arrives *after* a real `="` or `='`. This under-recognises real
-       attribute values containing a literal `>` -- the match ends early,
-       splitting one real tag into a phantom open plus leftover text that
-       might itself contain something matchable -- but every consequence of
-       that split is an *extra* phantom open or close, which can only ever
-       grow the counted depth, never shrink it. Over-counting, the safe
-       side, again.
-    5. Pre-existing since the very first version, same as (3): `_TAG_RE` has
-       no notion of an HTML comment. `<!--` does not itself match as an
-       opener, but a `</div>` sitting *inside* a comment matched as a real
-       close -- and matched the TOP of the stack exactly, so the round-2
-       "pop only the top" rule gave it no protection at all, because from
-       the regex's point of view there was nothing to tell it the close
-       wasn't real. The tokenizer treats the whole `<!-- ... -->` span as
-       comment data start to finish; the `<div>` just before it is never
-       closed by anything inside. `"<div><!--</div>-->" * 55555`
-       (999,990 B): counted depth peaked at 1 (open, immediately "closed"
-       by the fake close every iteration) while real depth reached 55,557.
-       Measured 6,443 ms unrefused; also reproduced with `<i>` and `<b>` at
-       ~3.4 s.
-       Fixed by no longer treating the whole document as one flat sequence
-       of tag-shaped substrings for `finditer` to find. `_too_deeply_
-       nested` now walks the string with an explicit position pointer:
-       on `<!--`, it jumps straight to just past the matching `-->` without
-       looking at anything in between (an unterminated `<!--` makes it stop
-       scanning entirely, since the tokenizer treats the rest of the
-       document as comment data too and nothing after it can be a real tag
-       either); on `<!` or `<?` that isn't a comment start (a DOCTYPE, a
-       processing instruction, any bogus-comment-state markup declaration),
-       it skips to just past the next `>`, the same way the tokenizer's
-       bogus comment state does, treating everything in between as inert
-       either way. Counting *nothing* inside these spans is not merely the
-       safe choice, it is the exact match for the tokenizer: neither a real
-       open nor a real close ever occurs inside a comment or a bogus
-       comment, so this is one of the few places in this function where
-       "crude" and "correct" happen to be the same rule.
-
-    **The rule that actually holds, this time because it stops trying to be
-    exact: pop only when a close matches the TOP of the stack. Never search
-    deeper. If it doesn't match the top, ignore the close outright** -- the
-    same outcome as "no matching open in scope" from the parser's own
-    perspective, without this function having to know *why* (scope
-    boundary, RAWTEXT content, a name it never really opened, or a
-    genuinely absent element all look identical from here: the top doesn't
-    match). This is strictly more conservative than searching the whole
-    stack: it can only leave MORE entries open for longer than a real parser
-    would, never fewer. That is over-counting, and over-counting only costs
-    a body the plain-text fallback -- the safe side of every mistake this
-    function has made. Do not replace it with anything that tries to model
-    scope, RAWTEXT, matching-anywhere-in-the-stack, or quoted attribute
-    values more precisely; every such attempt so far has bought a little
-    accuracy on the safe side by selling correctness on the dangerous one.
-    In particular: do not put quote-awareness back into `_TAG_RE`. Be crude
-    in the safe
-    direction, on purpose.
-
-    Still amortised linear: every push is popped at most once (an ignored
-    close pops nothing), so the total cost stays proportional to the number
-    of tags, not the document's real nesting depth.
-
-    A trailing "/" on the tag (`<div/>`) is NOT treated as self-closing here,
-    on purpose, for anything outside `_VOID_ELEMENTS`. HTML5 has no general
-    self-closing syntax -- the trailing slash is only meaningful on a void
-    element, where it is a no-op, and is otherwise ignored by a conformant
-    parser, which still opens a real, nested element. Verified directly
-    against selectolax: 2,000 consecutive `<div class="x"/>` (no closing
-    tags at all) parse to an actual tree 2,000 levels deep, identically to
-    the same input without the slashes -- so treating the slash as closing
-    the tag here would have under-counted exactly the shape this guard
-    exists to catch. `<img src="x"/>` still costs nothing, because `img` is
-    void regardless of how it is spelled -- confirmed the same way, depth 2
-    either with or without the slash.
-
-    HTML5's *implicit* closes are deliberately NOT modelled -- `<p><p><p>`
-    does not nest three deep; the parser closes the previous `<p>` the
-    moment the next one opens. Teaching this function that rule would only
-    ever REDUCE the depth it counts for such input, which moves error onto
-    the dangerous side (under-counting) to fix a case that only ever costs
-    the safe one (a paragraph-heavy body over-counted into the plain-text
-    fallback it didn't strictly need). Do not add it.
-    """
-    if len(raw) < GUARD_MIN_BYTES:
-        return False
-    stack: list[str] = []
-    length = len(raw)
-    pos = 0
-    while True:
-        lt = raw.find("<", pos)
-        if lt == -1:
-            break
-        if raw.startswith("<!--", lt):
-            end = raw.find("-->", lt + 4)
-            if end == -1:
-                # Unterminated: the tokenizer treats everything from here to
-                # EOF as comment data too, so there is no real tag left to
-                # find -- stop scanning rather than keep looking for one.
-                break
-            pos = end + 3
-            continue
-        if lt + 1 < length and raw[lt + 1] in "!?":
-            # A DOCTYPE, a processing instruction, or any other bogus
-            # comment -- the tokenizer runs to the next '>' in all of these
-            # states and nothing in between is a tag, opening or closing.
-            gt = raw.find(">", lt)
-            if gt == -1:
-                break  # runs to EOF the same way an unterminated comment does
-            pos = gt + 1
-            continue
-        match = _TAG_RE.match(raw, lt)
-        if match is None:
-            pos = lt + 1
-            continue
-        closing, name = match.group(1), match.group(2).lower()
-        if closing:
-            if stack and stack[-1] == name:
-                stack.pop()
-            # else: ignore. Deliberately never search past the top -- see the
-            # docstring's history of why "search deeper" is the unsafe move.
-        elif name not in _VOID_ELEMENTS:
-            stack.append(name)
-            if len(stack) > MAX_NESTING:
-                return True
-        pos = match.end()
-    return False
+# A body's byte size, unlike its markup, has no tokenizer state to bypass --
+# it is what it is regardless of how the bytes are shaped, so this is the one
+# bound in this file's history that cannot be defeated by choosing a cleverer
+# shape. This deliberately gives up on rendering large bodies at all, rather
+# than trying to decide which large bodies are safe: every body over the cap
+# gets the plain-text fallback (`articles.body`, which holds every word
+# regardless of body_raw), independent of what its markup contains.
+#
+# Measured directly, no guard of any kind, worst render across six adversarial
+# shapes at each size (one-sided, unclosed tags reach the deepest real
+# nesting per byte -- 5 bytes each with nothing spent on a matching close):
+# 32 KiB -> 90 ms, 64 KiB -> 354 ms, 96 KiB -> 793 ms, 128 KiB -> 1,410 ms. An
+# earlier estimate of "64 KiB is about 80 ms" was wrong -- it assumed matched
+# `<div>...</div>` pairs at 11 bytes per level, not the 5-byte one-sided shape
+# that actually reaches the worst depth (~13,100) at this size; re-measured
+# before choosing this number rather than trusted from an earlier round.
+# 64 KiB is chosen because 354 ms stays comfortably inside the 1 s budget
+# this guard exists to protect for every shape measured, not just the ones a
+# scan happened to recognise, and still covers roughly nineteen times the
+# 3.4 KB mean archived body (SPEC.md) -- the vast majority of the archive
+# keeps its markup; only the long tail loses it.
+MAX_MARKUP_BYTES = 64 * 1024
 
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
@@ -678,8 +488,8 @@ def _image_urls(items: Sequence[object]) -> set[str]:
 
 
 def render_body(raw: str, images: Mapping[str, ImageState]) -> RenderedBody | None:
-    if _too_deeply_nested(raw or ""):
-        log.warning("refusing to render a body nested past %d", MAX_NESTING)
+    if len(raw or "") > MAX_MARKUP_BYTES:
+        log.warning("refusing to render a body over %d bytes", MAX_MARKUP_BYTES)
         return None
     tree = HTMLParser(raw or "")
     # Remove every DROPPED subtree once, before the walk, rather than

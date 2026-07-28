@@ -1929,6 +1929,76 @@ No re-crawl — this is the property the storage decision bought.
 
 Added after Task 3's third review round measured it. Not in the original spec.
 
+> **This task's entire approach — a regex-and-stack scan of `body_raw` that
+> estimates nesting depth before handing the body to selectolax — was
+> abandoned after shipping and being reviewed six times in a row. Read
+> `src/babel/web/markup.py`'s `MAX_MARKUP_BYTES` comment and
+> `tests/web/test_markup.py` as the source of truth, not the plan text below,
+> which describes the design that was replaced.
+>
+> **What shipped instead: `MAX_MARKUP_BYTES = 64 * 1024`.** `render_body`
+> refuses any body over 64 KiB outright — no HTML parsing, no scanning, no
+> tag matching of any kind enters the decision. A body over the cap gets the
+> same plain-text fallback (`articles.body`) a too-deeply-nested body used to
+> get; the difference is entirely in how "too dangerous to render" is
+> decided. `MAX_NESTING` and `GUARD_MIN_BYTES`, named throughout the plan
+> text below, do not exist in the shipped code.
+>
+> **Why the scanning approach could not be salvaged.** Five review rounds,
+> each finding a genuine bypass the previous round's fix didn't cover,
+> because each fix modelled HTML5 tokenizer behaviour more precisely than
+> the last and each new precision opened a gap into a tokenizer state it
+> didn't yet model. In order: (1) a running balance of opens/closes doesn't
+> know a close needs a matching open — 18.2 s unrefused. (2) a stack that
+> searches for a same-named entry anywhere in it, not just the top, ignores
+> HTML5 scope boundaries (`object`, `table`, …), RAWTEXT content
+> (`<style>`, `<textarea>`, …), and a tag-name character class narrower
+> than HTML5's own grammar — 29.5 s, 3.5 s, and 24.3 s unrefused
+> respectively. (3) a regex that treats any quote as opening an attribute
+> value, when HTML5 only does that right after `=`, lets an unbalanced
+> quote swallow the rest of the document as one "tag" — 58.7 s unrefused,
+> the worst of the first four. (4) teaching the scan to skip HTML comments
+> closed that hole but, because it only recognised `-->` as a terminator,
+> opened four more: `<!-->`, `<!--->`, and `<!-- --!>` are all valid ways
+> HTML5 also ends a comment, and each one made the scanner misread a closed
+> comment as unterminated and abandon the rest of the document — a single
+> 1,000,000-byte body rendered past a **two-minute** timeout, worse than
+> having no guard at all. HTML5's tokenizer has more than eighty states;
+> a scan that tries to track enough of them to bound depth safely does not
+> converge, and five bypasses in five rounds was the signal to stop
+> patching and change the approach rather than attempt a sixth.
+>
+> **The bound that replaced it has no bypass class**, because it doesn't
+> read the markup at all — a byte count cannot be tricked by a clever tag
+> shape the way a scan can. Measured directly, no guard of any kind, worst
+> render across six adversarial one-sided-tag shapes (5 bytes per level,
+> nothing spent on a matching close — the deepest real nesting achievable
+> per byte) at each size:
+>
+> | size | worst render |
+> |---|---|
+> | 32 KiB | 90 ms |
+> | 64 KiB | 354 ms |
+> | 96 KiB | 793 ms |
+> | 128 KiB | 1,410 ms |
+>
+> 64 KiB was chosen because 354 ms is comfortably inside the 1 s budget this
+> guard exists to protect *for every shape measured*, not just the ones a
+> scan happened to recognise, and still covers roughly nineteen times the
+> 3.4 KB mean archived body (SPEC.md) — the vast majority of the archive
+> keeps its rendered markup; only the long tail past 64 KiB loses it to the
+> plain-text fallback. An earlier estimate that 64 KiB would cost "about
+> 80 ms" was itself wrong, for the same reason as every round above: it
+> assumed matched `<div>...</div>` pairs (11 bytes/level) rather than the
+> one-sided shape that actually reaches the worst depth (~13,100) at that
+> size, and was corrected by direct measurement before being written into
+> the shipped comment.
+>
+> Also removed, along with the scanning code: `_VOID_ELEMENTS` and
+> `_TAG_RE` (both specific to the scan) and every test that exercised them.
+> `MAX_DEPTH` (the recursive emitter's own stack-exhaustion ceiling, Task 3)
+> is unrelated and was kept unchanged.
+
 **Files:**
 - Modify: `src/babel/web/markup.py`
 - Test: `tests/web/test_markup.py`

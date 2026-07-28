@@ -1,6 +1,6 @@
 import datetime
 
-from babel.web.markup import MAX_NESTING
+from babel.web.markup import MAX_MARKUP_BYTES
 
 UTC = datetime.UTC
 
@@ -359,11 +359,11 @@ async def test_an_empty_rendered_body_does_not_falsely_flag_the_gallery(client, 
     assert "no longer in the article" not in body
 
 
-async def test_a_comment_nested_past_the_limit_falls_back_to_plain_text(client, pool):
-    """render_body returns None for a body nested past MAX_NESTING (Task 11).
+async def test_a_comment_over_the_markup_cap_falls_back_to_plain_text(client, pool):
+    """render_body returns None for a body over MAX_MARKUP_BYTES (Task 11).
 
     The route used to build comment_html unconditionally --
-    `render_body(c.body_raw, {}).html` -- so a single deeply-nested COMMENT
+    `render_body(c.body_raw, {}).html` -- so a single oversized COMMENT
     body raised AttributeError on the None and 500'd the whole article page,
     not just that one comment. article.html's `comment_html.get(c.id)`
     already falls back to the comment's own plain-text `body` when the id is
@@ -373,15 +373,20 @@ async def test_a_comment_nested_past_the_limit_falls_back_to_plain_text(client, 
     no template change was needed. The article's own body is untouched by
     this fixture (plain default text, no body_raw), isolating this to the
     comment path the bug was in.
+
+    The oversized body is plain, ordinary markup, not a deeply nested one:
+    round 6 replaced the depth-scanning guard (which this test originally
+    exercised via MAX_NESTING) with a byte-size cap alone, so any body over
+    MAX_MARKUP_BYTES is refused regardless of its shape.
     """
     await _article(pool, 2111, comment_count=1)
-    nested = "<div>" * (MAX_NESTING + 50) + "text" + ("z" * 25_000) + "</div>" * (MAX_NESTING + 50)
+    oversized = "<p>" + ("z" * (MAX_MARKUP_BYTES + 1)) + "</p>"
     async with pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO comments (id, article_id, position, depth, author_name,
                                      body, body_raw)
                VALUES (92, 2111, 0, 0, 'bob', 'plain fallback text', $1)""",
-            nested,
+            oversized,
         )
     response = await client.get("/article/2111")
     assert response.status_code == 200
