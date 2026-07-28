@@ -101,8 +101,12 @@ M2 are already fixed and deployed; these are not.
   asymmetric failure — a markup change, where the feed keeps working while `parse_article` returns
   None. Fix: give the poller the cooldown the sweep has.
 - **M1 — the sweep is unreachable for the whole ~32-day walk**, so `babel refetch` looks inert.
+  **Its operator-facing half is closed as of 2026-07-28: `babel run --sweep-only` skips the walk and
+  goes straight to `claim_retryable`, and deliberately neither reads nor writes the cursor, so a
+  sweep leaves the walk exactly where it was with nothing to restore afterwards.** What remains open
+  is the running service, which still cannot interleave the phases on its own.
   `run_backfill` only reaches `claim_retryable` once the cursor passes `stop_at`. Nothing is lost
-  (waiting does not burn attempts), but README.md and CLAUDE.md both say the running service
+  (waiting does not burn attempts), but README.md and CLAUDE.md both said the running service
   "picks the queued IDs up on its own", which reads as immediacy. Either interleave the phases or
   correct the docs.
 - **M3 — still open for the crawler's own queries; prevented from recurring in the newer browse
@@ -313,7 +317,8 @@ measurement was cheap.
   `babel refetch --from 100 --to 200` — queue already-collected articles for re-collection after a
   parser fix or a markup change. The sweep phase that picks them up is only reached once the walk
   bottoms out (M1 above), so during a walk this queues work for ~32 days' time. To act on it now,
-  stop `crawler` and run a one-shot `babel run --no-poll` until the queue drains — README, "Re-collect
+  stop `crawler` and run a one-shot `babel run --no-poll --sweep-only` until the queue drains
+  (`--sweep-only` is what makes the sweep reachable at all — see below) — README, "Re-collect
   the bodies before launch", has the exact commands
 - `docker compose run --rm crawler babel requeue-images --host i.imgur.com` — put one image host's
   `dead`/`error` rows back to `pending` with attempts reset, after fixing whatever caused that host

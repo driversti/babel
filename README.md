@@ -125,12 +125,24 @@ service in `docker-compose.yml` for what that costs and what carries the weight 
 Every article and comment collected before migration 007 has no `body_raw`, so it renders through
 the plain-text fallback: no paragraphs for the oldest rows, and no emphasis, links or in-position
 images for any of them. Re-collection is what fills the column, and it is a deliberate three-step
-pass, not a queued job:
+pass, not a queued job.
+
+**`--sweep-only` is not optional here.** Without it the one-shot walks instead of sweeping: the walk
+runs while `cursor >= stop_at`, `babel run` hardcodes `stop_at=1`, and a live cursor is in the
+millions — so the sweep is a month away and the pass silently collects nothing it was asked to.
+The flag skips the walk and, deliberately, neither reads nor writes the cursor, so the walk keeps
+its place with nothing to restore afterwards.
+
+**Expect an hour of apparent nothing first.** `refetch` stamps `updated_at = now()` and the sweep
+only claims rows older than `retry_cooldown_sec` (an hour by default), so the first hour logs
+nothing at all. After that it logs `sweeping 50 article(s)` roughly once a minute. Judge progress
+by `SELECT count(*) FROM articles WHERE body_raw IS NOT NULL`, not by the logs, and note the loop
+idles rather than exiting when the queue drains — stopping it is the operator's job.
 
 ```bash
 docker compose run --rm crawler babel refetch --from 1 --to 2797025 --yes
 docker compose stop crawler
-docker compose run --rm crawler babel run --no-poll   # runs the sweep; stop it when the queue drains
+docker compose run --rm crawler babel run --no-poll --sweep-only   # stop it when the queue drains
 docker compose up -d crawler
 ```
 

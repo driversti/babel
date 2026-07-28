@@ -272,13 +272,20 @@ async def _migrate() -> None:
 @click.option("--start-id", type=int, default=None, help="Required only on the very first run.")
 @click.option("--no-poll", is_flag=True, help="Backfill only.")
 @click.option("--no-backfill", is_flag=True, help="Live polling only.")
-def run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
+@click.option(
+    "--sweep-only",
+    is_flag=True,
+    help="Re-collect queued articles instead of walking. Leaves the cursor alone.",
+)
+def run(start_id: int | None, no_poll: bool, no_backfill: bool, sweep_only: bool) -> None:
     """Run the crawler until stopped."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    asyncio.run(_run(start_id, no_poll, no_backfill))
+    asyncio.run(_run(start_id, no_poll, no_backfill, sweep_only))
 
 
-async def _run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
+async def _run(
+    start_id: int | None, no_poll: bool, no_backfill: bool, sweep_only: bool = False
+) -> None:
     settings = Settings()
     notifier = Throttled(build_notifier(settings), settings.alert_repeat_sec)
 
@@ -320,7 +327,7 @@ async def _run(start_id: int | None, no_poll: bool, no_backfill: bool) -> None:
         if not no_backfill:
             tasks.append(
                 asyncio.create_task(
-                    _backfill_forever(pool, ingestor, start_id, fetch_rss, settings)
+                    _backfill_forever(pool, ingestor, start_id, fetch_rss, settings, sweep_only)
                 )
             )
 
@@ -404,7 +411,12 @@ async def _poll_forever(pool, ingestor: Ingestor, fetch_rss, settings: Settings)
 
 
 async def _backfill_forever(
-    pool, ingestor: Ingestor, start_id: int | None, fetch_rss, settings: Settings
+    pool,
+    ingestor: Ingestor,
+    start_id: int | None,
+    fetch_rss,
+    settings: Settings,
+    sweep_only: bool = False,
 ) -> None:
     async with pool.acquire() as conn:
         await run_backfill(
@@ -416,6 +428,10 @@ async def _backfill_forever(
             # fresh deployment crash-loops under `restart: unless-stopped`.
             discover_start=functools.partial(newest_article_id, fetch_rss),
             stop_at=1,
+            # Hardcoded, and that is why --sweep-only exists: the sweep only
+            # runs once the cursor descends past this, which on a live archive
+            # is a month away. See run_backfill's docstring.
+            sweep_only=sweep_only,
             cooldown_sec=settings.retry_cooldown_sec,
             idle_sleep_sec=settings.backfill_idle_sleep_sec,
         )

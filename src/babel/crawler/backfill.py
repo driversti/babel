@@ -64,12 +64,27 @@ async def run_backfill(
     idle_sleep_sec: float = 300.0,
     sleep=asyncio.sleep,
     max_cycles: int | None = None,
+    sweep_only: bool = False,
 ) -> None:
-    """Collect articles until stopped. `max_cycles` bounds the loop for tests."""
+    """Collect articles until stopped. `max_cycles` bounds the loop for tests.
+
+    `sweep_only` skips the walk entirely and goes straight to `claim_retryable`.
+    Without it the sweep is unreachable in practice: the walk runs while
+    `cursor >= stop_at`, `babel run` hardcodes `stop_at=1`, and the live cursor
+    is in the millions — so the re-collection procedure this project documents
+    (stop the crawler, run a one-shot, wait for the sweep) walked instead and
+    swept nothing, for the whole ~32-day descent. That is finding M1's
+    operator-facing half.
+
+    It deliberately neither reads a start point nor writes the cursor, so a
+    sweep leaves the walk exactly where it was. The alternative on a live host
+    was to park the cursor by hand and restore it hours later, which is a
+    procedure whose safety rests on someone remembering a number.
+    """
     # A stored cursor is the resume point and beats both, or every restart would
     # jump back to the newest article and the walk would never reach the archive.
     cursor = await repo.get_cursor(conn, cursor_name)
-    if cursor is None:
+    if cursor is None and not sweep_only:
         cursor = await _first_cursor(start_id, discover_start)
         # Written before any article is fetched. The loop only persists the cursor
         # once a whole batch finishes — 50 articles, about a minute — and a restart
@@ -82,7 +97,7 @@ async def run_backfill(
     while max_cycles is None or cycles < max_cycles:
         cycles += 1
 
-        if cursor >= stop_at:
+        if not sweep_only and cursor >= stop_at:
             batch = list(range(cursor, max(stop_at - 1, cursor - batch_size), -1))
             for article_id in await repo.filter_unseen(conn, batch):
                 await _ingest_one(conn, ingest, article_id)
