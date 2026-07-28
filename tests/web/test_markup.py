@@ -332,24 +332,27 @@ def test_thousands_of_dropped_elements_render_well_under_a_second():
     HTMLParser.strip_tags(), which runs in selectolax's C layer and is
     linear.
 
-    2,500 elements, not the original 4,000: this body must now fit under
-    MAX_MARKUP_BYTES (64 KiB) too, since render_body refuses anything
-    larger before strip_tags ever runs -- 4,000 of these elements is
-    86,897 bytes, over the cap, and would have been refused outright
-    rather than exercising this cost path at all. 2,500 is 53,897 bytes,
-    comfortably under, and a hypothetical regression back to O(n^2) at
-    this count would still cost roughly a tenth of the original 25.3s
-    measurement (~2.5s) -- easily enough to trip the assertion below.
-    "well under a second" is a generous ceiling against a ~5ms
-    measurement, chosen to be robust to slower CI hardware while still
-    catching that regression.
+    2,000 `<svg>` elements, not the original 4,000 `<script>` elements this
+    test used before B2 (the whole-branch review's finding on
+    MAX_MARKUP_BYTES) moved the cap from 64 KiB to 32 KiB: this body must
+    fit under whatever the cap currently is, since render_body refuses
+    anything larger before strip_tags ever runs. `<script>` was switched to
+    the shorter `<svg>` (both DROPPED) to keep enough elements under the
+    smaller cap for the regression check below to still mean something: at
+    32 KiB, 2,000 `<svg>x{i}</svg>` elements is 30,897 bytes, comfortably
+    under, and a hypothetical regression back to O(n^2) at this count would
+    cost roughly 25.3s * (2,000/8,000)^2 ~= 1.6s against the original
+    8,000-element, 25.3s measurement -- over the 1.0s assertion below with
+    real margin, not just barely. "well under a second" is a generous
+    ceiling against a ~5ms measurement, chosen to be robust to slower CI
+    hardware while still catching that regression.
     """
-    raw = "<p>" + "".join(f"<script>x{i}</script>" for i in range(2500)) + "</p>"
+    raw = "<p>" + "".join(f"<svg>x{i}</svg>" for i in range(2000)) + "</p>"
     assert len(raw) <= MAX_MARKUP_BYTES
     started = time.perf_counter()
     out = html(raw)
     elapsed = time.perf_counter() - started
-    assert "x0" not in out and "x2499" not in out
+    assert "x0" not in out and "x1999" not in out
     assert elapsed < 1.0, f"took {elapsed:.2f}s -- DROPPED removal may have regressed to O(n^2)"
 
 
@@ -696,6 +699,12 @@ def test_a_body_just_over_the_cap_is_refused():
 
 
 @pytest.mark.parametrize(
+    # Each count is coupled to the exact bytes of its fixture file under
+    # tests/fixtures/: editing article_with_images.html, article_with_
+    # comments.html or article_indonesia.html (a re-capture, a markup fix,
+    # anything that changes their postBody div) can silently make the
+    # matching number below wrong rather than making the test fail for an
+    # obvious reason -- recount `<p>` in the new render before updating it.
     ("filename", "expected_paragraphs"),
     [
         ("article_with_images.html", 6),
@@ -768,6 +777,13 @@ def test_every_historical_attack_shape_renders_harmlessly_under_the_cap(label):
     from seconds (round 2's mismatched close) to a two-minute timeout
     (round 6's comment-end-bang hole) at sizes comparable to this one;
     under the cap, all of them render in well under a second.
+
+    The 1.0 s ceiling itself has real headroom, not thin: the worst shape
+    found at MAX_MARKUP_BYTES (32 KiB) measures ~308 ms (see
+    test_the_worst_known_shape_at_the_cap_renders_well_under_a_second), and
+    none of these historical shapes reaches that -- most render in single-
+    digit milliseconds. A failure here is a real regression, not a slow CI
+    runner brushing a tight margin.
     """
     raw = _SHAPES[label]
     assert len(raw) <= MAX_MARKUP_BYTES
@@ -779,19 +795,37 @@ def test_every_historical_attack_shape_renders_harmlessly_under_the_cap(label):
 
 
 def test_the_worst_known_shape_at_the_cap_renders_well_under_a_second():
-    """The single worst shape measured across every round of this guard's
-    history: unclosed, one-sided `<div>` tags, 5 bytes each with nothing
-    spent on a matching close, reaching the deepest real nesting per byte
-    of anything tried. Measured with no guard of any kind at exactly
-    MAX_MARKUP_BYTES (64 KiB): 352-354 ms, confirmed independently rather
-    than trusted from the review that chose this cap. This is the test
-    that actually pins the cap's value: raise MAX_MARKUP_BYTES enough (128
-    KiB measures ~1.4 s for this same shape) and this is the test that
-    fails, not the correctness ones above, because correctness doesn't
+    """The worst shape found so far, not `<div>`. One-sided `<div>` was
+    believed to be the worst case because it reaches the deepest nesting per
+    byte among 5-byte-per-level shapes -- but four-byte list elements
+    (`<ul>`, `<ol>`, `<dd>`, `<dt>`, `<li>`) reach 16,384 levels at this size
+    instead of 13,107, and none of them is a scope boundary, so each
+    additionally triggers HTML5's "have a p element in button scope" walk
+    over the whole open-element stack; `<a>` and `<nobr>` stack adoption-
+    agency walks on top of that. The search that produced `<div>`'s number
+    only tried five-byte-per-level shapes, which is why it missed this one.
+
+    `"<ol><ol><dd><ol><li><ul><a><ol><nobr><ul>"` is the hill-climbed result
+    of widening that search: measured at exactly MAX_MARKUP_BYTES (32 KiB),
+    it costs ~308 ms, independently reproduced within a few ms. At the
+    previous cap of 64 KiB the same shape measured 1,215-1,221 ms -- over
+    the 1 s budget this guard exists to enforce -- which is what moved the
+    cap from 64 KiB to 32 KiB rather than merely rewriting this test. This is
+    the test that actually pins the cap's value: raise MAX_MARKUP_BYTES
+    enough (64 KiB measures ~1.2 s for this same shape) and this is the test
+    that fails, not the correctness ones above, because correctness doesn't
     care how large the cap is -- only timing does.
+
+    Headroom against the 1.0 s ceiling: ~308 ms measured vs. ~692 ms of
+    margin, roughly 2.2x. That is real margin, not a coin flip -- unlike the
+    64 KiB cap this replaces (354 ms measured against the *wrong* worst
+    shape, no margin at all against the real one), so a failure here should
+    be read as a genuine regression rather than routine variance, though a
+    sufficiently loaded or slow machine could still trip it.
     """
-    n = MAX_MARKUP_BYTES // len("<div>")
-    raw = "<div>" * n
+    unit = "<ol><ol><dd><ol><li><ul><a><ol><nobr><ul>"
+    n = MAX_MARKUP_BYTES // len(unit)
+    raw = unit * n
     assert len(raw) <= MAX_MARKUP_BYTES
     start = time.perf_counter()
     rendered = render_body(raw, {})

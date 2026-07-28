@@ -60,7 +60,10 @@ DROPPED: frozenset[str] = frozenset({
     "select", "textarea", "applet", "frame", "frameset",
 })
 
-# Emitted tags that end the paragraph being accumulated. Task 4 uses this.
+# Emitted tags that end the paragraph being accumulated. Used by _convert to
+# decide when a source element needs `_paragraphs`'s grouping pass at all,
+# and by _has_paragraph_break to recognise a nested Block as its own
+# boundary.
 BLOCKS: frozenset[str] = frozenset({
     "p", "blockquote", "ul", "ol", "li", "h2", "h3", "h4", "h5", "h6",
 })
@@ -102,24 +105,35 @@ MAX_DEPTH = 100
 # gets the plain-text fallback (`articles.body`, which holds every word
 # regardless of body_raw), independent of what its markup contains.
 #
-# Measured directly, no guard of any kind, worst render across six adversarial
-# shapes at each size (one-sided, unclosed tags reach the deepest real
-# nesting per byte -- 5 bytes each with nothing spent on a matching close):
-# 32 KiB -> 90 ms, 64 KiB -> 354 ms, 96 KiB -> 793 ms, 128 KiB -> 1,410 ms. An
-# earlier estimate of "64 KiB is about 80 ms" was wrong -- it assumed matched
-# `<div>...</div>` pairs at 11 bytes per level, not the 5-byte one-sided shape
-# that actually reaches the worst depth (~13,100) at this size; re-measured
-# before choosing this number rather than trusted from an earlier round.
-# 64 KiB is chosen because 354 ms stays comfortably inside the 1 s budget
-# this guard exists to protect for every shape measured, not just the ones a
-# scan happened to recognise, and still covers roughly nineteen times the
-# 3.4 KB mean archived body (SPEC.md) -- the vast majority of the archive
-# keeps its markup; only the long tail loses it.
-MAX_MARKUP_BYTES = 64 * 1024
+# The first measurement behind this cap searched only five-byte-per-level,
+# one-sided shapes -- `<div>`, `<dir>` -- and concluded 64 KiB was safe at
+# 354 ms against the 1 s budget below. That search was too narrow: four-byte
+# list elements (`<ul>`, `<ol>`, `<dd>`, `<dt>`, `<li>`) reach 16,384 levels
+# in the same space instead of 13,107, and none of them is a scope boundary,
+# so each additionally triggers HTML5's "have a p element in button scope"
+# walk over the whole open-element stack -- `<ol>` alone is 564 ms and `<ul>`
+# 587 ms at 64 KiB, matched or exceeded by `<dir>` and `<ul><ol>`. Stacking
+# `<a>` and `<nobr>` on top adds adoption-agency walks for the same reason.
+# Hill-climbing from there found `"<ol><ol><dd><ol><li><ul><a><ol><nobr><ul>"`,
+# which measured **1,215 ms** at exactly 64 KiB -- over the 1 s budget this
+# guard exists to enforce, independently reproduced within a few ms. Cost is
+# roughly quadratic in size for this shape: 32 KiB -> 308 ms, 40 -> 479,
+# 48 -> 685, 56 -> 933, 64 -> 1,216 (independently reproduced at
+# 308/686/1,234). No amount of further widening this search can make a size
+# cap wrong in the way a markup-scanning guard could be, because a byte count
+# never reads the markup at all -- but it can make the *value* wrong, which
+# is what happened here.
+#
+# 32 KiB is chosen because the worst shape found so far measures ~308 ms
+# there, restoring the margin the previous value was believed to have, and
+# still covers roughly ten times the 3.4 KB mean archived body (SPEC.md) --
+# the vast majority of the archive keeps its markup; only the long tail
+# loses it. Paired with the per-request render budget in web/routes.py, a
+# single body can no longer consume that budget by itself.
+MAX_MARKUP_BYTES = 32 * 1024
 
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
-_VOID = frozenset({"br", "img"})
 
 # What the reader is told when the bytes are not on our disk. 'withheld' gets no
 # link: `babel hide --image` is a takedown, and linking round it would defeat it.
@@ -282,13 +296,17 @@ def _is_blank(items: Sequence[object]) -> bool:
 
 
 def _has_paragraph_break(items: Sequence[object]) -> bool:
-    """True if grouping `items` through `_paragraphs` would actually change
-    anything: a run of two or more Breaks, or a nested Block that must stand
-    apart from the inline content around it. A single Break, or plain text
-    and inline elements with no Block among them, is content _paragraphs
-    would return as one untouched group -- so a caller that only wants to
-    know whether it needs to pay for grouping (and gains an inner <p> from
-    it) can skip the call entirely when this is False.
+    """True if grouping `items` through `_paragraphs` would produce visible
+    structure beyond a single plain wrap: a run of two or more Breaks, which
+    splits `items` into multiple blocks, or a nested Block that must stand
+    apart from the inline content around it. When this is False, `_paragraphs`
+    does not return `items` back "untouched" -- it still trims trailing
+    Breaks and leading/trailing blank Text, and content that is blank
+    throughout collapses to zero groups, not one (`_paragraphs((Text("   "),))
+    == ()`, not a single Block) -- what False actually guarantees is that no
+    *additional* Block boundary would appear, so a caller that only cares
+    about that (and gains an inner <p> it would otherwise pay for) can skip
+    the call entirely when this is False.
 
     Whitespace-only Text between two Breaks is transparent to the run count,
     the same way `_paragraphs` itself treats it: the game writes
