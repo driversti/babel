@@ -878,6 +878,39 @@ def test_a_hyphenated_tag_name_cannot_defeat_the_depth_counter():
     assert render_body(raw, {}) is None
 
 
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_an_unbalanced_quote_cannot_swallow_the_rest_of_the_document(quote):
+    """Found in review, round 4: the original `_TAG_RE` let a quote mark
+    ANYWHERE after the tag name open a quoted run that swallows everything
+    up to the matching quote -- including any `>` inside it. HTML5 only
+    enters "attribute value (quoted)" state right after a real `=`; a stray
+    quote in the before-attribute-name state just starts a new (malformed)
+    attribute *name* and does not change how `>` is recognised -- the real
+    tag still ends at the very next `>`. So an unbalanced quote right after
+    the tag name (`<a"`, with no closing quote until far later) was ONE tag
+    to the old regex and genuinely deep to the real parser: confirmed
+    directly, `<a"<div><div><div><div>">` produced regex opens `['a']`
+    (the whole thing swallowed as one tag) against a real parser depth of
+    4. Measured at crawler/parser.py's 1,000,000-character ceiling:
+    `"<a\"" + "<div>" * 166000 + "\">"` (830,005 B) rendered -- not refused
+    -- in 58,688 ms, the worst of the four bypasses found on this function
+    and worse than the first three combined were individually.
+
+    Fixed by deleting quote-awareness from `_TAG_RE` entirely: a tag now
+    ends at the first `>`, full stop, matching the real tokenizer's
+    before-attribute-name state for everything except a `>` that arrives
+    genuinely inside a quoted value opened by a real `="` or `='`. That
+    under-recognises real attribute values containing a literal `>` --
+    splitting one real tag into a phantom open plus leftover text -- but
+    every consequence of that split can only add extra phantom opens,
+    never remove real ones. Over-counting, the safe side.
+    """
+    n = 20_000
+    raw = f"<a{quote}" + "<div>" * n + f"{quote}>"
+    assert len(raw) > GUARD_MIN_BYTES
+    assert render_body(raw, {}) is None
+
+
 def test_the_pathological_body_renders_in_well_under_a_second():
     """The whole point. Without the guard this exact input takes ~17.7 s."""
     n = 1_000_000 // 11

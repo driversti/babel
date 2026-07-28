@@ -108,7 +108,7 @@ _VOID_ELEMENTS = frozenset({
     "meta", "param", "source", "track", "wbr",
 })
 
-_TAG_RE = re.compile(r"""<(/?)([a-zA-Z][^\s/>"']*)((?:[^>"']|"[^"]*"|'[^']*')*)>""")
+_TAG_RE = re.compile(r"""<(/?)([a-zA-Z][^\s/>"']*)[^>]*>""")
 
 
 def _too_deeply_nested(raw: str) -> bool:
@@ -121,7 +121,7 @@ def _too_deeply_nested(raw: str) -> bool:
     choice below is made to never under-count, even at the cost of sometimes
     over-counting a body that would actually have parsed cheaply.
 
-    This function has been wrong three times before landing on the rule
+    This function has been wrong four times before landing on the rule
     below, and every one of those times was a *clever* attempt to track HTML5
     tree construction more exactly. Read this history before changing
     anything here again:
@@ -163,6 +163,30 @@ def _too_deeply_nested(raw: str) -> bool:
        Fixed here too: `_TAG_RE`'s name class widened to
        `[a-zA-Z][^\\s/>"']*`, matching everything HTML5 accepts in a tag
        name (letters, digits, and the punctuation real tag names use).
+    3. `_TAG_RE` itself, from the very first version of this function, let a
+       `"` ANYWHERE after the tag name open a quoted run that swallows
+       everything up to the matching quote, including any `>` inside it.
+       HTML5 only enters "attribute value (quoted)" state right after an
+       `=`; a stray `"` in the before-attribute-name state just starts a new
+       (malformed) attribute *name* and does not change how `>` is
+       recognised at all -- the tag still ends at the next real `>`. So
+       `"<a\"" + "<div>" * N + "\">"` is ONE tag to this regex (the
+       unbalanced `"` right after `a` opens a quoted run that swallows every
+       `<div>` up to the matching `"`) and genuinely `N` deep to the real
+       parser, which has no such rule to trip over. Measured at
+       crawler/parser.py's 1,000,000-character ceiling: `N=166,000`
+       (830,005 B) parsed in 58,688 ms unrefused -- the worst of the four,
+       and worse than the first three combined were on their own.
+       Fixed by deleting quote-awareness from `_TAG_RE` entirely: a tag now
+       ends at the first `>`, full stop, exactly like the real tokenizer's
+       before-attribute-name state does for everything except a `>` that
+       arrives *after* a real `="` or `='`. This under-recognises real
+       attribute values containing a literal `>` -- the match ends early,
+       splitting one real tag into a phantom open plus leftover text that
+       might itself contain something matchable -- but every consequence of
+       that split is an *extra* phantom open or close, which can only ever
+       grow the counted depth, never shrink it. Over-counting, the safe
+       side, again.
 
     **The rule that actually holds, this time because it stops trying to be
     exact: pop only when a close matches the TOP of the stack. Never search
@@ -176,9 +200,11 @@ def _too_deeply_nested(raw: str) -> bool:
     would, never fewer. That is over-counting, and over-counting only costs
     a body the plain-text fallback -- the safe side of every mistake this
     function has made. Do not replace it with anything that tries to model
-    scope, RAWTEXT, or matching-anywhere-in-the-stack more precisely; every
-    such attempt so far has bought a little accuracy on the safe side by
-    selling correctness on the dangerous one. Be crude in the safe
+    scope, RAWTEXT, matching-anywhere-in-the-stack, or quoted attribute
+    values more precisely; every such attempt so far has bought a little
+    accuracy on the safe side by selling correctness on the dangerous one.
+    In particular: do not put quote-awareness back into `_TAG_RE`. Be crude
+    in the safe
     direction, on purpose.
 
     Still amortised linear: every push is popped at most once (an ignored
