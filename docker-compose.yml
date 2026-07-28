@@ -65,6 +65,42 @@ services:
       db: {condition: service_healthy}
     restart: unless-stopped
 
+  # The re-collection pass: the crawler's image and tunnel, but `--sweep-only`,
+  # so it drains fetch_log's stale/error queue instead of walking.
+  #
+  # It is a service rather than the `compose run --rm` one-shot the docs used to
+  # prescribe because that container carries `restart: no` and is deleted when it
+  # exits. A host reboot therefore ended a 34-hour re-collection silently — every
+  # other container came back healthy around it, `docker ps` looked right, and the
+  # only symptom was `body_raw` quietly not filling.
+  #
+  # Behind a profile because it must NOT come up with a bare `docker compose
+  # up -d`. RateLimiter is constructed per process (cli.py `_run`), so a sweep
+  # running beside the walk asks eRepublik for two articles a second rather than
+  # the one this project settled on. Stop `crawler` first, then:
+  #
+  #   docker compose --profile sweep up -d sweep     # start
+  #   docker compose --profile sweep stop sweep      # when the queue drains
+  #
+  # `unless-stopped` then keeps it down across a reboot the same way it keeps a
+  # hand-stopped `crawler` down, so stopping it once is enough.
+  #
+  # Like `crawler` and `images` this applies pending migrations at startup, so it
+  # is subject to the same build-before-migrate rule in README.
+  sweep:
+    build: .
+    container_name: babel-sweep
+    command: ["babel", "run", "--no-poll", "--sweep-only"]
+    profiles: ["sweep"]
+    env_file: .env
+    volumes:
+      - ${IMAGE_ROOT_HOST:-./data/images}:/data/images
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun: {condition: service_healthy}
+      db: {condition: service_healthy}
+    restart: unless-stopped
+
   images:
     build: .
     container_name: babel-images

@@ -175,8 +175,14 @@ mutation results:
 ## Operating the live run
 
 It runs as five compose services on the deploy host (see SPEC.md "Target host"; the address is not
-in this repo). `gluetun` is the tunnel, `db` is Postgres, `crawler` walks and polls, `images`
-drains the image queue, and `web` (`babel serve`) serves the public read-only archive. `web` is
+in this repo), plus a sixth that only runs when an operator asks for it. `gluetun` is the tunnel,
+`db` is Postgres, `crawler` walks and polls, `images` drains the image queue, and `web`
+(`babel serve`) serves the public read-only archive. The sixth is `sweep`, behind a compose profile
+so a bare `up -d` never starts it: it is `crawler`'s image running `--no-poll --sweep-only`, for
+re-collection passes, and it is a service rather than a `compose run --rm` one-shot because that
+one-shot carries `restart: no` and is deleted on exit — a reboot ended a 34-hour re-collection with
+every other container coming back healthy around it. The profile exists because `RateLimiter` is
+per process: a sweep beside the walk is two requests a second, so stop `crawler` first. `web` is
 deliberately outside gluetun's namespace: it needs inbound connections, which that namespace cannot
 accept, and its only outbound dependency is Postgres on the bridge, so the site stays up when the
 tunnel is down. All state is in Postgres plus `data/images`; both are gitignored bind mounts, so
@@ -317,9 +323,15 @@ measurement was cheap.
   `babel refetch --from 100 --to 200` — queue already-collected articles for re-collection after a
   parser fix or a markup change. The sweep phase that picks them up is only reached once the walk
   bottoms out (M1 above), so during a walk this queues work for ~32 days' time. To act on it now,
-  stop `crawler` and run a one-shot `babel run --no-poll --sweep-only` until the queue drains
-  (`--sweep-only` is what makes the sweep reachable at all — see below) — README, "Re-collect
-  the bodies before launch", has the exact commands
+  `docker compose stop crawler` then `docker compose --profile sweep up -d sweep` until the queue
+  drains (`--sweep-only`, which that service runs, is what makes the sweep reachable at all — see
+  below) — README, "Re-collect the bodies before launch", has the exact commands
+- `docker compose --profile sweep up -d sweep` / `--profile sweep stop sweep` — the re-collection
+  pass. The profile is what keeps a bare `up -d` from running it beside the walk at two requests a
+  second, and `restart: unless-stopped` is what carries it across a host reboot; stop it by hand
+  when `SELECT count(*) FROM fetch_log WHERE status = 'stale'` reaches zero, and that stop is what
+  keeps it down afterwards. It idles rather than exiting when the queue drains, so nothing stops it
+  for you
 - `docker compose run --rm crawler babel requeue-images --host i.imgur.com` — put one image host's
   `dead`/`error` rows back to `pending` with attempts reset, after fixing whatever caused that host
   to be misjudged. Pass a host you don't recognise to get a ranked list of hosts with stuck images.

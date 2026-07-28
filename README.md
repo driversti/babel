@@ -139,17 +139,35 @@ nothing at all. After that it logs `sweeping 50 article(s)` roughly once a minut
 by `SELECT count(*) FROM articles WHERE body_raw IS NOT NULL`, not by the logs, and note the loop
 idles rather than exiting when the queue drains — stopping it is the operator's job.
 
+**Run it as the `sweep` service, not as `compose run --rm`.** A one-shot container carries
+`restart: no` and is deleted when it exits, so a host reboot ends the pass and nothing brings it
+back — while `db`, `images` and `web` all return healthy around it, which is what makes the failure
+invisible. The `sweep` service is the same command with `restart: unless-stopped`, so it survives a
+reboot; stopping it by hand is what keeps it stopped afterwards.
+
+It sits behind a compose profile so that a bare `docker compose up -d` cannot start it beside the
+walk: `RateLimiter` is constructed per process, so two crawling processes make two requests a second
+against a source this project decided to ask once a second.
+
 ```bash
 docker compose run --rm crawler babel refetch --from 1 --to 2797025 --yes
 docker compose stop crawler
-docker compose run --rm crawler babel run --no-poll --sweep-only   # stop it when the queue drains
+docker compose --profile sweep up -d sweep        # runs until you stop it, reboot or no reboot
+docker compose --profile sweep stop sweep         # once the queue drains
 docker compose up -d crawler
 ```
 
-The middle two steps are not optional. `run_backfill` only reaches its sweep phase once the walk
-bottoms out (finding M1 in CLAUDE.md), which is ~32 days away, so the `stale` rows a running service
-is holding are not picked up in the meantime. Nothing is lost by waiting — waiting burns no attempts
-— but nothing happens either.
+Stopping `crawler` first is not optional, and neither is `--sweep-only`. `run_backfill` only reaches
+its sweep phase once the walk bottoms out (finding M1 in CLAUDE.md), which is ~32 days away, so the
+`stale` rows a running service is holding are not picked up in the meantime. Nothing is lost by
+waiting — waiting burns no attempts — but nothing happens either.
+
+Track it with the queue itself rather than the container list, since a stopped sweep and a working
+one look identical from outside:
+
+```sql
+SELECT count(*) FROM fetch_log WHERE status = 'stale';
+```
 
 ### Audit the pre-guard blobs before launch
 
