@@ -189,22 +189,51 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE article_embeddings (
     article_id bigint PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
-    embedding  halfvec(1024) NOT NULL,
-    model      text          NOT NULL,
-    updated_at timestamptz   NOT NULL DEFAULT now()
+    embedding  halfvec(1024),
+    model      text,
+    updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- The queue. Shrinks to nothing as the corpus drains, and never covers a row
+-- that has a vector.
+CREATE INDEX article_embeddings_pending_idx
+    ON article_embeddings (article_id DESC) WHERE embedding IS NULL;
+
+-- Seed the 162,618 articles already collected.
+INSERT INTO article_embeddings (article_id) SELECT id FROM articles
+ON CONFLICT DO NOTHING;
 ```
 
 `halfvec` is two bytes per dimension instead of four: 2,048 bytes per article, so ~333 MB at
 today's 162,618 rows and ~5.7 GB across the full 2.8M archive. That matches SPEC.md's "text,
 metadata and vectors total roughly 15 GB".
 
-**No status column, unlike `article_images`.** The queue is the absence of a row — `articles LEFT
-JOIN article_embeddings WHERE ae.article_id IS NULL`. `article_images` needs statuses because a
-remote host can permanently refuse a URL and that verdict has to be remembered; embedding has no
-such verdict. A failure here is always transient (the service is down, the batch timed out), and
-the correct response is always to try again. Retry accounting stays in the worker process, where a
-restart resets it, which is exactly right for a transient-only failure.
+**A row exists from ingest with a NULL embedding, exactly like `article_images`.** `save_article`
+gains one statement; migration 008 seeds what is already collected.
+
+The obvious alternative — no row until there is a vector, and an anti-join for the queue — was
+designed first and rejected on its steady-state cost. `articles LEFT JOIN article_embeddings WHERE
+ae.article_id IS NULL ORDER BY a.id DESC LIMIT 32` reads the `articles` primary key backwards and
+probes for each row, which is cheap only while the unembedded rows are near the top. They are not:
+the crawler adds ~18 articles a day at the top through the poller and ~1 a second at the *bottom*
+through the descending walk, so in steady state the queue lives at the walk frontier and every
+claim scans past the entire embedded corpus to reach it — a cost that grows to 2.8M index entries
+and is paid again every couple of seconds, forever. A partial index on `embedding IS NULL` makes
+the same claim O(queue), which is the shape `claim_pending_images` already has and for the same
+reason.
+
+**No status and no attempts column**, unlike `article_images`. That part of the comparison holds:
+`article_images` needs statuses because a remote host can permanently refuse a URL and that verdict
+has to be remembered. Embedding has no such verdict — a failure is always transient (the service is
+down, the batch timed out) and the answer is always to try again. Retry accounting stays in the
+worker process, where a restart resets it, which is right for a transient-only failure.
+
+**The seeding creates a gap the same shape as the one `refetch --to` left**, and it closes the same
+way. Migration 008 seeds the articles that exist when it runs; `save_article` queues the ones
+ingested afterwards. An article ingested *between* the two — by a crawler still running the old
+image — gets neither. The documented deploy order already prevents it (stop the writers, build,
+migrate, start), and README carries a reconcile statement for when it happens anyway:
+`INSERT INTO article_embeddings (article_id) SELECT id FROM articles ON CONFLICT DO NOTHING`.
 
 `model` records which encoder produced the row. Two uses, both load-bearing:
 
@@ -222,8 +251,13 @@ runbook with `maintenance_work_mem` raised for the build:
 ```sql
 SET maintenance_work_mem = '4GB';
 CREATE INDEX article_embeddings_bin_idx ON article_embeddings
-    USING hnsw ((binary_quantize(embedding)::bit(1024)) bit_hamming_ops);
+    USING hnsw ((binary_quantize(embedding)::bit(1024)) bit_hamming_ops)
+    WHERE embedding IS NOT NULL;
 ```
+
+Partial, because the same table now holds the queue: rows waiting to be embedded have a NULL
+vector and belong in no similarity index. The predicate is repeated in the search query so the
+planner can match it.
 
 Sizing: the quantised vectors are 128 bytes each — 358 MB at 2.8M rows, which is the "about 400 MB"
 figure in SPEC.md. The HNSW graph's neighbour lists sit on top of that and are not free; expect
@@ -252,6 +286,7 @@ FROM (
     SELECT ae.article_id, ae.embedding
     FROM article_embeddings ae
     JOIN articles ar ON ar.id = ae.article_id AND ar.hidden_at IS NULL
+    WHERE ae.embedding IS NOT NULL
     ORDER BY binary_quantize(ae.embedding)::bit(1024)
              <~> binary_quantize($1::halfvec(1024))::bit(1024)
     LIMIT 500
