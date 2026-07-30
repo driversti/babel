@@ -325,7 +325,12 @@ measurement was cheap.
   bottoms out (M1 above), so during a walk this queues work for ~32 days' time. To act on it now,
   `docker compose stop crawler` then `docker compose --profile sweep up -d sweep` until the queue
   drains (`--sweep-only`, which that service runs, is what makes the sweep reachable at all — see
-  below) — README, "Re-collect the bodies before launch", has the exact commands
+  below) — README, "Re-collect the bodies before launch", has the exact commands. **A `--to` chosen
+  as "the newest article right now" leaves a gap**: the poller keeps ingesting above that ceiling
+  with the old image until the rebuild lands, and nothing revisits those IDs afterwards — the walk
+  only descends and the sweep only sees what was queued. The first re-collection lost 27 articles
+  that way. Query the backfilled column after the sweep drains rather than assuming coverage;
+  README has the query and the follow-up range
 - `docker compose --profile sweep up -d sweep` / `--profile sweep stop sweep` — the re-collection
   pass. The profile is what keeps a bare `up -d` from running it beside the walk at two requests a
   second, and `restart: unless-stopped` is what carries it across a host reboot; stop it by hand

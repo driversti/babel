@@ -169,6 +169,46 @@ one look identical from outside:
 SELECT count(*) FROM fetch_log WHERE status = 'stale';
 ```
 
+**Then close the gap above `--to`, because the poller kept working while you were not looking.**
+`--to` is chosen as the newest article that exists when the range is picked, but the poller goes on
+ingesting above that ceiling for as long as it takes to `git pull`, rebuild and restart — and until
+the restart it is doing so with the *old* image, which does not write the column being backfilled.
+Those articles are too new for the refetch and too old for the new code, and nothing ever revisits
+them: the walk only descends, and the sweep only sees rows something has queued.
+
+The first real re-collection lost 27 articles this way, IDs 2797026-2797053 against a `--to` of
+2797025 — 0.02% of the archive, found only by querying the column afterwards. Every one of them was
+from the last three days, i.e. exactly the articles a reader is most likely to open.
+
+So after the sweep drains, ask what is still NULL rather than assuming the pass covered it:
+
+```sql
+SELECT count(*), min(id), max(id) FROM articles WHERE body_raw IS NULL;
+```
+
+A contiguous block starting one above the old `--to` is this gap. Queue that range and sweep it
+again — with `RETRY_COOLDOWN_SEC=0`, since there is no reason to wait an hour for two dozen rows,
+and `timeout` because the loop idles instead of exiting:
+
+```bash
+docker compose run --rm crawler babel refetch --from 2797026 --to 2797053 --yes
+docker compose stop crawler
+timeout 150 docker compose run --rm -e RETRY_COOLDOWN_SEC=0 crawler babel run --no-poll --sweep-only
+docker compose up -d crawler
+```
+
+**A few rows will stay NULL, and that is the archive working.** After the gap above was closed one
+article remained: 2797032, whose re-collection came back `missing` because it had been deleted from
+the site in the days since. Its plain text survives from the first collection and its markup never
+will. The same is true of comments — 6 kept text with no markup because they were deleted between
+the two visits. Judge the pass by whether the NULLs are a contiguous recent block (a gap, fixable)
+or scattered singletons whose `fetch_log` says `missing` (deleted upstream, nothing to fix).
+
+Do not read a large NULL count on `comments` as any of this. Around 2% of comments have no
+`body_raw` *and* no `body`, which is deliberate: `parse_comments` stores a removed comment as its
+slot and nothing else, so that the renderer has no body to render for a comment whose whole point is
+that there is no body. Only a comment with text and no markup is worth looking at.
+
 ### Audit the pre-guard blobs before launch
 
 Everything already in `article_images`/`images` was captured before `capture_image` had a scheme and
