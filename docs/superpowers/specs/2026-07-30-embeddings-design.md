@@ -470,13 +470,83 @@ box as a second path.
 Named here so that the implementation plan starts by measuring them rather than by trusting this
 document:
 
-1. **Throughput of `bge-m3` on this Jetson.** The estimate behind the sizing above is 5–15
-   articles/second, which would put today's 162,618 articles at 3–9 hours and the full 2.8M archive
-   at 2–6 days. If that holds, the GPU is not the bottleneck — the 32-day crawl is. Nothing in this
-   design depends on the number being right, but the plan's first task is to get it.
-2. **The right token cap.** 1,024 tokens covers roughly p90 of this corpus; 2,048 covers past p97
-   at meaningfully more compute. Measure both at the same batch size and pick. Changing it later
-   costs a re-run, not a migration.
+1. **Throughput of `bge-m3` on this Jetson — measured 2026-07-31.** Full 27-configuration sweep,
+   `jetson/bench.py`, run inside `babel-embed` (`jetson/Dockerfile`, `dustynv/l4t-pytorch:r36.4.0`
+   base, PyTorch 2.4.0, transformers 4.57.6) on the Orin Nano Super at `MAXN_SUPER`, fp16, weights
+   converted once from the upstream `pytorch_model.bin` to `model.safetensors` (transformers ≥4.57
+   refuses to `torch.load` a pickle checkpoint below torch 2.6, CVE-2025-32434, and this board's
+   PyTorch build is 2.4.0 — the conversion runs `torch.load` directly, outside that gate, once,
+   against the file already fetched from the official repo). Each row is the median of 10 timed
+   batches after 2 discarded warm-up iterations, against three real article bodies trimmed to the
+   corpus's p90 of 4,600 characters — one Polish (id 2796545), one Bulgarian (id 2794482), one
+   Persian (id 2796355):
+
+   ```
+    tokens  batch    script   docs/s  ms/batch
+       512      8     latin     20.0       401
+       512      8  cyrillic     19.9       403
+       512      8   persian     19.7       405
+       512     16     latin     18.8       850
+       512     16  cyrillic     18.7       854
+       512     16   persian     18.5       863
+       512     32     latin     18.4      1743
+       512     32  cyrillic     18.1      1765
+       512     32   persian     18.0      1781
+      1024      8     latin      8.8       907
+      1024      8  cyrillic      8.8       912
+      1024      8   persian      8.8       914
+      1024     16     latin      8.7      1841
+      1024     16  cyrillic      8.6      1851
+      1024     16   persian      8.6      1858
+      1024     32     latin      8.6      3715
+      1024     32  cyrillic      8.6      3730
+      1024     32   persian      8.6      3735
+      2048      8     latin      7.2      1118
+      2048      8  cyrillic      8.4       954
+      2048      8   persian      7.7      1044
+      2048     16     latin      7.2      2237
+      2048     16  cyrillic      8.3      1919
+      2048     16   persian      7.6      2105
+      2048     32     latin      7.1      4495
+      2048     32  cyrillic      8.3      3857
+      2048     32   persian      7.6      4214
+   ```
+
+   **Bigger batches do not help on this board — 8 beats 16 and 32 at every single token cap**, the
+   opposite of the usual GPU assumption. The Orin Nano's CPU and GPU share one memory pool and its
+   bandwidth, so a larger batch buys no parallelism the bus can actually deliver and only adds
+   latency; `NvMapMemAllocInternalTagged: ... error 12` (ENOMEM) appeared in the log between the
+   batch-8 and batch-16 runs, a real allocator complaint that did not stop the run but points the
+   same direction. **`EMBED_BATCH_SIZE = 8`.**
+
+   **What this means for the backlog**, at the chosen configuration (2,048 tokens, batch 8, see item
+   2 below): measured throughput is 7.1–8.4 docs/s depending on script. 162,618 articles (today's
+   archive) is 5.4–6.3 hours; the full 2.8M-article archive is 3.9–4.5 days. Both land inside the
+   5–15 articles/second estimate this item previously carried unchecked, and both stay well under
+   the ~32-day backfill walk: the GPU is not the bottleneck, which is what the design hoped and is
+   now measured rather than assumed.
+
+2. **The right token cap — measured 2026-07-31.** 512 → 1024 costs more than half the throughput
+   (20.0 → 8.8 docs/s); 1024 → 2048 costs almost nothing (8.8 → 7.1–8.4). That is not "half the
+   tokens vs. all of them" — it is truncated vs. not. Tokenising the three benchmark samples with
+   the real tokenizer, uncapped, gives 1,206 tokens (latin), 1,142 (persian), 1,040 (cyrillic) for a
+   4,600-character body — all three exceed 1,024, so **every 512 and 1,024 cell above ran a
+   truncated sequence**, and 1,024 still cuts 10–15% off a p90-sized article. None exceed 2,048, so
+   the 2,048 cells ran each sample's real length, and throughput barely moved from 1,024 because
+   past ~1,200 tokens there was nothing left to truncate. **`EMBED_MAX_TOKENS = 2048`**: it costs
+   next to nothing over 1,024 and is the first cap that stops silently cutting the p90 article body
+   the "one vector" design above is built on.
+
+   **The same token counts explain the script ordering, which is not what "Why one vector" predicted
+   — flagged rather than quietly folded in.** That section assumed Persian and Cyrillic run ~0.4
+   tokens/char against ~0.25 for Latin; measured on these three real bodies the ratios are latin
+   0.262, persian 0.248, cyrillic 0.226 — Cyrillic is the *most* token-efficient of the three here,
+   not the least. At 2,048 tokens nothing is capped, so throughput tracks each sample's own token
+   count: cyrillic (1,040 tokens) is fastest at 8.3–8.4 docs/s, latin (1,206) is slowest at 7.1–7.2,
+   persian (1,142) sits between at 7.6–7.7 — the same order as token count, inverted. This is one
+   article per script family, not a corpus-wide measurement, so it does not overturn the
+   0.4-vs-0.25 figure elsewhere in this document — it means that figure is itself unverified, and
+   should be re-measured before anything is built on it specifically.
 3. **HNSW index size and build time** at 2.8M rows.
 4. **Recall of the quantise-then-re-rank pattern** at a 25x over-fetch, against the evaluation set.
 5. **Whether `nvidia-container-toolkit` installs cleanly on JetPack 6.2** and what the four running
