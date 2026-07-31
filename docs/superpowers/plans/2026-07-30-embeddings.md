@@ -1681,6 +1681,33 @@ async def test_a_hidden_article_is_never_returned(pg):
     await pg.execute("UPDATE articles SET hidden_at = now() WHERE id = 77")
     rows = await search.search_articles(pg, _probe(), candidates=200, limit=200)
     assert 77 not in [r.id for r in rows]
+
+
+async def test_the_pending_claim_uses_its_partial_index(pg):
+    """The bug this project has already shipped twice.
+
+    CLAUDE.md's finding M3 records `claim_retryable` and `claim_pending_images`
+    both being one edit away from losing their partial index — turn the status
+    literal into a bound parameter and Postgres can no longer prove the index
+    applicable, so the plan degrades to a scan of a table heading for 2.8M rows.
+    Nothing errors; the queue just gets slower every week.
+
+    Task 3 added a third such index and no guard for it, which is what this
+    closes. It takes its SQL from `repo._CLAIM_PENDING_EMBEDDINGS` rather than a
+    pasted copy — reaching for the private name deliberately, because a test that
+    EXPLAINs its own copy of the statement proves only that Postgres *can* use a
+    partial index, which is precisely the mistake M3 names.
+    """
+    await _populated(pg, rows=500)
+    # Half the corpus back into the queue. On an empty queue the partial index
+    # is empty too, every plan costs about the same, and the choice carries no
+    # information.
+    await pg.execute("UPDATE article_embeddings SET embedding = NULL WHERE article_id % 2 = 0")
+    await pg.execute("ANALYZE article_embeddings")
+    plan = "\n".join(
+        r[0] for r in await pg.fetch(f"EXPLAIN {repo._CLAIM_PENDING_EMBEDDINGS}", 32)
+    )
+    assert "article_embeddings_pending_idx" in plan
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
