@@ -39,6 +39,10 @@ packages = ["src/babel"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src", "jetson"]
+markers = [
+    "live: needs the real embed service on the LAN. Not run by default.",
+]
+addopts = "-m 'not live'"
 
 [tool.ruff]
 line-length = 110

@@ -64,6 +64,108 @@ its own schedule and its own rate limit, sharing the same VPN tunnel (`network_m
 redeployed without touching the other: stopping `images` simply lets the queue build up, and
 `crawler` keeps ingesting articles normally in the meantime.
 
+## Semantic search
+
+Two processes on two machines. `babel embed` on the x86 box drains the queue of
+unembedded articles through the Jetson's `POST /embed`; `babel serve` calls the
+same endpoint for each reader's query. They must use the same model — vectors
+from two models are not comparable, and nothing reports it.
+
+### One-time setup on the Jetson
+
+```bash
+ssh jetson@<jetson-address>
+sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
+docker run --rm --runtime nvidia nvcr.io/nvidia/l4t-jetpack:r36.4.0 nvidia-smi   # must print a table
+```
+
+The daemon restart bounces every container on that host. Check their restart
+policies first.
+
+Then download the model once (it is bind-mounted read-only afterwards, so a
+restart needs no internet), clone this branch, and bring the service up:
+
+```bash
+cd ~/babel-embed/src/jetson && docker compose up -d --build
+curl http://<jetson-address>:8081/healthz     # {"model":"BAAI/bge-m3","dim":1024,"cuda":true}
+```
+
+### Deploying the database change
+
+`db` moves from `postgres:17` to `pgvector/pgvector:0.8.6-pg17-trixie`. Same
+upstream image plus the extension, same PGDATA — an image swap, not a dump and
+restore. **The `-trixie` tag is not optional.** Prod runs `17.10-1.pgdg13+1`
+and both images report `Debian GLIBC 2.41-12+deb13u3`; a bookworm image would
+change text collation under every index already built on this data.
+
+Build before migrating, as always — migrations are baked into the image:
+
+```bash
+docker compose stop crawler images embed
+docker compose build crawler images embed web
+docker compose up -d db
+docker compose run --rm crawler babel migrate
+docker compose up -d crawler images embed web
+```
+
+### Building the similarity index
+
+Not in the migration: `CREATE INDEX CONCURRENTLY` is illegal inside a
+transaction and this project's runner wraps every file in one. Do it through
+`psql` once there are vectors to index.
+
+```sql
+SET maintenance_work_mem = '4GB';
+CREATE INDEX CONCURRENTLY article_embeddings_bin_idx ON article_embeddings
+    USING hnsw ((binary_quantize(embedding)::bit(1024)) bit_hamming_ops)
+    WHERE embedding IS NOT NULL;
+```
+
+Two things this design deliberately does not have, named here so an operator meets them in the
+runbook rather than in production. `/search` has **no rate limit and no query-vector cache**: about
+60 bytes of request buys a `bge-m3` forward pass on the Jetson, and `search_timeout_sec` bounds the
+*page*, not the queue behind it. Neither is hard to add — a cache keyed on the normalised query
+string would absorb the common case — but both were out of scope for this slice. If the site takes
+real traffic, watch the Jetson's load before assuming it is fine.
+
+### Watching the drain
+
+```sql
+SELECT count(*) FILTER (WHERE embedding IS NULL)     AS pending,
+       count(*) FILTER (WHERE embedding IS NOT NULL) AS done,
+       count(DISTINCT model)                         AS models
+FROM article_embeddings;
+```
+
+`models` must be 1. More than one means the corpus is half-encoded by something
+else, and search quality is already degraded.
+
+### If the queue is missing rows
+
+Migration 008 seeds the articles that existed when it ran, and `save_article`
+queues the ones ingested afterwards. An article written *between* the two — by
+a crawler still running the old image — gets neither. The deploy order above
+prevents it; this closes it when it happens anyway:
+
+```sql
+INSERT INTO article_embeddings (article_id) SELECT id FROM articles
+ON CONFLICT DO NOTHING;
+```
+
+### Changing the model
+
+The dimension is the only thing the schema commits to, so a different
+1024-dimension encoder costs a re-run and no migration:
+
+```sql
+UPDATE article_embeddings SET embedding = NULL, model = NULL WHERE model <> 'new/model';
+```
+
+Then point `EMBED_MODEL` and the Jetson's `MODEL_ID`/`MODEL_DIR` at it and
+restart both. Search degrades while the queue drains — rows with a NULL vector
+are not searchable.
+
 ## Commands
 
 - `babel probe --newest <id>` — fetch a sample of article pages through the tunnel and report
