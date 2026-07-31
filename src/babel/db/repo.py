@@ -80,8 +80,10 @@ async def save_article(conn: asyncpg.Connection, article: Article) -> None:
         # BEFORE the articles upsert, not after — the comparison is against the
         # body currently stored, and after the upsert that is already the new
         # one, so the same statement moved three lines down silently never
-        # fires. The INSERT arm queues a new article; the UPDATE arm clears a
-        # vector whose text has changed underneath it.
+        # fires. This is the clear half only: it touches a row that already
+        # exists (an article being re-collected), so it never inserts and never
+        # raises the FK on article_embeddings.article_id — see the create half
+        # below for the other half of the split and why it exists.
         #
         # Gated on the body actually differing, rather than clearing on every
         # save. A re-collection sweep touches the whole archive, and clearing
@@ -89,23 +91,12 @@ async def save_article(conn: asyncpg.Connection, article: Article) -> None:
         # re-embed takes. A title-only edit leaves the vector alone too, which
         # is a deliberate approximation: the title is a small part of the
         # embedded text and is not worth a full re-encode of the corpus.
-        #
-        # For a brand-new article this INSERT runs before the matching row in
-        # articles exists in this transaction at all — that is what makes the
-        # ordering above correct — so the FK on article_embeddings.article_id
-        # must be DEFERRABLE INITIALLY DEFERRED (see migration 008). A plain FK
-        # checks at the end of this statement, not at commit, and rejected it
-        # outright when this was tried without deferring: ForeignKeyViolationError,
-        # "is not present in table articles".
         await conn.execute(
             """
-            INSERT INTO article_embeddings (article_id) VALUES ($1)
-            ON CONFLICT (article_id) DO UPDATE
-                SET embedding = NULL, model = NULL, updated_at = now()
-            WHERE EXISTS (
-                SELECT 1 FROM articles
-                WHERE id = $1 AND body IS DISTINCT FROM $2
-            )
+            UPDATE article_embeddings
+            SET embedding = NULL, model = NULL, updated_at = now()
+            WHERE article_id = $1 AND embedding IS NOT NULL
+              AND EXISTS (SELECT 1 FROM articles WHERE id = $1 AND body IS DISTINCT FROM $2)
             """,
             article.id, article.body,
         )
@@ -126,6 +117,28 @@ async def save_article(conn: asyncpg.Connection, article: Article) -> None:
             article.id, article.title, article.body, article.body_raw,
             article.author_id, article.author_name, article.country,
             article.published_at, article.e_day, article.comment_count,
+        )
+
+        # AFTER the articles upsert, not before — this is the create half of
+        # the split described above. A brand-new article has no
+        # article_embeddings row yet, so this has to INSERT, and an INSERT
+        # checks its FK immediately rather than at commit; running it here,
+        # once the articles row above exists, is what lets that check pass
+        # without weakening the constraint. Tried as a single combined
+        # statement before the upsert instead (the obvious way to write this,
+        # matching the clear half above), it raised on every never-before-seen
+        # article: ForeignKeyViolationError, "is not present in table
+        # articles" — measured directly, not a hypothetical. DO NOTHING rather
+        # than an upsert: the clear half above already handled the case where a
+        # row exists and needs resetting, so by the time this runs a
+        # pre-existing row is already correct and a fresh row just needs to
+        # exist with its default NULL embedding.
+        await conn.execute(
+            """
+            INSERT INTO article_embeddings (article_id) VALUES ($1)
+            ON CONFLICT (article_id) DO NOTHING
+            """,
+            article.id,
         )
 
         if article.comments:

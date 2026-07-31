@@ -29,20 +29,23 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- always to try again. Retry accounting lives in the worker process, where a
 -- restart resets it, which is right for a transient-only failure.
 --
--- DEFERRABLE INITIALLY DEFERRED, unlike every other FK in this schema.
--- save_article writes this row BEFORE the articles upsert (see the comment
--- there), so that the "has the body changed" check reads the pre-overwrite
--- value. A plain FK checks at the end of each statement, not each transaction:
--- for an article never seen before, that first INSERT into article_embeddings
--- runs while articles.id still has no matching row yet in this transaction,
--- and a non-deferred constraint rejects it outright — verified directly,
--- ForeignKeyViolationError, "is not present in table articles". Deferring the
--- check to COMMIT is what makes the ordering save_article needs legal: by
--- commit time the articles row has been written by the very next statement in
--- the same transaction.
+-- The FK is a plain, non-deferred REFERENCES, same as every other one in this
+-- schema — deliberately. save_article needs to read the pre-overwrite body
+-- before the articles upsert runs (see the comment there), which at first
+-- looked like it needed the *row creation* to happen early too, in one
+-- combined statement — and that combined statement, tried directly, fails
+-- with ForeignKeyViolationError ("is not present in table articles") for any
+-- article never seen before, because a plain FK checks at the end of the
+-- statement that violates it, not at commit, and articles.id has no matching
+-- row yet at that point in the transaction. The fix was not to defer the
+-- constraint — that would change when Postgres reports *every* future
+-- violation of this FK, not just this one call's — but to split the
+-- statement: the UPDATE that clears a changed body's vector touches only a
+-- row that already exists, so no FK check arises from it at all, and the
+-- INSERT that creates a new article's queue row runs after the upsert, where
+-- the parent row already exists and the ordinary immediate check just passes.
 CREATE TABLE article_embeddings (
-    article_id bigint PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE
-        DEFERRABLE INITIALLY DEFERRED,
+    article_id bigint PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
     embedding  halfvec(1024),
     model      text,
     updated_at timestamptz NOT NULL DEFAULT now()
