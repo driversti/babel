@@ -37,29 +37,29 @@ CASES = [
     # 2797020 (sr): a Serbian congress candidate's platform against "traitor"
     # labelling by the ruling party, urging voters to pick substance over
     # tribalism this election.
-    ("congressional election campaign against political corruption", "en", 2797020),
+    ("congressional election campaign against political corruption", "en", 2797020, "sr"),
     # 2797081 (pl): "W IMIENIU RZĄDU JEDNOŚCI NARODÓW..." — a Polish-language
     # call to arms as Finnish troops enter Norrland to break a Ukrainian
     # occupation there.
-    ("Финландия обявява война за освобождение на Норрланд", "bg", 2797081),
+    ("Финландия обявява война за освобождение на Норрланд", "bg", 2797081, "pl"),
     # 2794826 (hu): a Hungarian economic write-up of company/manager taxation
     # rates and how they are computed.
-    ("análisis de impuestos sobre empresas y gerentes", "es", 2794826),
+    ("análisis de impuestos sobre empresas y gerentes", "es", 2794826, "hu"),
     # 2762609 (bg): a Bulgarian commentary on the Russia-Ukraine war, Bakhmut
     # casualties, mobilisation and who is "stuck in it" indirectly.
-    ("orosz-ukrán háború és a bahmuti veszteségek", "hu", 2762609),
+    ("orosz-ukrán háború és a bahmuti veszteségek", "hu", 2762609, "bg"),
     # 2796804 (es): a Spanish monthly economy bulletin — austerity, budget
     # control, pensions.
-    ("laporan ekonomi bulanan tentang penghematan dan pensiun", "id", 2796804),
+    ("laporan ekonomi bulanan tentang penghematan dan pensiun", "id", 2796804, "es"),
     # 2796905 (id): an Indonesian economic write-up on the Aircraft Weapon
     # industry's potential in the Maluku Islands region.
-    ("پتانسیل اقتصادی صنعت اسلحه هوایی در جزایر مالوکو", "fa", 2796905),
+    ("پتانسیل اقتصادی صنعت اسلحه هوایی در جزایر مالوکو", "fa", 2796905, "id"),
     # 2776557 (fa): a Persian proposal for a military participation incentive
     # scheme, with a bonus multiplier for low-level accounts.
-    ("plan zachęt do udziału w wojnach dla słabszych kont", "pl", 2776557),
+    ("plan zachęt do udziału w wojnach dla słabszych kont", "pl", 2776557, "fa"),
     # 2797058 (en): an eUK Ministry of Defence war update — containing a
     # "botserver", AEGIS tactics, coalition thanks.
-    ("izveštaj o ratu i suzbijanju botserver naloga", "sr", 2797058),
+    ("izveštaj o ratu i suzbijanju botserver naloga", "sr", 2797058, "en"),
 ]
 
 
@@ -85,11 +85,13 @@ async def test_recall_at_20_across_languages(live_conn):
     )
 
     hits = 0
-    for query, lang, expected in filled:
+    for query, lang, expected, article_lang in filled:
         vector = (await client.embed([query]))[0]
         rows = await search.search_articles(live_conn, vector, limit=20)
         found = expected in [r.id for r in rows]
-        print(f"{lang:>3} {query[:40]:<42} {'hit' if found else 'MISS'}")
+        print(
+            f"{lang:>3} -> {article_lang:<3} {query[:40]:<42} {'hit' if found else 'MISS'}"
+        )
         hits += found
 
     recall = hits / len(filled)
