@@ -334,8 +334,8 @@ measurement was cheap.
 - `uv sync` — install
 - `uv run pytest` — tests (needs Docker for testcontainers)
 - `uv run ruff check src tests` — lint
-- `docker compose up -d` — run the stack, including all three long-running services, `crawler`,
-  `images` and `web`
+- `docker compose up -d` — run the stack, including all four long-running services, `crawler`,
+  `images`, `embed` and `web`
 - `docker compose run --rm crawler babel migrate` — apply migrations
 - `docker compose run --rm crawler babel probe --newest <id>` — check the exit node is not challenged
 - `docker compose run --rm crawler babel refetch --ids 123,456` or
@@ -374,7 +374,8 @@ measurement was cheap.
   if `WEB_DATABASE_URL` is unset or equal to `DATABASE_URL`, and never applies migrations itself —
   see "Operating the live run" for why and for the deploy order. It does *check* them: one throwaway
   connection reads `schema_migrations` before anything is served and refuses, naming whichever of
-  `005_browse.sql`/`007_body_markup.sql` is missing. Without that check a skipped migrate step
+  `005_browse.sql`/`007_body_markup.sql`/`008_embeddings.sql` is missing. Without that check a
+  skipped migrate step
   answers 503 on every page — `UndefinedColumnError` is a `PostgresError`, so it lands in the
   database-down handler — while `/healthz` and the compose healthcheck stay green, which points the
   operator at Postgres instead of at the deploy

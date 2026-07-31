@@ -83,11 +83,63 @@ docker run --rm --runtime nvidia nvcr.io/nvidia/l4t-jetpack:r36.4.0 nvidia-smi  
 The daemon restart bounces every container on that host. Check their restart
 policies first.
 
-Then download the model once (it is bind-mounted read-only afterwards, so a
-restart needs no internet), clone this branch, and bring the service up:
+**Download the model once.** It lands in a bind mount that is read-only afterwards, so a
+restart needs no internet:
 
 ```bash
-cd ~/babel-embed/src/jetson && docker compose up -d --build
+mkdir -p ~/babel-embed/models
+docker run --rm -v ~/babel-embed/models:/models python:3.12-slim sh -c \
+  "pip install -q huggingface_hub && python -c '
+from huggingface_hub import snapshot_download
+snapshot_download(\"BAAI/bge-m3\", local_dir=\"/models/bge-m3\",
+    allow_patterns=[\"*.json\", \"*.bin\", \"*.model\", \"tokenizer*\"],
+    ignore_patterns=[\"onnx/*\"])'"
+```
+
+`*.bin`, not `*.safetensors` — `BAAI/bge-m3`'s upstream repository ships no safetensors
+variant at all, so the pattern that looks more modern silently downloads ~43 MB of JSON and
+tokenizer files with no weights. `ignore_patterns=["onnx/*"]` skips a duplicate ONNX export the
+repo also carries, which this service never uses. Expect ~2.3 GB under `~/babel-embed/models/bge-m3`.
+
+**Clone this branch onto the Jetson itself** (the compose file below lives in it, so nothing
+resolves before this step) **and build the image:**
+
+```bash
+git clone -b feat/phase-3-embeddings <repo-url> ~/babel-embed/src
+cd ~/babel-embed/src/jetson
+docker compose build
+```
+
+**Convert the weights before starting the service — this step is not optional.**
+`jetson/embed_service/encoder.py` loads the model with `AutoModel.from_pretrained`, and this
+image's `transformers` refuses to `torch.load` a pickle checkpoint — which is all
+`pytorch_model.bin` is — unless torch ≥ 2.6 (CVE-2025-32434). This image's torch, from the
+`dustynv/l4t-pytorch:r36.4.0` base, is 2.4.0. Skip this and the container starts, the healthcheck
+never turns healthy, and the logs show `AutoModel.from_pretrained` raising that `ValueError`, not a
+crash at startup. Convert once, using the image just built and the script this repo tracks for
+exactly this (`jetson/convert_to_safetensors.py` has the full reasoning in its docstring):
+
+```bash
+docker run --rm -v ~/babel-embed/models:/models \
+    -v ~/babel-embed/src/jetson/convert_to_safetensors.py:/app/convert.py \
+    babel-embed python3 /app/convert.py
+sudo mv ~/babel-embed/models/bge-m3/pytorch_model.bin \
+    ~/babel-embed/models/pytorch_model.bin.bak
+```
+
+The `sudo` is not decoration: `pytorch_model.bin` is root-owned because `snapshot_download` above
+ran as root inside its own container. Moving it out removes any ambiguity about which weights file
+loads — `transformers` prefers safetensors when both are present, but only one should exist here.
+
+**Set `EMBED_BIND` before bringing the service up.** `jetson/docker-compose.yml` binds to
+`127.0.0.1` by default, deliberately: that address is unreachable from the x86 box, so a deployment
+that forgets this setting fails loudly (connection refused, not a silent LAN exposure). Copy the
+template and fill in this machine's own LAN address:
+
+```bash
+cp jetson/.env.example jetson/.env
+# edit jetson/.env: EMBED_BIND=<this Jetson's LAN address>
+docker compose up -d
 curl http://<jetson-address>:8081/healthz     # {"model":"BAAI/bge-m3","dim":1024,"cuda":true}
 ```
 
@@ -187,7 +239,7 @@ are not searchable.
 
 ## Public archive
 
-A fifth compose service, `web` (command `babel serve`), serves the archive read-only over HTTP. It
+A sixth compose service, `web` (command `babel serve`), serves the archive read-only over HTTP. It
 is a separate FastAPI process from the crawler, deliberately outside gluetun's network namespace: it
 needs *inbound* connections, which that namespace cannot accept, and its only outbound dependency is
 Postgres on the bridge — so the site stays up when the VPN tunnel is down. `babel serve` never
@@ -195,7 +247,8 @@ applies migrations: `crawler` and `images` both do that at startup, and a third 
 same way would connect as a SELECT-only role and crash-loop under `restart: unless-stopped`.
 Applying the schema is an explicit operator step (below). It does check that the step was taken —
 one throwaway connection reads `schema_migrations` before anything is served, and the process
-refuses to start, naming whichever of `005_browse.sql`/`007_body_markup.sql` is missing. A skipped
+refuses to start, naming whichever of `005_browse.sql`/`007_body_markup.sql`/`008_embeddings.sql` is
+missing. A skipped
 migrate step otherwise answers 503 on every page while `/healthz` and the compose healthcheck stay
 green.
 
