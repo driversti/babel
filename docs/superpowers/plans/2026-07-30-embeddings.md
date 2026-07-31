@@ -130,7 +130,10 @@ WORKDIR /app
 # yields perfectly valid 1024-dimension vectors that retrieve badly.
 RUN pip install --no-cache-dir "transformers>=4.44,<5" "fastapi>=0.115" "uvicorn>=0.32"
 
-COPY embed_service ./embed_service
+# Only the benchmark at this task. The service package does not exist yet —
+# task 2 adds `COPY embed_service ./embed_service`, the EXPOSE and the CMD
+# alongside the code they refer to. A COPY of a directory that is not there
+# fails the build.
 COPY bench.py ./bench.py
 
 ENV MODEL_DIR=/models/bge-m3 \
@@ -140,9 +143,6 @@ ENV MODEL_DIR=/models/bge-m3 \
     MAX_BATCH=64 \
     MAX_INPUT_CHARS=32000 \
     DEVICE=cuda
-
-EXPOSE 8081
-CMD ["python", "-m", "embed_service.main"]
 ```
 
 - [ ] **Step 5: Write `jetson/.dockerignore`**
@@ -525,6 +525,17 @@ def build():
 
 if __name__ == "__main__":
     uvicorn.run(build(), host="0.0.0.0", port=8081)  # noqa: S104
+```
+
+- [ ] **Step 7b: Add the service to the Dockerfile**
+
+Task 1 left it out deliberately — the package did not exist then. Append to `jetson/Dockerfile`, after the `COPY bench.py` line:
+
+```dockerfile
+COPY embed_service ./embed_service
+
+EXPOSE 8081
+CMD ["python", "-m", "embed_service.main"]
 ```
 
 - [ ] **Step 8: Write the Jetson compose file**
