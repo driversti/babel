@@ -1546,7 +1546,13 @@ In `.env.example`:
 # encoder or their vectors are not comparable.
 EMBED_SERVICE_URL=http://<jetson-lan-address>:8081
 EMBED_MODEL=BAAI/bge-m3
-EMBED_BATCH_SIZE=32
+
+# This worker's own batch size — not the Jetson service's MAX_BATCH, which is
+# a request-size ceiling on a different process and is allowed to differ.
+# Measured, not guessed: task 1's sweep found batch 8 beats or ties 16 and 32
+# at every token cap, because this board shares memory bandwidth between CPU
+# and GPU, so a larger batch buys no throughput and costs latency.
+EMBED_BATCH_SIZE=8
 EMBED_MAX_CHARS=20000
 
 # The public search path. A query is a string from anyone on the internet and
