@@ -250,7 +250,7 @@ ssh jetson@<jetson-host> 'cd ~/babel-embed/src/jetson && docker build -t babel-e
 - [ ] **Step 10: Run the benchmark**
 
 ```bash
-ssh jetson@<jetson-host> 'docker run --rm --runtime nvidia -v ~/babel-embed/models:/models:ro babel-embed python bench.py'
+ssh jetson@<jetson-host> 'docker run --rm --runtime nvidia -v ~/babel-embed/models:/models:ro babel-embed python3 bench.py'
 ```
 
 Expected: a table. Watch for `docs/s` collapsing between 1024 and 2048 tokens — if 2048 costs more than ~2.2x of 1024, the attention term has started to dominate and 1024 is the cap.
@@ -534,8 +534,11 @@ Task 1 left it out deliberately — the package did not exist then. Append to `j
 ```dockerfile
 COPY embed_service ./embed_service
 
+# python3, not python. Measured inside the built image: the l4t-pytorch base
+# provides /usr/bin/python3 (3.10.12) and no `python` on PATH at all, so the
+# shorter spelling fails with "executable file not found in $PATH".
 EXPOSE 8081
-CMD ["python", "-m", "embed_service.main"]
+CMD ["python3", "-m", "embed_service.main"]
 ```
 
 - [ ] **Step 8: Write the Jetson compose file**
@@ -567,7 +570,9 @@ services:
       - "${EMBED_BIND:-127.0.0.1}:8081:8081"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c",
+      # python3 for the same reason as the Dockerfile's CMD — the base image
+      # has no `python` on PATH.
+      test: ["CMD", "python3", "-c",
              "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz')"]
       interval: 30s
       timeout: 10s
