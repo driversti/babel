@@ -26,6 +26,11 @@ MAX_FETCH_ATTEMPTS = 5
 # 'ok' and 'missing' are answers. 'error' and 'stale' are unfinished business.
 RETRYABLE_STATUSES = ("error", "stale")
 
+# The dimension of every stored vector. It is the only thing the schema commits
+# to: switching to a different 1024-dimension encoder costs a re-run of the
+# corpus and no migration at all.
+EMBED_DIM = 1024
+
 # The host of a source_url, as SQL. Peels the authority off `scheme://…`, off a
 # protocol-relative `//…` (common in older articles, and stored verbatim), then
 # drops any `user@` and `:port` so the operator can name a host the plain way.
@@ -72,6 +77,39 @@ async def save_article(conn: asyncpg.Connection, article: Article) -> None:
         )
 
     async with conn.transaction():
+        # BEFORE the articles upsert, not after — the comparison is against the
+        # body currently stored, and after the upsert that is already the new
+        # one, so the same statement moved three lines down silently never
+        # fires. The INSERT arm queues a new article; the UPDATE arm clears a
+        # vector whose text has changed underneath it.
+        #
+        # Gated on the body actually differing, rather than clearing on every
+        # save. A re-collection sweep touches the whole archive, and clearing
+        # unconditionally would drop all of it out of search for as long as the
+        # re-embed takes. A title-only edit leaves the vector alone too, which
+        # is a deliberate approximation: the title is a small part of the
+        # embedded text and is not worth a full re-encode of the corpus.
+        #
+        # For a brand-new article this INSERT runs before the matching row in
+        # articles exists in this transaction at all — that is what makes the
+        # ordering above correct — so the FK on article_embeddings.article_id
+        # must be DEFERRABLE INITIALLY DEFERRED (see migration 008). A plain FK
+        # checks at the end of this statement, not at commit, and rejected it
+        # outright when this was tried without deferring: ForeignKeyViolationError,
+        # "is not present in table articles".
+        await conn.execute(
+            """
+            INSERT INTO article_embeddings (article_id) VALUES ($1)
+            ON CONFLICT (article_id) DO UPDATE
+                SET embedding = NULL, model = NULL, updated_at = now()
+            WHERE EXISTS (
+                SELECT 1 FROM articles
+                WHERE id = $1 AND body IS DISTINCT FROM $2
+            )
+            """,
+            article.id, article.body,
+        )
+
         await conn.execute(
             """
             INSERT INTO articles (id, title, body, body_raw, author_id, author_name,
@@ -408,4 +446,70 @@ async def withhold_image(conn: asyncpg.Connection, digest: bytes) -> int:
     )
     return await conn.fetchval(
         "SELECT count(DISTINCT article_id) FROM article_images WHERE sha256 = $1", digest
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PendingEmbedding:
+    article_id: int
+    title: str
+    body: str
+
+
+def vector_literal(values: Sequence[float]) -> str:
+    """A vector as pgvector's text form, for a `$n::halfvec(1024)` cast.
+
+    Passed as text rather than through a registered asyncpg codec. A codec
+    would have to be installed on every connection the pool hands out — the web
+    pool included, which connects as a role that may not create types — and the
+    saving is nothing: 1024 floats is ~12 KB of text against a batch that
+    already carried tens of kilobytes of article body.
+    """
+    return "[" + ",".join(f"{v:.7g}" for v in values) + "]"
+
+
+_CLAIM_PENDING_EMBEDDINGS = """
+    SELECT ae.article_id, a.title, a.body
+    FROM article_embeddings ae
+    JOIN articles a ON a.id = ae.article_id
+    WHERE ae.embedding IS NULL AND a.hidden_at IS NULL
+    ORDER BY ae.article_id DESC
+    LIMIT $1
+"""
+
+
+async def claim_pending_embeddings(
+    conn: asyncpg.Connection, limit: int
+) -> tuple[PendingEmbedding, ...]:
+    """The next articles with no vector, newest first.
+
+    "Claim" by analogy with claim_pending_images, but nothing is marked: the row
+    leaves the queue when its vector is written and not before. There is no
+    status to move it through, so a worker killed mid-batch has changed nothing
+    and the same rows are simply offered again.
+
+    Newest-first for the same reason as the image drain and the article walk —
+    the most-read part of the archive becomes searchable first.
+    """
+    rows = await conn.fetch(_CLAIM_PENDING_EMBEDDINGS, limit)
+    return tuple(
+        PendingEmbedding(article_id=r["article_id"], title=r["title"], body=r["body"])
+        for r in rows
+    )
+
+
+async def save_embeddings(
+    conn: asyncpg.Connection, model: str, rows: Sequence[tuple[int, str]]
+) -> None:
+    """Write a batch of vectors. `rows` is (article_id, vector_literal)."""
+    if not rows:
+        return
+    await conn.execute(
+        f"""
+        UPDATE article_embeddings ae
+        SET embedding = v.vec::halfvec({EMBED_DIM}), model = $1, updated_at = now()
+        FROM unnest($2::bigint[], $3::text[]) AS v(article_id, vec)
+        WHERE ae.article_id = v.article_id
+        """,
+        model, [r[0] for r in rows], [r[1] for r in rows],
     )

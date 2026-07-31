@@ -37,7 +37,11 @@ def postgres_dsn():
     171 database-backed tests, a container per test was ~263 s of the suite's
     ~315 s — the run was almost entirely Docker.
     """
-    with PostgresContainer("postgres:17") as container:
+    # pgvector rather than stock postgres:17, and pinned to the -trixie
+    # variant. Prod runs 17.10-1.pgdg13+1 — a trixie build — and both report
+    # Debian GLIBC 2.41-12+deb13u3. Testing against a bookworm image would
+    # test a different collation than production has.
+    with PostgresContainer("pgvector/pgvector:0.8.6-pg17-trixie") as container:
         yield container.get_connection_url().replace("postgresql+psycopg2", "postgresql")
 
 
