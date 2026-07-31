@@ -1,0 +1,39 @@
+services:
+  embed:
+    build: .
+    image: babel-embed
+    container_name: babel-embed
+    runtime: nvidia
+    environment:
+      - MODEL_DIR=/models/bge-m3
+      - MODEL_ID=BAAI/bge-m3
+      - EMBED_DIM=1024
+      # Defaults here match the Dockerfile's own ENV (2048/32), which are the
+      # measured values from docs/superpowers/specs/2026-07-30-embeddings-design.md
+      # ("Still unmeasured" item 1's table and item 2's reasoning) — not the
+      # 1024/64 pair Task 1's review already flagged and corrected once. Compose's
+      # `environment:` always overrides the image's ENV, with or without a host
+      # variable set, so a stale default here would silently downgrade every
+      # deploy that does not export MAX_TOKENS/MAX_BATCH by hand.
+      - MAX_TOKENS=${MAX_TOKENS:-2048}
+      - MAX_BATCH=${MAX_BATCH:-32}
+      - MAX_INPUT_CHARS=32000
+      - DEVICE=cuda
+    volumes:
+      # Read-only: the service loads the model, it never writes one.
+      - ${MODEL_ROOT:-~/babel-embed/models}:/models:ro
+    # Bound to the LAN address, not 0.0.0.0. This machine also runs four
+    # unrelated containers and sits on a home network; the only client that
+    # needs to reach it is the x86 box.
+    ports:
+      - "${EMBED_BIND:-127.0.0.1}:8081:8081"
+    restart: unless-stopped
+    healthcheck:
+      # python3 for the same reason as the Dockerfile's CMD — the base image
+      # has no `python` on PATH.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3

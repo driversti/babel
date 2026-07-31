@@ -26,6 +26,14 @@ RUN pip install --no-cache-dir --index-url https://pypi.org/simple \
 # fails the build.
 COPY bench.py ./bench.py
 
+COPY embed_service ./embed_service
+
+# python3, not python. Measured inside the built image: the l4t-pytorch base
+# provides /usr/bin/python3 (3.10.12) and no `python` on PATH at all, so the
+# shorter spelling fails with "executable file not found in $PATH".
+EXPOSE 8081
+CMD ["python3", "-m", "embed_service.main"]
+
 # MAX_TOKENS=2048 and MAX_BATCH=32 are measured, not chosen defaults — see
 # docs/superpowers/specs/2026-07-30-embeddings-design.md, "Still unmeasured"
 # item 1's table and item 2's reasoning.
