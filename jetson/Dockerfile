@@ -26,10 +26,28 @@ RUN pip install --no-cache-dir --index-url https://pypi.org/simple \
 # fails the build.
 COPY bench.py ./bench.py
 
+# MAX_TOKENS=2048 and MAX_BATCH=32 are measured, not chosen defaults — see
+# docs/superpowers/specs/2026-07-30-embeddings-design.md, "Still unmeasured"
+# item 1's table and item 2's reasoning.
+#
+# MAX_TOKENS matches EMBED_MAX_TOKENS from that measurement: 1,024 tokens
+# still truncates a p90-sized article (measured real token counts were
+# 1,040-1,206 against a 4,600-character body), 2,048 does not, and the
+# throughput cost between them is negligible (8.6-8.8 → 7.2-8.4 docs/s).
+#
+# MAX_BATCH is the service's request-size *ceiling*, not the worker's batch
+# size (EMBED_BATCH_SIZE=8, chosen separately because batch 8 measured best
+# or tied-best throughput at every token cap on this board's shared CPU/GPU
+# memory bus). The ceiling does not have to equal the worker's batch size,
+# but it should not be a number nothing measured: the original 64 here was
+# never benchmarked. The sweep covered 8/16/32 — every batch above 8
+# measured equal or worse throughput, but none errored or crashed up to 32 —
+# so 32 is set as the ceiling: the largest batch size this Jetson is actually
+# known to handle. 64 is dropped rather than carried forward unverified.
 ENV MODEL_DIR=/models/bge-m3 \
     MODEL_ID=BAAI/bge-m3 \
     EMBED_DIM=1024 \
-    MAX_TOKENS=1024 \
-    MAX_BATCH=64 \
+    MAX_TOKENS=2048 \
+    MAX_BATCH=32 \
     MAX_INPUT_CHARS=32000 \
     DEVICE=cuda

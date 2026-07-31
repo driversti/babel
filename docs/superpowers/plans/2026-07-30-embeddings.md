@@ -80,6 +80,8 @@ No product code and no test cycle — this task produces **numbers**, and those 
 - Create: `jetson/Dockerfile`
 - Create: `jetson/bench.py`
 - Create: `jetson/.dockerignore`
+- Create: `jetson/convert_to_safetensors.py` (needed because `BAAI/bge-m3` ships no `*.safetensors`
+  file — see Step 8)
 - Modify: `docs/superpowers/specs/2026-07-30-embeddings-design.md` (the "Still unmeasured" section)
 
 **Interfaces:**
@@ -235,17 +237,46 @@ Paste three bodies of visibly different scripts into `SAMPLES`. If all three com
 - [ ] **Step 8: Download the model onto the Jetson**
 
 ```bash
-ssh jetson@<jetson-host> 'mkdir -p ~/babel-embed/models && docker run --rm -v ~/babel-embed/models:/models python:3.12-slim sh -c "pip install -q huggingface_hub && python -c \"from huggingface_hub import snapshot_download; snapshot_download(\\\"BAAI/bge-m3\\\", local_dir=\\\"/models/bge-m3\\\", allow_patterns=[\\\"*.json\\\",\\\"*.safetensors\\\",\\\"*.model\\\",\\\"tokenizer*\\\"])\""'
+ssh jetson@<jetson-host> 'mkdir -p ~/babel-embed/models && docker run --rm -v ~/babel-embed/models:/models python:3.12-slim sh -c "pip install -q huggingface_hub && python -c \"from huggingface_hub import snapshot_download; snapshot_download(\\\"BAAI/bge-m3\\\", local_dir=\\\"/models/bge-m3\\\", allow_patterns=[\\\"*.json\\\",\\\"*.bin\\\",\\\"*.model\\\",\\\"tokenizer*\\\"], ignore_patterns=[\\\"onnx/*\\\"])\""'
 ```
 
-Expected: ~2.3 GB under `~/babel-embed/models/bge-m3`. Downloaded once, mounted read-only afterwards, so a restart needs no internet.
+`BAAI/bge-m3`'s repository ships only `pytorch_model.bin` — no `*.safetensors` variant exists, so
+the pattern above pulls `*.bin` instead. (An earlier version of this command listed
+`*.safetensors`, which matches nothing in this repo and silently downloads only the ~43 MB of JSON
+and tokenizer files with no weights at all — checked directly against the HF API's file listing.)
+`ignore_patterns=["onnx/*"]` skips a duplicate ONNX export the repo also carries, which is not
+used here and would roughly double the download.
 
-- [ ] **Step 9: Copy the repo to the Jetson and build**
+Expected: ~2.3 GB under `~/babel-embed/models/bge-m3`, `pytorch_model.bin` at ~2.27 GB. Downloaded
+once, mounted read-only afterwards, so a restart needs no internet.
+
+- [ ] **Step 9: Copy the repo to the Jetson, build, and convert the weights**
 
 ```bash
 ssh jetson@<jetson-host> 'git clone -b feat/phase-3-embeddings <repo-url> ~/babel-embed/src 2>/dev/null || git -C ~/babel-embed/src pull'
 ssh jetson@<jetson-host> 'cd ~/babel-embed/src/jetson && docker build -t babel-embed .'
 ```
+
+The built image's `transformers` (>=4.57 at the time this was run) refuses to `torch.load` a
+pickle checkpoint — which is all `pytorch_model.bin` is — unless torch >= 2.6
+(CVE-2025-32434), and this image's torch (from the `dustynv/l4t-pytorch:r36.4.0` base) is 2.4.0.
+Loading the model fails with `ValueError: Due to a serious vulnerability issue in torch.load...`
+until the weights are converted once to `model.safetensors`, using `jetson/convert_to_safetensors.py`
+(tracked in the repo — see that file's docstring for why running `torch.load` directly, outside
+`transformers`' own gate, is correct here rather than a bypass of the check):
+
+```bash
+ssh jetson@<jetson-host> 'docker run --rm -v ~/babel-embed/models:/models \
+    -v ~/babel-embed/src/jetson/convert_to_safetensors.py:/app/convert.py \
+    babel-embed python3 /app/convert.py'
+ssh jetson@<jetson-host> 'sudo mv ~/babel-embed/models/bge-m3/pytorch_model.bin \
+    ~/babel-embed/models/pytorch_model.bin.bak'
+```
+
+The `sudo mv` (not plain `mv`) is because `pytorch_model.bin` is root-owned — `snapshot_download`
+in Step 8 ran as root inside the `python:3.12-slim` container. Moving it out of the model directory
+removes any ambiguity about which weights file gets loaded; `transformers` prefers safetensors when
+both are present, but only one should exist here.
 
 - [ ] **Step 10: Run the benchmark**
 
