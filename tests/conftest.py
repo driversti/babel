@@ -4,7 +4,7 @@ import pathlib
 import asyncpg
 import pytest
 import pytest_asyncio
-from testcontainers.postgres import PostgresContainer
+from testcontainers.community.postgres import PostgresContainer
 
 from babel.db.migrate import apply_migrations
 
