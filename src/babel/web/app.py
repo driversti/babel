@@ -30,7 +30,10 @@ STATIC_DIR = pathlib.Path(__file__).parent / "static"
 # header, which leaves the URL indexable as a bare entry that noindex can never
 # remove. The parameterised list space is refused because filter combinations
 # are a crawl trap carrying no content of their own.
-ROBOTS_TXT = "User-agent: *\nDisallow: /?\nAllow: /\n"
+#
+# /search joins that refusal for the same reason: every query string is a
+# distinct URL carrying no content of its own, one per possible search term.
+ROBOTS_TXT = "User-agent: *\nDisallow: /?\nDisallow: /search\nAllow: /\n"
 
 CSP = (
     "default-src 'self'; script-src 'none'; img-src 'self'; "
@@ -46,7 +49,7 @@ CSP = (
 # 006 is not listed for the same reason: it only drops indexes 005 made
 # redundant, and no browse query names one of them. A future browse migration
 # belongs in this tuple, added by the commit that adds the migration.
-REQUIRED_MIGRATIONS = ("005_browse.sql", "007_body_markup.sql")
+REQUIRED_MIGRATIONS = ("005_browse.sql", "007_body_markup.sql", "008_embeddings.sql")
 
 
 def web_dsn(settings: Settings) -> str:
@@ -138,13 +141,30 @@ async def open_pool(settings: Settings) -> asyncpg.Pool:
     )
 
 
-def create_app(settings: Settings, pool: object | None = None) -> FastAPI:
+def create_app(
+    settings: Settings, pool: object | None = None, embedder: object | None = None
+) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Built here rather than in create_app because a lock belongs to the
         # loop the app actually runs on, and this is the first place that loop
         # is running. It guards the archive_stats refresh; see routes._stats.
         app.state.stats_lock = asyncio.Lock()
+        # One client for the process — building one per request would open a
+        # fresh aiohttp session on every search. Injected in tests, built here
+        # in production, exactly like the pool below.
+        if embedder is not None:
+            app.state.embedder = embedder
+        else:
+            from babel.db.repo import EMBED_DIM  # noqa: PLC0415 — avoids a cycle
+            from babel.embed.client import EmbedClient  # noqa: PLC0415
+
+            app.state.embedder = EmbedClient(
+                settings.embed_service_url,
+                model=settings.embed_model,
+                dim=EMBED_DIM,
+                timeout_sec=settings.search_timeout_sec,
+            )
         # An injected pool belongs to the caller: used as-is, never closed here.
         # That is the seam the tests drive the app through, and it leaves the
         # production path — pool omitted, open_pool runs — exactly as strict.
