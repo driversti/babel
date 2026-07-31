@@ -105,7 +105,7 @@ repo also carries, which this service never uses. Expect ~2.3 GB under `~/babel-
 resolves before this step) **and build the image:**
 
 ```bash
-git clone -b feat/phase-3-embeddings <repo-url> ~/babel-embed/src
+git clone <repo-url> ~/babel-embed/src
 cd ~/babel-embed/src/jetson
 docker compose build
 ```
