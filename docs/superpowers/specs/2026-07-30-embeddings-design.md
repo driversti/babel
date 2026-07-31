@@ -145,7 +145,7 @@ below exists.
 ## Architecture
 
 ```
-Jetson <host>                    x86 box <host>
+Jetson (LAN)                              x86 box (LAN)        
 ┌────────────────────────┐              ┌───────────────────────────────┐
 │ babel-embed-service    │              │ db  (pgvector/pgvector:pg17)  │
 │  arm64, NVIDIA runtime │              │   articles                    │

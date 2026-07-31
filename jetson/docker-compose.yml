@@ -22,9 +22,15 @@ services:
     volumes:
       # Read-only: the service loads the model, it never writes one.
       - ${MODEL_ROOT:-~/babel-embed/models}:/models:ro
-    # Bound to the LAN address, not 0.0.0.0. This machine also runs four
-    # unrelated containers and sits on a home network; the only client that
-    # needs to reach it is the x86 box.
+    # Bound to one address, never 0.0.0.0. This machine sits on a home network
+    # and the only client that needs to reach it is the x86 box running the
+    # crawler and the site.
+    #
+    # The default is loopback, which is deliberately NOT usable: the x86 box
+    # cannot reach it, so a deployment that forgets EMBED_BIND fails visibly
+    # and immediately rather than quietly exposing the service to the whole
+    # LAN. Set EMBED_BIND to this machine's LAN address in .env. Same shape as
+    # WEB_BIND in the root compose file, and for the same reason.
     ports:
       - "${EMBED_BIND:-127.0.0.1}:8081:8081"
     restart: unless-stopped
