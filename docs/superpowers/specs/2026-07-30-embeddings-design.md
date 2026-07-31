@@ -459,6 +459,15 @@ matches, per failure mode 6.
 On the Jetson, `nvidia-container-toolkit`, then a local `docker compose build`, then the service.
 The model directory is a bind mount, gitignored, populated once.
 
+Populating it is two steps, both in the plan's Task 1 Step 8-9 and both required — a `snapshot_download`
+that must ask for `*.bin`, not `*.safetensors` (`BAAI/bge-m3` ships no safetensors variant), followed
+by a one-time conversion to `model.safetensors` with `jetson/convert_to_safetensors.py` (tracked in
+the repo), because the version of `transformers` this project pins refuses to `torch.load` a pickle
+checkpoint below torch 2.6 (CVE-2025-32434) and this board's PyTorch build does not clear that bar.
+The script's own docstring explains why converting outside `transformers`' loader is correct here
+rather than a bypass of that check. Skipping either step reproduces the exact failure this task hit
+first: an empty download, or a model directory `AutoModel.from_pretrained` refuses to load.
+
 ## Out of scope
 
 Comments. Translation of results at query time. A cross-encoder re-ranker. Hybrid keyword+vector
@@ -512,26 +521,29 @@ document:
       2048     32   persian      7.6      4214
    ```
 
-   **Bigger batches do not help on this board — 8 beats 16 and 32 at every single token cap**, the
-   opposite of the usual GPU assumption. The Orin Nano's CPU and GPU share one memory pool and its
-   bandwidth, so a larger batch buys no parallelism the bus can actually deliver and only adds
-   latency; `NvMapMemAllocInternalTagged: ... error 12` (ENOMEM) appeared in the log between the
-   batch-8 and batch-16 runs, a real allocator complaint that did not stop the run but points the
-   same direction. **`EMBED_BATCH_SIZE = 8`.**
+   **Bigger batches do not help on this board — 8 beats or ties 16 and 32 at every token cap**, the
+   opposite of the usual GPU assumption (the one tie is 2048/latin, where batch 8 and batch 16 both
+   measured 7.2 docs/s; every other cell strictly favours 8). The Orin Nano's CPU and GPU share one
+   memory pool and its bandwidth, so a larger batch buys no parallelism the bus can actually deliver
+   and mostly adds latency; `NvMapMemAllocInternalTagged: ... error 12` (ENOMEM) appeared in the log
+   between the batch-8 and batch-16 runs, a real allocator complaint that did not stop the run but
+   points the same direction. **`EMBED_BATCH_SIZE = 8`.**
 
    **What this means for the backlog**, at the chosen configuration (2,048 tokens, batch 8, see item
-   2 below): measured throughput is 7.1–8.4 docs/s depending on script. 162,618 articles (today's
-   archive) is 5.4–6.3 hours; the full 2.8M-article archive is 3.9–4.5 days. Both land inside the
-   5–15 articles/second estimate this item previously carried unchecked, and both stay well under
-   the ~32-day backfill walk: the GPU is not the bottleneck, which is what the design hoped and is
-   now measured rather than assumed.
+   2 below): measured throughput is 7.2–8.4 docs/s depending on script (the batch-8 row for each
+   script: latin 7.2, persian 7.7, cyrillic 8.4). 162,618 articles (today's archive) is 5.4–6.3
+   hours; the full 2.8M-article archive is 3.9–4.5 days. Both land inside the 5–15 articles/second
+   estimate this item previously carried unchecked, and both stay well under the ~32-day backfill
+   walk: the GPU is not the bottleneck, which is what the design hoped and is now measured rather
+   than assumed.
 
 2. **The right token cap — measured 2026-07-31.** 512 → 1024 costs more than half the throughput
    (20.0 → 8.8 docs/s); 1024 → 2048 costs almost nothing (8.8 → 7.1–8.4). That is not "half the
    tokens vs. all of them" — it is truncated vs. not. Tokenising the three benchmark samples with
    the real tokenizer, uncapped, gives 1,206 tokens (latin), 1,142 (persian), 1,040 (cyrillic) for a
    4,600-character body — all three exceed 1,024, so **every 512 and 1,024 cell above ran a
-   truncated sequence**, and 1,024 still cuts 10–15% off a p90-sized article. None exceed 2,048, so
+   truncated sequence**, and at 1,024 the cut is uneven: 15.1% off latin, 10.3% off persian, only
+   1.5% off cyrillic — not a uniform "10–15%" across scripts. None exceed 2,048, so
    the 2,048 cells ran each sample's real length, and throughput barely moved from 1,024 because
    past ~1,200 tokens there was nothing left to truncate. **`EMBED_MAX_TOKENS = 2048`**: it costs
    next to nothing over 1,024 and is the first cap that stops silently cutting the p90 article body
