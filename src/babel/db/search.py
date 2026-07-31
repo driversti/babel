@@ -29,6 +29,12 @@ def quantised(expression: str) -> str:
     return f"binary_quantize({expression})::bit({EMBED_DIM})"
 
 
+# Plain CREATE INDEX, not CONCURRENTLY, because the tests apply this inside a
+# transaction and CONCURRENTLY is illegal there. That makes it the wrong
+# statement to paste into production: against 2.8M halfvec rows it takes
+# ShareLock for the whole build and blocks every writer until it finishes.
+# README's "Building the similarity index" carries the CONCURRENTLY form and
+# the maintenance_work_mem it needs; use that one on a live database.
 HNSW_INDEX_SQL = f"""
 CREATE INDEX IF NOT EXISTS article_embeddings_bin_idx ON article_embeddings
     USING hnsw (({quantised("embedding")}) bit_hamming_ops)

@@ -568,7 +568,29 @@ document:
    article per script family, not a corpus-wide measurement, so it does not overturn the
    0.4-vs-0.25 figure elsewhere in this document — it means that figure is itself unverified, and
    should be re-measured before anything is built on it specifically.
-3. **HNSW index size and build time** at 2.8M rows.
-4. **Recall of the quantise-then-re-rank pattern** at a 25x over-fetch, against the evaluation set.
+3. **HNSW index size and build time — measured at 508 rows, not at 2.8M, 2026-07-31.** A local
+   `pgvector/pgvector:0.8.6-pg17-trixie` container (not prod; seeded from a read-only prod query, per
+   task 8) built `article_embeddings_bin_idx` with `CREATE INDEX CONCURRENTLY` and
+   `maintenance_work_mem = '256MB'` in **71.5 ms**, at **224 kB** (`pg_relation_size`). That is a real
+   number, not a guess, but it is not a stand-in for the 2.8M-row figure this item originally asked
+   for: HNSW's build cost and graph size do not scale linearly with row count — layer count grows
+   with log(N), and 508 rows is small enough that the graph is mostly one layer — so neither figure
+   above should be multiplied up to estimate the full corpus. **The 2.8M-row build time and index
+   size are still unmeasured.**
+4. **Recall of the quantise-then-re-rank pattern — measured 2026-07-31: 1.00 (8/8)**, against the
+   hand-built cross-language set in `tests/eval/test_cross_language.py`, run with `pytest -m live`
+   against the real Jetson `bge-m3` service and a real (if small) populated database — see task 8's
+   report for the eight query/article pairs, each written by hand from a real archived body, each
+   query in a different language from the article it targets, covering all eight languages the
+   archive actually has: Persian, Serbian, Hungarian, Indonesian, Bulgarian, Polish, Spanish, English.
+   **This is a genuine measurement, not a vacuous one** — the target article still had to outrank
+   several hundred real, multilingual distractor articles under `search_articles`'s default
+   `CANDIDATES=500, RESULTS=20` — but it is not a measurement of the 25x over-fetch ratio's adequacy
+   at production scale: the local database held 508 rows total, so the inner stage's `LIMIT 500`
+   barely filters anything at that size, and this run cannot tell a healthy 25x over-fetch apart from
+   one that would lose recall once the quantised first stage is actually discarding candidates at
+   162,618 or 2.8M rows. What it does establish is that the encoder and the query path retrieve the
+   right article across languages at all, which is the property this whole slice exists for.
+   **Recall at the corpus's real scale is still unmeasured.**
 5. **Whether `nvidia-container-toolkit` installs cleanly on JetPack 6.2** and what the four running
    containers do when the daemon restarts.

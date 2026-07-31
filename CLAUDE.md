@@ -89,6 +89,20 @@ retryable, the same distinction this project draws everywhere else between "the 
 so `ip rule` is unavailable and gluetun cannot start there at all. Details in `SPEC.md` under
 "Target host". The Jetson keeps phase 3.
 
+**The archive holds 162,618 articles and 2,985,540 comments as of 2026-07-30**, not the 10,093
+articles and 161,155 comments recorded at the last handoff above — the crawler has kept walking and
+polling in between. `lang` is NULL in every row; nothing populates it. That does not affect
+embeddings — `bge-m3` needs no language label — but it means no "Serbian articles about X" filter
+can be built on that column today.
+
+**Phase 3 — cross-language semantic search — is on `feat/phase-3-embeddings`.** Design in
+`docs/superpowers/specs/2026-07-30-embeddings-design.md`. A `bge-m3` embed service on a Jetson turns
+article text into vectors; `babel embed` drains the corpus queue through it; `babel serve`'s
+`/search` embeds the reader's query through the same service and ranks by cosine similarity via a
+quantise-then-re-rank pgvector query. See the Commands section below for `babel embed` and
+`/search`, and "Operating the live run" for the `embed` compose service — deliberately outside
+gluetun's namespace, since it never talks to eRepublik, only to Postgres and the Jetson.
+
 ## What is still open
 
 From the second whole-branch review, in the order it recommends. Its Criticals (C2, C3), I8, I9 and
@@ -174,21 +188,26 @@ mutation results:
 
 ## Operating the live run
 
-It runs as five compose services on the deploy host (see SPEC.md "Target host"; the address is not
-in this repo), plus a sixth that only runs when an operator asks for it. `gluetun` is the tunnel,
-`db` is Postgres, `crawler` walks and polls, `images` drains the image queue, and `web`
-(`babel serve`) serves the public read-only archive. The sixth is `sweep`, behind a compose profile
-so a bare `up -d` never starts it: it is `crawler`'s image running `--no-poll --sweep-only`, for
-re-collection passes, and it is a service rather than a `compose run --rm` one-shot because that
-one-shot carries `restart: no` and is deleted on exit — a reboot ended a 34-hour re-collection with
-every other container coming back healthy around it. The profile exists because `RateLimiter` is
-per process: a sweep beside the walk is two requests a second, so stop `crawler` first. `web` is
-deliberately outside gluetun's namespace: it needs inbound connections, which that namespace cannot
-accept, and its only outbound dependency is Postgres on the bridge, so the site stays up when the
-tunnel is down. All state is in Postgres plus `data/images`; both are gitignored bind mounts, so
-`git pull && docker compose build && docker compose up -d <service>` is the whole deploy for
-`crawler`, `images` and `web` individually. Restarting any one of them outside of a migration is
-safe at any time — the cursor is persisted and a partial batch is re-walked without HTTP.
+It runs as six compose services on the deploy host (see SPEC.md "Target host"; the address is not
+in this repo), plus a seventh that only runs when an operator asks for it. `gluetun` is the tunnel,
+`db` is Postgres, `crawler` walks and polls, `images` drains the image queue, `embed` drains the
+`article_embeddings` queue through the Jetson, and `web` (`babel serve`) serves the public read-only
+archive, including `/search`. The seventh is `sweep`, behind a compose profile so a bare `up -d`
+never starts it: it is `crawler`'s image running `--no-poll --sweep-only`, for re-collection passes,
+and it is a service rather than a `compose run --rm` one-shot because that one-shot carries
+`restart: no` and is deleted on exit — a reboot ended a 34-hour re-collection with every other
+container coming back healthy around it. The profile exists because `RateLimiter` is per process: a
+sweep beside the walk is two requests a second, so stop `crawler` first. `web` and `embed` are both
+deliberately outside gluetun's namespace, for different reasons: `web` needs inbound connections,
+which that namespace cannot accept; `embed` never talks to eRepublik at all, only to Postgres on the
+bridge and the Jetson on the LAN, so routing it through the tunnel would only add
+`FIREWALL_OUTBOUND_SUBNETS` exposure for nothing. Both mean the site and the embedding drain stay up
+when the VPN tunnel is down. All state is in Postgres plus `data/images`; both are gitignored bind
+mounts, so `git pull && docker compose build && docker compose up -d <service>` is the whole deploy
+for `crawler`, `images`, `embed` and `web` individually. Restarting any one of them outside of a
+migration is safe at any time — the cursor is persisted and a partial batch is re-walked without
+HTTP; `embed`'s queue is a NULL-vector row, not a status, so a restart mid-batch just re-offers the
+same rows.
 
 **That one-liner is not safe for a migration.** Both `crawler` and `images` apply pending
 migrations at startup, so bringing up either one first runs a pending migration file against a live
@@ -345,6 +364,12 @@ measurement was cheap.
 - `babel images` — drain the `article_images` queue until stopped; runs as the separate `images`
   compose service, stoppable/restartable independently of `crawler` since ingest only enqueues
   image URLs and never fetches the bytes itself
+- `babel embed` — drain the `article_embeddings` queue until stopped; runs as the separate `embed`
+  compose service. Claims articles with no vector newest-first, batches them to the Jetson's
+  `POST /embed`, and refuses to write a vector if the service reports a model id different from
+  `EMBED_MODEL` — the one silent-degradation failure this whole design exists to name and catch.
+  No status/attempts column like `article_images` has: an embedding failure is always transient (the
+  service is down, the batch timed out), so a restart mid-batch just re-offers the same rows
 - `babel serve` — run the public read-only web archive; the `web` compose service. Refuses to start
   if `WEB_DATABASE_URL` is unset or equal to `DATABASE_URL`, and never applies migrations itself —
   see "Operating the live run" for why and for the deploy order. It does *check* them: one throwaway
@@ -353,6 +378,12 @@ measurement was cheap.
   answers 503 on every page — `UndefinedColumnError` is a `PostgresError`, so it lands in the
   database-down handler — while `/healthz` and the compose healthcheck stay green, which points the
   operator at Postgres instead of at the deploy
+- `GET /search?q=…` — part of `babel serve`, not a separate command. Embeds the query string through
+  the same Jetson service `babel embed` uses, then runs the two-stage pgvector query
+  (`src/babel/db/search.py`) and renders results through the same templates as browse. Degrades
+  honestly: a slow or unreachable embed service renders a "semantic search is unavailable right now"
+  notice rather than a keyword fallback, because keyword search does not exist in this codebase.
+  `noindex`, and disallowed in `robots.txt`, like the rest of the filtered browse space
 - `docker compose run --rm crawler babel hide --article <id>` or `babel hide --image <sha256>` —
   suppress an article, or stop serving one blob by digest. These are two separate commands on
   purpose: hiding an article does not withhold its images, because a blob is content-addressed and
