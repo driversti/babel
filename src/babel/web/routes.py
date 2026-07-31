@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime
+import json
 import logging
 import pathlib
 import time
@@ -343,17 +344,27 @@ def register_routes(app: FastAPI) -> None:
             vectors = await asyncio.wait_for(
                 app.state.embedder.embed([query]), timeout=settings.search_timeout_sec
             )
-        except (EmbedError, aiohttp.ClientError, OSError, TimeoutError):
+        except (
+            EmbedError, aiohttp.ClientError, OSError, TimeoutError, json.JSONDecodeError
+        ) as exc:
             # asyncio.TimeoutError is not listed separately: since Python 3.11 it
             # is the exact same object as the builtin TimeoutError (ruff UP041),
             # not a subclass, so asyncio.wait_for's own timeout is already caught
             # here alongside aiohttp's.
             #
+            # json.JSONDecodeError (a ValueError) is not covered by
+            # aiohttp.ClientError: that covers a *wrong* content type, not a
+            # right one carrying a malformed body. resp.json() inside
+            # EmbedClient.embed raises this directly when a 200 declares
+            # application/json but the body does not parse, and without this
+            # entry that escaped as an unhandled exception to the generic 500
+            # page instead of this route's own honest "unavailable".
+            #
             # Deliberately not a keyword fallback: this codebase has no keyword
             # search, and offering one under that name would be a promise the
             # degradation path cannot keep. The reader is told the truth and
             # the browse filters still work.
-            log.warning("embed service unavailable for search")
+            log.warning("embed service unavailable for search: %s", exc)
             context["unavailable"] = True
             return templates.TemplateResponse(
                 request=request, name="search.html", context=context
