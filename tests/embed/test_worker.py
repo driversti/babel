@@ -120,3 +120,62 @@ async def test_a_persistent_failure_alerts_once(pool, pg, settings):
     await run_embed_worker(pool, client, notifier, settings,
                            sleep=clock.sleep, max_cycles=3)
     assert [key for key, _ in notifier.sent] == ["embed-service-down"] * 3
+
+
+async def test_the_backoff_survives_days_of_failure_without_overflowing(pool, pg, settings):
+    """`settings.embed_backoff_base_sec * 2 ** (consecutive_failures - 1)` is
+    computed in full before `min()` caps it against embed_backoff_max_sec. At
+    consecutive_failures = 1025, `2 ** 1024` is an int too large to convert to
+    a float, and OverflowError is raised computing `delay` itself — a
+    statement that runs *after* `client.embed`'s exception has already been
+    caught, so it is not inside the try/except above it and propagates out of
+    run_embed_worker uncaught. ~7 days of a down embed service (doubling every
+    idle-sleep-free failure cycle) is not a contrived count for a service that
+    is meant to run indefinitely. Impact is bounded — a restart recovers — but
+    the traceback names arithmetic instead of the embed service.
+    """
+    await repo.save_article(pg, _article(10))
+    client, clock = FakeClient(fail_times=10_000), Clock()
+    await run_embed_worker(pool, client, FakeNotifier(), settings,
+                           sleep=clock.sleep, max_cycles=1025)
+    assert clock.slept[-1] == settings.embed_backoff_max_sec
+
+
+class _FailFailSucceedThenFailAgain:
+    """fail, fail, succeed, fail — all inside one continuous worker run, so a
+    deleted `consecutive_failures = 0` reset is actually exercised rather than
+    reset for free by a fresh `run_embed_worker` call starting its own local
+    variable at 0.
+
+    The third call's "success" queues a fresh article as a side effect —
+    standing in for a poll or backfill enqueuing new work while the worker was
+    recovering — so the fourth cycle has something to fail on instead of
+    finding an empty, already-drained queue.
+    """
+
+    dim = repo.EMBED_DIM
+
+    def __init__(self, pg):
+        self._pg = pg
+        self.calls = 0
+
+    async def embed(self, texts):
+        self.calls += 1
+        if self.calls == 3:
+            await repo.save_article(self._pg, _article(20))
+            return [[1.0] + [0.0] * (self.dim - 1) for _ in texts]
+        raise EmbedError("service down")
+
+
+async def test_a_success_resets_the_backoff_to_base(pool, pg, settings):
+    """fail, fail, succeed, fail: the fourth failure's delay must restart at
+    embed_backoff_base_sec, not continue doubling from the first two.
+    Deleting `consecutive_failures = 0` after a successful embed currently
+    leaves the rest of the suite green — nothing else exercises a recovery
+    followed by a fresh failure.
+    """
+    await repo.save_article(pg, _article(10))
+    client, clock = _FailFailSucceedThenFailAgain(pg), Clock()
+    await run_embed_worker(pool, client, FakeNotifier(), settings,
+                           sleep=clock.sleep, max_cycles=4)
+    assert clock.slept == [5.0, 10.0, 5.0]
