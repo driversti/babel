@@ -28,7 +28,12 @@ services:
       retries: 3
 
   db:
-    image: postgres:17
+    # Stock postgres:17 plus the vector extension — same upstream image, same
+    # PGDATA layout, so this is an image swap and not a dump and restore. The
+    # -trixie tag is not optional: prod runs 17.10-1.pgdg13+1 and both report
+    # Debian GLIBC 2.41-12+deb13u3. A bookworm image would change text
+    # collation under every index already built on this data.
+    image: pgvector/pgvector:0.8.6-pg17-trixie
     container_name: babel-db
     environment:
       - POSTGRES_USER=babel
