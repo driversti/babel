@@ -121,6 +121,25 @@ services:
       db: {condition: service_healthy}
     restart: unless-stopped
 
+  # Turns article text into vectors, through the Jetson's GPU.
+  #
+  # Deliberately NOT network_mode: service:gluetun, unlike crawler/images/sweep.
+  # This process never touches eRepublik. Its two dependencies are Postgres on
+  # the bridge and the embed service on the LAN, and gluetun's namespace can
+  # reach neither without widening FIREWALL_OUTBOUND_SUBNETS to the home
+  # network — which is exactly the exposure the tunnel exists to prevent.
+  #
+  # Like crawler and images it applies pending migrations at startup, so it is
+  # subject to the same build-before-migrate rule in README.
+  embed:
+    build: .
+    container_name: babel-embed
+    command: ["babel", "embed"]
+    env_file: .env
+    depends_on:
+      db: {condition: service_healthy}
+    restart: unless-stopped
+
   web:
     build: .
     container_name: babel-web
@@ -148,6 +167,10 @@ services:
       - IMAGE_ROOT=${IMAGE_ROOT:-/data/images}
       - CONTACT=${CONTACT:-}
       - WEB_POOL_SIZE=${WEB_POOL_SIZE:-10}
+      - EMBED_SERVICE_URL=${EMBED_SERVICE_URL}
+      - EMBED_MODEL=${EMBED_MODEL:-BAAI/bge-m3}
+      - SEARCH_MAX_QUERY_CHARS=${SEARCH_MAX_QUERY_CHARS:-512}
+      - SEARCH_TIMEOUT_SEC=${SEARCH_TIMEOUT_SEC:-2.0}
     volumes:
       # Read-only: the site serves blobs, it never writes one.
       - ${IMAGE_ROOT_HOST:-./data/images}:/data/images:ro
