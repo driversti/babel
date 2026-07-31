@@ -490,6 +490,13 @@ async def claim_pending_embeddings(
 
     Newest-first for the same reason as the image drain and the article walk —
     the most-read part of the archive becomes searchable first.
+
+    Filters on ae.embedding IS NULL rather than the absence of an
+    article_embeddings row — every article gets one at save time (save_article)
+    or by migration 008's backfill, so there is always a row to filter, never a
+    join to perform. Migration 008 has the cost argument for why: an anti-join
+    against articles would get cheaper to skip only while the unembedded rows
+    sit near the top of the table, and in steady state they do not.
     """
     rows = await conn.fetch(_CLAIM_PENDING_EMBEDDINGS, limit)
     return tuple(
