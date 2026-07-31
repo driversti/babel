@@ -1197,6 +1197,7 @@ git commit -m "Add the embed client and its refusals"
 `tests/embed/test_worker.py`:
 
 ```python
+import dataclasses
 import datetime
 
 import pytest
@@ -1277,9 +1278,9 @@ async def test_the_title_is_embedded_with_the_body(pool, pg, settings):
 
 
 async def test_long_bodies_are_truncated_before_they_are_sent(pool, pg, settings):
-    article = _article(10)
-    article = type(article)(**{**article.__dict__, "body": "x" * 50_000})
-    await repo.save_article(pg, article)
+    # dataclasses.replace, not `type(a)(**a.__dict__)`: Article is
+    # @dataclass(frozen=True, slots=True) and a slots dataclass has no __dict__.
+    await repo.save_article(pg, dataclasses.replace(_article(10), body="x" * 50_000))
     settings = settings.model_copy(update={"embed_max_chars": 100})
     client, clock = FakeClient(), Clock()
     await run_embed_worker(pool, client, FakeNotifier(), settings,
@@ -1517,7 +1518,7 @@ git commit -m "Drain the embedding queue through the Jetson"
 - Produces:
   - `search.CANDIDATES: int = 500`, `search.RESULTS: int = 20`
   - `search.HNSW_INDEX_SQL: str`
-  - `search.build_search_query(*, candidates: int, limit: int) -> str`
+  - `search.build_search_query() -> str`
   - `search.SearchRow` — frozen dataclass with `id, title, author_name, country, published_at, score`
   - `async search.search_articles(conn, vector: Sequence[float], *, candidates=CANDIDATES, limit=RESULTS) -> tuple[SearchRow, ...]`
 
@@ -1577,12 +1578,12 @@ async def test_the_index_and_the_query_quantise_identically(pg):
     """
     expression = search.quantised("embedding")
     assert expression in search.HNSW_INDEX_SQL
-    assert expression in search.build_search_query(candidates=500, limit=20)
+    assert expression in search.build_search_query()
 
 
 async def test_the_search_uses_the_hnsw_index(pg):
     await _populated(pg)
-    sql = search.build_search_query(candidates=50, limit=10)
+    sql = search.build_search_query()
     async with pg.transaction():
         # Forced, not hoped for. At any row count a test can afford, the
         # planner may reasonably prefer a scan; what this test exists to prove
@@ -1687,19 +1688,17 @@ class SearchRow:
     score: float
 
 
-def build_search_query(*, candidates: int, limit: int) -> str:
-    """The two-stage statement. Parameters are ($1 vector text, $2 candidates, $3 limit).
+def build_search_query() -> str:
+    """The two-stage statement. Its parameters are ($1 vector text, $2 candidates, $3 limit).
 
     Returned rather than executed so the EXPLAIN test plans the query the
     application actually sends — the mistake finding M3 records against the
     older suite is asserting on a copy pasted into a test.
 
-    `candidates` and `limit` are still bound parameters; they appear in the
-    signature because the caller must set hnsw.ef_search from the same value it
-    passes here, and taking both through one function is what keeps them from
-    drifting apart.
+    Takes no arguments: candidates and limit are bound at execution, and the
+    statement text does not vary with them. That is the difference from
+    build_list_query, whose text genuinely varies per filter combination.
     """
-    del candidates, limit  # bound at execution; named here to document the contract
     return f"""
         SELECT a.id, a.title, a.author_name, a.country, a.published_at,
                1 - (c.embedding <=> $1::halfvec({EMBED_DIM})) AS score
@@ -1746,7 +1745,7 @@ async def search_articles(
     limit: int = RESULTS,
 ) -> tuple[SearchRow, ...]:
     literal = vector_literal(vector)
-    sql = build_search_query(candidates=candidates, limit=limit)
+    sql = build_search_query()
     # An explicit transaction, because SET LOCAL applies to one and asyncpg
     # otherwise wraps each execute in its own. Plain SET is not the fix: on a
     # pooled connection it would persist into whatever unrelated request
@@ -1773,7 +1772,7 @@ async def search_articles_with_settings_probe(
     because the no-op raises nothing.
     """
     literal = vector_literal(vector)
-    sql = build_search_query(candidates=candidates, limit=limit)
+    sql = build_search_query()
     async with conn.transaction():
         await _apply_settings(conn, candidates)
         await conn.fetch(sql, literal, candidates, limit)
@@ -1802,7 +1801,7 @@ git commit -m "Add the two-stage semantic search query"
 
 **Interfaces:**
 - Consumes: `search.search_articles`, `search.SearchRow` (Task 6); `EmbedClient`, `EmbedError` (Task 4); `settings.search_max_query_chars`, `settings.search_timeout_sec`, `settings.embed_service_url`, `settings.embed_model` (Task 4).
-- Produces: `GET /search?q=` returning HTML.
+- Produces: `GET /search?q=` returning HTML; `create_app(settings, pool=None, embedder=None)` — a third injectable, defaulted, so every existing `create_app` call site keeps working unchanged.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1829,19 +1828,6 @@ def _article(article_id: int, title: str) -> Article:
     )
 
 
-class StubEmbedder:
-    def __init__(self, vector=None, error=None):
-        self.vector = vector or [0.1] * repo.EMBED_DIM
-        self.error = error
-        self.calls = []
-
-    async def embed(self, texts):
-        self.calls.append(list(texts))
-        if self.error is not None:
-            raise self.error
-        return [self.vector]
-
-
 @pytest.fixture
 async def seeded(pg):
     await repo.save_article(pg, _article(10, "About elections"))
@@ -1853,29 +1839,24 @@ async def seeded(pg):
 
 
 async def test_a_query_returns_matching_articles(client, seeded):
-    client._transport.app.state.embedder = StubEmbedder()
     resp = await client.get("/search", params={"q": "вибори"})
     assert resp.status_code == 200
     assert "About elections" in resp.text
 
 
-async def test_an_empty_query_shows_the_form_and_calls_nothing(client, seeded):
-    embedder = StubEmbedder()
-    client._transport.app.state.embedder = embedder
+async def test_an_empty_query_shows_the_form_and_calls_nothing(client, seeded, embedder):
     resp = await client.get("/search", params={"q": "   "})
     assert resp.status_code == 200
     assert embedder.calls == []
 
 
-async def test_an_overlong_query_is_truncated_not_sent_whole(client, seeded):
-    embedder = StubEmbedder()
-    client._transport.app.state.embedder = embedder
+async def test_an_overlong_query_is_truncated_not_sent_whole(client, seeded, embedder):
     await client.get("/search", params={"q": "x" * 5000})
     assert len(embedder.calls[0][0]) == 512
 
 
-async def test_the_service_being_down_degrades_honestly(client, seeded):
-    client._transport.app.state.embedder = StubEmbedder(error=EmbedError("down"))
+async def test_the_service_being_down_degrades_honestly(client, seeded, embedder):
+    embedder.error = EmbedError("down")
     resp = await client.get("/search", params={"q": "вибори"})
     assert resp.status_code == 200
     assert "unavailable" in resp.text.lower()
@@ -1885,8 +1866,8 @@ async def test_the_service_being_down_degrades_honestly(client, seeded):
     assert "no matches" not in resp.text.lower()
 
 
-async def test_a_timeout_degrades_the_same_way(client, seeded):
-    client._transport.app.state.embedder = StubEmbedder(error=TimeoutError())
+async def test_a_timeout_degrades_the_same_way(client, seeded, embedder):
+    embedder.error = TimeoutError()
     resp = await client.get("/search", params={"q": "вибори"})
     assert resp.status_code == 200
     assert "unavailable" in resp.text.lower()
@@ -1904,24 +1885,74 @@ Expected: FAIL — 404 on `/search`
 
 - [ ] **Step 3: Let the web fixture inject an embedder**
 
-In `tests/web/conftest.py`, add to the `Settings(...)` call:
+In `tests/web/conftest.py`, add the stub and the fixture, and pass both new arguments through:
 
 ```python
+from babel.db.repo import EMBED_DIM
+
+
+class StubEmbedder:
+    """Stands in for EmbedClient. Tests mutate `error` and `vector` in place.
+
+    Mutable rather than constructed per test, because the app is built once by
+    the `client` fixture and the same instance has to be reachable from the
+    test that wants it to fail.
+    """
+
+    def __init__(self):
+        self.vector = [0.1] * EMBED_DIM
+        self.error = None
+        self.calls = []
+
+    async def embed(self, texts):
+        self.calls.append(list(texts))
+        if self.error is not None:
+            raise self.error
+        return [self.vector]
+
+
+@pytest.fixture
+def embedder():
+    return StubEmbedder()
+```
+
+In the `client` fixture, take `embedder`, add two settings, and inject:
+
+```python
+async def client(pool, image_root, embedder):
+    settings = Settings(
+        database_url="postgresql://babel@unused/babel",
+        web_database_url="postgresql://babel_web@unused/babel",
+        contact="archive@example.invalid",
+        image_root=str(image_root),
         embed_service_url="http://embed.invalid",
         embed_model="test/model",
+    )
+    app = create_app(settings, pool=pool, embedder=embedder)
 ```
 
 - [ ] **Step 4: Build the embedder in the app**
 
-In `src/babel/web/app.py`, inside `lifespan`, before the pool is set:
+In `src/babel/web/app.py`, give `create_app` a third injectable and build the real client when it is
+omitted. This is the seam the pool already uses, and the docstring there says why: an injected
+object belongs to the caller, and leaving the production path untouched keeps it exactly as strict.
 
 ```python
-        # One client for the process. `app.state.embedder` is a seam the tests
-        # replace; production never sets it, so this is what runs.
-        from babel.embed.client import EmbedClient  # noqa: PLC0415 — avoids a cycle
-        from babel.db.repo import EMBED_DIM  # noqa: PLC0415
+def create_app(settings: Settings, pool: object | None = None, embedder: object | None = None) -> FastAPI:
+```
 
-        if not hasattr(app.state, "embedder"):
+Inside `lifespan`, before the pool handling:
+
+```python
+        # One client for the process — building one per request would open a
+        # fresh aiohttp session on every search. Injected in tests, built here
+        # in production, exactly like the pool below.
+        if embedder is not None:
+            app.state.embedder = embedder
+        else:
+            from babel.db.repo import EMBED_DIM  # noqa: PLC0415 — avoids a cycle
+            from babel.embed.client import EmbedClient  # noqa: PLC0415
+
             app.state.embedder = EmbedClient(
                 settings.embed_service_url,
                 model=settings.embed_model,
