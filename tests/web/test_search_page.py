@@ -69,6 +69,33 @@ async def test_a_timeout_degrades_the_same_way(client, seeded, embedder):
     assert "unavailable" in resp.text.lower()
 
 
+async def test_the_empty_query_form_is_cacheable(client, seeded):
+    """`/search` is the one new public route; both its siblings (`/`'s list
+    page and `/article/{id}`) already send `public, max-age=300`, and this
+    path had sent no Cache-Control header at all — every hit, even for the
+    bare form, would have gone uncached by any proxy in front of the site.
+    """
+    resp = await client.get("/search", params={"q": "   "})
+    assert resp.headers["cache-control"] == "public, max-age=300"
+
+
+async def test_a_successful_search_is_cacheable(client, seeded):
+    resp = await client.get("/search", params={"q": "вибори"})
+    assert resp.headers["cache-control"] == "public, max-age=300"
+
+
+async def test_the_unavailable_response_is_not_cached(client, seeded, embedder):
+    """Deliberately not the max-age=300 the other two paths use: this
+    response describes an outage of the embed service, not a page of the
+    archive. A proxy that cached "unavailable" for five minutes would keep
+    telling readers search is down for the whole cache lifetime after the
+    service actually recovers.
+    """
+    embedder.error = EmbedError("down")
+    resp = await client.get("/search", params={"q": "вибори"})
+    assert resp.headers["cache-control"] == "no-store"
+
+
 async def test_search_is_disallowed_in_robots(client):
     body = (await client.get("/robots.txt")).text
     assert "Disallow: /search" in body
