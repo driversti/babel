@@ -11,8 +11,8 @@ expensive to obtain; do not re-derive them, and update them there if the site ch
 Phase 1 — crawler. All ten original tasks are implemented: config, article/comment parser, DB
 schema + migration runner, repository layer, rate limiter + fetcher, content-addressed image
 store, end-to-end article ingest, RSS poller, newest-first backfill walker, and the CLI/service
-that composes them (`src/babel/cli.py`). 204 tests, all passing (`uv run pytest`, needs Docker for
-the `postgres:17` testcontainer); `uv run ruff check src tests` clean.
+that composes them (`src/babel/cli.py`). 535 tests, all passing (`uv run pytest`, needs Docker for
+the `pgvector/pgvector:0.8.6-pg17-trixie` testcontainer); `uv run ruff check src tests` clean.
 
 **The crawler is running live right now** on the deploy host, and has been since 2026-07-26. It
 works: articles, authors, e-days and full comment threads in Persian, Serbian, Hungarian,
