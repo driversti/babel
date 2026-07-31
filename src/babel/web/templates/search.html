@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Search — babel{% endblock %}
+{% block content %}
+
+<form class="filters" method="get" action="/search">
+  <label>Search
+    <input type="search" name="q" value="{{ query }}" maxlength="512"
+           placeholder="any language">
+  </label>
+  <button type="submit">Search</button>
+</form>
+
+<p class="coverage">
+  Search finds articles by meaning, not by words: a query in one language
+  matches articles written in another. Only articles already embedded are
+  searchable.
+</p>
+
+{% if unavailable %}
+<p class="notice">
+  Semantic search is unavailable right now. Nothing is lost — the archive is
+  still there. <a href="/">Browse by country, author or date</a> instead.
+</p>
+{% elif query and rows %}
+<ol class="articles">
+  {% for row in rows %}
+  <li>
+    <time>{{ game_time(row.published_at).strftime("%Y-%m-%d") }}</time>
+    <a class="title" href="/article/{{ row.id }}">{{ row.title }}</a>
+    {% if row.author_name %}
+    <a class="author" href="/?author={{ row.author_name|urlencode }}">{{ row.author_name }}</a>
+    {% endif %}
+    {% if row.country %}<span class="country">{{ row.country }}</span>{% endif %}
+  </li>
+  {% endfor %}
+</ol>
+{% elif query %}
+<p class="notice">No matches.</p>
+{% endif %}
+
+{% endblock %}

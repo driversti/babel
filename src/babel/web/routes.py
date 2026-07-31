@@ -1,15 +1,19 @@
 """Route handlers. No SQL here — everything comes from babel.db.browse."""
 
+import asyncio
 import datetime
 import logging
 import pathlib
 import time
 
+import aiohttp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
 from babel.crawler.images import image_path
 from babel.db import browse
+from babel.db import search as db_search
+from babel.embed.client import EmbedError
 from babel.web.blobs import HEAD_BYTES, parse_digest, serving_type
 from babel.web.cursor import (
     decode_cursor,
@@ -312,6 +316,52 @@ def register_routes(app: FastAPI) -> None:
             },
             headers={"Cache-Control": "public, max-age=300"},
         )
+
+    @app.get("/search", response_class=HTMLResponse)
+    async def search_page(request: Request, q: str = ""):
+        settings = app.state.settings
+        # Truncated, not rejected. A reader who pastes a paragraph gets an
+        # answer for its opening rather than an error, and the cap still holds:
+        # attention is quadratic in length and this string comes from anyone on
+        # the internet. The service caps again on its own side, because it is
+        # reachable from the LAN without going through here.
+        query = q.strip()[: settings.search_max_query_chars]
+        context = {
+            "query": query,
+            "rows": (),
+            "unavailable": False,
+            "game_time": to_game_time,
+            "settings": settings,
+        }
+
+        if not query:
+            return templates.TemplateResponse(
+                request=request, name="search.html", context=context
+            )
+
+        try:
+            vectors = await asyncio.wait_for(
+                app.state.embedder.embed([query]), timeout=settings.search_timeout_sec
+            )
+        except (EmbedError, aiohttp.ClientError, OSError, TimeoutError):
+            # asyncio.TimeoutError is not listed separately: since Python 3.11 it
+            # is the exact same object as the builtin TimeoutError (ruff UP041),
+            # not a subclass, so asyncio.wait_for's own timeout is already caught
+            # here alongside aiohttp's.
+            #
+            # Deliberately not a keyword fallback: this codebase has no keyword
+            # search, and offering one under that name would be a promise the
+            # degradation path cannot keep. The reader is told the truth and
+            # the browse filters still work.
+            log.warning("embed service unavailable for search")
+            context["unavailable"] = True
+            return templates.TemplateResponse(
+                request=request, name="search.html", context=context
+            )
+
+        async with app.state.pool.acquire() as conn:
+            context["rows"] = await db_search.search_articles(conn, vectors[0])
+        return templates.TemplateResponse(request=request, name="search.html", context=context)
 
     @app.get("/article/{article_id}", response_class=HTMLResponse)
     async def article(request: Request, article_id: int):
