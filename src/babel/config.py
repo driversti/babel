@@ -74,6 +74,39 @@ class Settings(BaseSettings):
     image_idle_sleep_sec: float = Field(default=60.0, gt=0)
     image_disk_full_sleep_sec: float = Field(default=300.0, gt=0)
 
+    # The Jetson's embed service. A placeholder default, like every other
+    # address in this file: this repository is public.
+    embed_service_url: str = Field(default="http://localhost:8081")
+    embed_model: str = Field(default="BAAI/bge-m3")
+
+    # Batch and token caps are set by the benchmark in the plan's task 1, not
+    # guessed. Both are configuration because the corpus and the query are
+    # different workloads: one is 32 long texts that may take a second, the
+    # other is one short string a reader is waiting on.
+    # 8, measured, not guessed. Task 1's sweep found batch 8 beats or ties 16
+    # and 32 at every token cap — the opposite of the usual expectation, because
+    # this board shares its memory bandwidth between CPU and GPU, so a larger
+    # batch buys no throughput and costs latency. The table is in the design
+    # spec's "Still unmeasured" item 1.
+    embed_batch_size: int = Field(default=8, ge=1, le=64)
+
+    # Article text is truncated to this before it is sent. Far above what the
+    # token cap can reach in any script in this archive (1024 tokens is ~4,000
+    # Latin characters and ~2,500 Cyrillic or Persian), so nothing the
+    # tokenizer would keep is discarded here — this exists to bound the request
+    # body, not to shape the input.
+    embed_max_chars: int = Field(default=20_000, ge=1_000)
+
+    embed_timeout_sec: float = Field(default=120.0, gt=0)
+    embed_idle_sleep_sec: float = Field(default=60.0, gt=0)
+    embed_backoff_base_sec: float = Field(default=5.0, gt=0)
+    embed_backoff_max_sec: float = Field(default=600.0, gt=0)
+
+    # The public search path. A much tighter cap than the corpus one: this
+    # string comes from anyone on the internet, and attention is quadratic.
+    search_max_query_chars: int = Field(default=512, ge=1)
+    search_timeout_sec: float = Field(default=2.0, gt=0)
+
     poll_interval_sec: int = Field(default=900, ge=60)
     rss_pages: int = Field(default=5, ge=1, le=5)
     ip_check_interval_sec: int = Field(default=900, ge=60)
