@@ -2299,6 +2299,24 @@ async def test_recall_at_20_across_languages(live_conn):
 Run: `uv run pytest`
 Expected: the eval test does not appear (deselected by `-m 'not live'`). Everything else passes.
 
+- [ ] **Step 3b: Annotate `HNSW_INDEX_SQL` with what running it costs**
+
+`src/babel/db/search.py`'s `HNSW_INDEX_SQL` is a plain, non-`CONCURRENTLY` `CREATE INDEX` with no
+comment. That form is correct for the tests, which apply it inside a transaction where
+`CONCURRENTLY` is illegal — but an operator who copies the constant to production against 2.8M
+`halfvec` rows takes `ShareLock` for the whole build and blocks every writer until it finishes.
+`CLAUDE.md` records that this project already had to write a stop/migrate/start runbook for exactly
+that. Add the comment saying so, and pointing at the README section below:
+
+```python
+# Plain CREATE INDEX, not CONCURRENTLY, because the tests apply this inside a
+# transaction and CONCURRENTLY is illegal there. That makes it the wrong
+# statement to paste into production: against 2.8M halfvec rows it takes
+# ShareLock for the whole build and blocks every writer until it finishes.
+# README's "Building the similarity index" carries the CONCURRENTLY form and
+# the maintenance_work_mem it needs; use that one on a live database.
+```
+
 - [ ] **Step 4: Write the README section**
 
 Add to `README.md`, after the image-worker section:
@@ -2361,6 +2379,13 @@ CREATE INDEX CONCURRENTLY article_embeddings_bin_idx ON article_embeddings
     USING hnsw ((binary_quantize(embedding)::bit(1024)) bit_hamming_ops)
     WHERE embedding IS NOT NULL;
 ```
+
+Two things this design deliberately does not have, named here so an operator meets them in the
+runbook rather than in production. `/search` has **no rate limit and no query-vector cache**: about
+60 bytes of request buys a `bge-m3` forward pass on the Jetson, and `search_timeout_sec` bounds the
+*page*, not the queue behind it. Neither is hard to add — a cache keyed on the normalised query
+string would absorb the common case — but both were out of scope for this slice. If the site takes
+real traffic, watch the Jetson's load before assuming it is fine.
 
 ### Watching the drain
 
