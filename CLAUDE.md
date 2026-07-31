@@ -375,10 +375,9 @@ measurement was cheap.
   see "Operating the live run" for why and for the deploy order. It does *check* them: one throwaway
   connection reads `schema_migrations` before anything is served and refuses, naming whichever of
   `005_browse.sql`/`007_body_markup.sql`/`008_embeddings.sql` is missing. Without that check a
-  skipped migrate step
-  answers 503 on every page — `UndefinedColumnError` is a `PostgresError`, so it lands in the
-  database-down handler — while `/healthz` and the compose healthcheck stay green, which points the
-  operator at Postgres instead of at the deploy
+  skipped migrate step answers 503 on every page — `UndefinedColumnError` is a `PostgresError`, so
+  it lands in the database-down handler — while `/healthz` and the compose healthcheck stay green,
+  which points the operator at Postgres instead of at the deploy
 - `GET /search?q=…` — part of `babel serve`, not a separate command. Embeds the query string through
   the same Jetson service `babel embed` uses, then runs the two-stage pgvector query
   (`src/babel/db/search.py`) and renders results through the same templates as browse. Degrades

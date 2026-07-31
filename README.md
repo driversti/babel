@@ -137,8 +137,8 @@ that forgets this setting fails loudly (connection refused, not a silent LAN exp
 template and fill in this machine's own LAN address:
 
 ```bash
-cp jetson/.env.example jetson/.env
-# edit jetson/.env: EMBED_BIND=<this Jetson's LAN address>
+cp .env.example .env
+# edit .env (still inside ~/babel-embed/src/jetson): EMBED_BIND=<this Jetson's LAN address>
 docker compose up -d
 curl http://<jetson-address>:8081/healthz     # {"model":"BAAI/bge-m3","dim":1024,"cuda":true}
 ```
@@ -247,10 +247,9 @@ applies migrations: `crawler` and `images` both do that at startup, and a third 
 same way would connect as a SELECT-only role and crash-loop under `restart: unless-stopped`.
 Applying the schema is an explicit operator step (below). It does check that the step was taken —
 one throwaway connection reads `schema_migrations` before anything is served, and the process
-refuses to start, naming whichever of `005_browse.sql`/`007_body_markup.sql`/`008_embeddings.sql` is
-missing. A skipped
-migrate step otherwise answers 503 on every page while `/healthz` and the compose healthcheck stay
-green.
+refuses to start, naming whichever of `005_browse.sql`/`007_body_markup.sql`/`008_embeddings.sql`
+is missing. A skipped migrate step otherwise answers 503 on every page while `/healthz` and the
+compose healthcheck stay green.
 
 `web` is also the one service that does not get `env_file: .env`. It is handed `WEB_DATABASE_URL`,
 `IMAGE_ROOT`, `CONTACT` and `WEB_POOL_SIZE` and nothing else, because it is the only process here
