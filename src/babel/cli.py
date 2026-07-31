@@ -253,6 +253,37 @@ async def _images() -> None:
 
 
 @main.command()
+def embed() -> None:
+    """Embed queued articles until stopped."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    asyncio.run(_embed())
+
+
+async def _embed() -> None:
+    from babel.embed.client import EmbedClient
+    from babel.embed.worker import run_embed_worker
+
+    settings = Settings()
+    notifier = Throttled(build_notifier(settings), settings.alert_repeat_sec)
+
+    # No check_ip_leak and no gluetun namespace, unlike `run` and `images`.
+    # This process never touches eRepublik: it talks to Postgres on the bridge
+    # and to a LAN address, and routing either through the tunnel would buy
+    # nothing and break both.
+    pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=4)
+    async with pool.acquire() as conn:
+        await apply_migrations(conn, MIGRATIONS)
+
+    client = EmbedClient(
+        settings.embed_service_url,
+        model=settings.embed_model,
+        dim=repo.EMBED_DIM,
+        timeout_sec=settings.embed_timeout_sec,
+    )
+    await run_embed_worker(pool, client, notifier, settings)
+
+
+@main.command()
 def migrate() -> None:
     """Apply pending migrations."""
     asyncio.run(_migrate())
