@@ -1396,6 +1396,8 @@ most-read part of the archive becomes searchable first.
 import asyncio
 import logging
 
+import aiohttp
+
 from babel.db import repo
 from babel.embed.client import EmbedError
 
@@ -1425,7 +1427,12 @@ async def run_embed_worker(
         ]
         try:
             vectors = await client.embed(texts)
-        except (EmbedError, OSError, asyncio.TimeoutError) as exc:
+        except (EmbedError, aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+            # aiohttp.ClientError is in the tuple because EmbedClient does not wrap
+            # every aiohttp fault: a 200 carrying a non-JSON body raises
+            # aiohttp.ContentTypeError from resp.json(), and that inherits from
+            # Exception, not OSError, so without this it escapes the handler and
+            # kills the worker. Found reviewing task 4.
             # Nothing is written and nothing is marked, so every row in this
             # batch is still queued. The back-off is the only state the failure
             # leaves behind, and a restart discards it — which is right, because
@@ -2077,7 +2084,7 @@ In `src/babel/web/routes.py`, inside `register_routes`:
             vectors = await asyncio.wait_for(
                 app.state.embedder.embed([query]), timeout=settings.search_timeout_sec
             )
-        except (EmbedError, OSError, TimeoutError, asyncio.TimeoutError):
+        except (EmbedError, aiohttp.ClientError, OSError, TimeoutError, asyncio.TimeoutError):
             # Deliberately not a keyword fallback: this codebase has no keyword
             # search, and offering one under that name would be a promise the
             # degradation path cannot keep. The reader is told the truth and
@@ -2097,6 +2104,8 @@ Add to the imports at the top of `routes.py`:
 
 ```python
 import asyncio
+
+import aiohttp
 
 from babel.db import search as db_search
 from babel.embed.client import EmbedError
