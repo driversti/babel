@@ -1002,7 +1002,12 @@ In `src/babel/config.py`, after `image_batch_size`:
     # guessed. Both are configuration because the corpus and the query are
     # different workloads: one is 32 long texts that may take a second, the
     # other is one short string a reader is waiting on.
-    embed_batch_size: int = Field(default=32, ge=1, le=64)
+    # 8, measured, not guessed. Task 1's sweep found batch 8 beats or ties 16
+    # and 32 at every token cap — the opposite of the usual expectation, because
+    # this board shares its memory bandwidth between CPU and GPU, so a larger
+    # batch buys no throughput and costs latency. The table is in the design
+    # spec's "Still unmeasured" item 1.
+    embed_batch_size: int = Field(default=8, ge=1, le=64)
 
     # Article text is truncated to this before it is sent. Far above what the
     # token cap can reach in any script in this archive (1024 tokens is ~4,000
