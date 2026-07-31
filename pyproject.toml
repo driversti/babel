@@ -38,7 +38,7 @@ packages = ["src/babel"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "jetson"]
 
 [tool.ruff]
 line-length = 110
@@ -47,3 +47,8 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "B", "UP", "ASYNC", "RET", "SIM"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# jetson/ runs on the L4T base image's Python 3.10, so ruff's pyupgrade rules —
+# which target this repo's py312 — would suggest syntax that fails there.
+"jetson/**" = ["UP"]
