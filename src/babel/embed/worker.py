@@ -53,8 +53,19 @@ async def run_embed_worker(
             # leaves behind, and a restart discards it — which is right, because
             # "the service is down" is a fact about now.
             consecutive_failures += 1
+            # min(consecutive_failures, 32) caps the exponent, not just the
+            # result: `2 ** (consecutive_failures - 1)` as an int has no
+            # ceiling, and at consecutive_failures = 1025 it is too large to
+            # convert to a float at all — OverflowError, from arithmetic that
+            # runs after client.embed's own exception has already been caught,
+            # so it is not inside the try/except above and escapes
+            # run_embed_worker uncaught. ~7 days of a down embed service is
+            # not a contrived count for a service meant to run indefinitely.
+            # 32 is already far past where doubling stops mattering: 2**31
+            # seconds dwarfs embed_backoff_max_sec, and the min() below
+            # discards the uncapped value exactly as it did before.
             delay = min(
-                settings.embed_backoff_base_sec * 2 ** (consecutive_failures - 1),
+                settings.embed_backoff_base_sec * 2 ** (min(consecutive_failures, 32) - 1),
                 settings.embed_backoff_max_sec,
             )
             log.warning("embed batch of %d failed (%s) — waiting %.0fs", len(batch), exc, delay)
