@@ -150,9 +150,15 @@ def create_app(
         # loop the app actually runs on, and this is the first place that loop
         # is running. It guards the archive_stats refresh; see routes._stats.
         app.state.stats_lock = asyncio.Lock()
-        # One client for the process — building one per request would open a
-        # fresh aiohttp session on every search. Injected in tests, built here
-        # in production, exactly like the pool below.
+        # One EmbedClient object built once here, not built per request — but
+        # not because that would open an extra aiohttp session: EmbedClient.embed
+        # opens and closes its own session inside a single `async with` on every
+        # call regardless of how many EmbedClient objects exist, so a fresh
+        # session is already the behaviour on every search either way. What
+        # building it once here actually buys is the same seam the pool below
+        # already uses: one object, injected in tests and constructed here in
+        # production, rather than re-reading settings.embed_service_url and
+        # friends into a new (cheap, but still gratuitous) object on every call.
         if embedder is not None:
             app.state.embedder = embedder
         else:

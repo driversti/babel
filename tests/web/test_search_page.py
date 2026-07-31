@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import json
 import time
 
 import httpx
@@ -71,6 +72,22 @@ async def test_a_timeout_degrades_the_same_way(client, seeded, embedder):
 async def test_search_is_disallowed_in_robots(client):
     body = (await client.get("/robots.txt")).text
     assert "Disallow: /search" in body
+
+
+async def test_a_malformed_json_reply_degrades_the_same_way(client, seeded, embedder):
+    """A 200 that declares application/json but carries a malformed body makes
+    aiohttp's resp.json() raise json.JSONDecodeError (a ValueError) from inside
+    EmbedClient.embed — not aiohttp.ClientError, which only covers a wrong
+    content type, not a right one with broken contents. Without this in the
+    except tuple, a malformed reply from the embed service escaped as an
+    unhandled exception to the generic 500 page instead of this route's own
+    honest "unavailable" — the one path the review found where the
+    degradation was not actually honest.
+    """
+    embedder.error = json.JSONDecodeError("Expecting value", "not json", 0)
+    resp = await client.get("/search", params={"q": "вибори"})
+    assert resp.status_code == 200
+    assert "unavailable" in resp.text.lower()
 
 
 class _HangingEmbedder:
