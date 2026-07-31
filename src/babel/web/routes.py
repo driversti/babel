@@ -337,7 +337,8 @@ def register_routes(app: FastAPI) -> None:
 
         if not query:
             return templates.TemplateResponse(
-                request=request, name="search.html", context=context
+                request=request, name="search.html", context=context,
+                headers={"Cache-Control": "public, max-age=300"},
             )
 
         try:
@@ -367,12 +368,21 @@ def register_routes(app: FastAPI) -> None:
             log.warning("embed service unavailable for search: %s", exc)
             context["unavailable"] = True
             return templates.TemplateResponse(
-                request=request, name="search.html", context=context
+                request=request, name="search.html", context=context,
+                # no-store, not the max-age=300 the other two paths use: this
+                # response describes an outage, not a page, and a proxy that
+                # cached "unavailable" for five minutes would keep telling
+                # readers the search is down for the whole cache lifetime
+                # after it recovers.
+                headers={"Cache-Control": "no-store"},
             )
 
         async with app.state.pool.acquire() as conn:
             context["rows"] = await db_search.search_articles(conn, vectors[0])
-        return templates.TemplateResponse(request=request, name="search.html", context=context)
+        return templates.TemplateResponse(
+            request=request, name="search.html", context=context,
+            headers={"Cache-Control": "public, max-age=300"},
+        )
 
     @app.get("/article/{article_id}", response_class=HTMLResponse)
     async def article(request: Request, article_id: int):
