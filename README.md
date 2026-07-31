@@ -143,6 +143,36 @@ docker compose up -d
 curl http://<jetson-address>:8081/healthz     # {"model":"BAAI/bge-m3","dim":1024,"cuda":true}
 ```
 
+### Pointing the x86 side at it
+
+Everything above ran on the Jetson, over the `ssh` opened at the top of this section, inside
+`~/babel-embed/src/jetson`. The rest of this file runs back on the x86 box, in this repo's own
+checkout root — not `~/babel-embed/src`, which does not exist there.
+
+`EMBED_SERVICE_URL` defaults to `http://localhost:8081`, which is not the Jetson — it resolves
+inside whichever container reads it — so a `.env` that skips this step still starts `babel embed`
+and `babel serve` without error. Both look healthy: `babel embed` backs off against a closed local
+port forever, logging and alerting exactly as it would for a real outage, and `/search` answers
+"unavailable" on every query. Neither process crashes or refuses to start, so nothing short of
+trying a search names the missing step.
+
+If `.env` does not already exist in this checkout (per "Configuration" above), `cp .env.example
+.env` first. Either way, edit the `EMBED_*`/`SEARCH_*` block `.env.example` already carries, at
+minimum:
+
+```bash
+# in this checkout's root. embed reads this .env via env_file:; web does not
+# get env_file: .env (see its own service comment for why) but reads the same
+# two values through docker-compose.yml's ${EMBED_SERVICE_URL}/${EMBED_MODEL}
+# interpolation, so one edit here reaches both.
+EMBED_SERVICE_URL=http://<jetson-address>:8081   # the address the curl above just confirmed, not localhost
+EMBED_MODEL=BAAI/bge-m3                          # must match the Jetson's MODEL_ID
+```
+
+`EMBED_BATCH_SIZE`, `EMBED_MAX_CHARS`, `SEARCH_MAX_QUERY_CHARS` and `SEARCH_TIMEOUT_SEC` ship
+working defaults in `.env.example` and don't need editing to get search running. This only edits
+the file; the next section is what actually brings `embed` up.
+
 ### Deploying the database change
 
 `db` moves from `postgres:17` to `pgvector/pgvector:0.8.6-pg17-trixie`. Same
