@@ -108,11 +108,20 @@ to the stored ones to rank identically.
 
 ## Why one vector
 
-The median article is 926 characters. Even at the worst tokens-per-character ratio in this corpus
-(Persian and Cyrillic script, roughly 0.4 tokens/char against ~0.25 for Latin), that is under 400
-tokens — comfortably inside a single forward pass. p90 is 4,626 characters. Chunking exists to stop
-a long document's topic from being diluted across one averaged vector; at this length distribution
-there is nothing to dilute.
+The median article is 926 characters. Measured against `bge-m3`'s own tokenizer on one 4,600-character
+article per script family, the ratio is **0.262 tokens/char for Latin, 0.248 for Persian and 0.226
+for Cyrillic** — so the median article is roughly 210–245 tokens, comfortably inside a single
+forward pass. p90 is 4,626 characters, or about 1,040–1,210 tokens. Chunking exists to stop a long
+document's topic from being diluted across one averaged vector; at this length distribution there is
+nothing to dilute.
+
+**Those ratios replace a guess, and they invert it.** An earlier draft of this section asserted
+"roughly 0.4 tokens/char for Persian and Cyrillic against ~0.25 for Latin", on the intuition that
+non-Latin scripts fragment more under a subword tokenizer. Measured, Latin is the *densest* of the
+three and Cyrillic the sparsest. The conclusion above survives — it survives more comfortably, since
+the worst case is milder than assumed — but the number it rested on was invented. This is one
+article per script family, not a corpus-wide distribution; treat it as an order of magnitude, not a
+constant.
 
 The tail is real but thin: p99 is 13,959 characters and the longest is 65,541. Those get truncated
 at the token cap and represented by their opening, which is where an article states its subject.
