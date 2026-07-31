@@ -10,8 +10,9 @@ the ORDER BY, and the symptom is a sequential scan over the whole table rather
 than an error. `quantised()` is the single source both take it from.
 """
 
+import contextlib
 import datetime
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
 import asyncpg
@@ -102,6 +103,27 @@ async def _apply_settings(conn: asyncpg.Connection, candidates: int) -> None:
     await conn.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
 
 
+@contextlib.asynccontextmanager
+async def _tuned(conn: asyncpg.Connection, candidates: int) -> AsyncIterator[None]:
+    """The transaction and the settings, together, for both callers.
+
+    Together on purpose. `search_articles` and
+    `search_articles_with_settings_probe` used to each open their own
+    `async with conn.transaction():` block around a shared `_apply_settings`
+    call — which meant the test that proves SET LOCAL took effect exercised
+    only the probe's copy of the transaction. The production function's own
+    transaction could be deleted entirely and the whole suite stayed green,
+    because nothing else in the suite runs `search_articles` against a settings
+    change that depends on it. A single helper neither caller can own a private
+    copy of closes that gap: there is now exactly one transaction to delete,
+    and deleting it breaks the probe's test regardless of which caller the
+    reviewer imagines exercising it.
+    """
+    async with conn.transaction():
+        await _apply_settings(conn, candidates)
+        yield
+
+
 async def search_articles(
     conn: asyncpg.Connection,
     vector: Sequence[float],
@@ -111,12 +133,7 @@ async def search_articles(
 ) -> tuple[SearchRow, ...]:
     literal = vector_literal(vector)
     sql = build_search_query()
-    # An explicit transaction, because SET LOCAL applies to one and asyncpg
-    # otherwise wraps each execute in its own. Plain SET is not the fix: on a
-    # pooled connection it would persist into whatever unrelated request
-    # borrows that connection next.
-    async with conn.transaction():
-        await _apply_settings(conn, candidates)
+    async with _tuned(conn, candidates):
         rows = await conn.fetch(sql, literal, candidates, limit)
     return tuple(
         SearchRow(
@@ -134,11 +151,13 @@ async def search_articles_with_settings_probe(
 
     Exists only for the test that proves SET LOCAL took effect. Reading the
     setting back is the only way to tell a working SET LOCAL from a no-op one,
-    because the no-op raises nothing.
+    because the no-op raises nothing. A thin wrapper over `_tuned`, the same
+    helper `search_articles` uses — not a second implementation — so this is
+    honest production surface, not a stand-in that could drift from what
+    actually runs.
     """
     literal = vector_literal(vector)
     sql = build_search_query()
-    async with conn.transaction():
-        await _apply_settings(conn, candidates)
+    async with _tuned(conn, candidates):
         await conn.fetch(sql, literal, candidates, limit)
         return await conn.fetchval("SELECT current_setting('hnsw.ef_search')")
