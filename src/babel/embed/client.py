@@ -40,6 +40,13 @@ class EmbedClient:
                 raise EmbedError(f"embed service returned {resp.status}: {await resp.text()}")
             body = await resp.json()
 
+        if not isinstance(body, dict):
+            # A 200 with a syntactically valid but structurally wrong body —
+            # a bare JSON array or string, say. `body.get(...)` below would
+            # raise AttributeError, which is in neither the worker's nor the
+            # search route's except tuple, so it would escape as an
+            # unhandled exception instead of this client's own EmbedError.
+            raise EmbedError(f"embed service reply is not a JSON object: {body!r}")
         if body.get("model") != self._model:
             raise EmbedError(
                 f"embed service reports model {body.get('model')!r}, expected "
@@ -55,6 +62,20 @@ class EmbedClient:
         for i, vec in enumerate(vectors):
             if len(vec) != self._dim:
                 raise EmbedError(f"vector {i} has length {len(vec)}, expected {self._dim}")
+            if not all(math.isfinite(v) for v in vec):
+                # Must run before the norm check below, not after: a NaN
+                # component makes `norm` itself NaN, and every comparison
+                # against NaN is False in IEEE 754, so `abs(norm - 1.0) >
+                # NORM_TOLERANCE` silently passes a NaN vector through. That is
+                # not hypothetical — fp16 inference overflowing to inf and then
+                # to NaN through F.normalize is the exact path a real batch
+                # took, and the vector went on to reach asyncpg's halfvec
+                # column, which rejects NaN outside this module entirely, from
+                # a call site that crash-loops the worker with no alert.
+                raise EmbedError(
+                    f"vector {i} has a non-finite component (NaN or inf) — the "
+                    f"encoder has stopped producing valid output"
+                )
             norm = math.sqrt(sum(v * v for v in vec))
             if abs(norm - 1.0) > NORM_TOLERANCE:
                 raise EmbedError(

@@ -108,3 +108,48 @@ async def test_a_non_200_is_refused():
     client, _ = build({"detail": "too big"}, status=413)
     with pytest.raises(EmbedError, match="413"):
         await client.embed(["a"])
+
+
+async def test_a_200_carrying_a_json_array_is_refused():
+    """A 200 whose body is valid JSON but not an object — a bare list, for
+    example — makes `body.get("model")` raise AttributeError, which is in
+    neither the worker's nor the search route's except tuple, so it would
+    escape both as an unhandled exception. Same class of bug as the
+    json.JSONDecodeError path already closed: the service answered, but not
+    with anything this client's contract expects.
+    """
+    client, _ = build([1, 2, 3])
+    with pytest.raises(EmbedError, match="object"):
+        await client.embed(["a"])
+
+
+async def test_a_nan_component_is_refused():
+    """The bug the whole-branch review found by tracing the path against a
+    real pgvector container, not by reasoning: `norm = sqrt(sum(v*v ...))` is
+    NaN when any component is NaN, and `abs(nan - 1.0) > NORM_TOLERANCE` is
+    **False** — every comparison against NaN is False in IEEE 754 — so the
+    existing norm guard lets a NaN vector through with no EmbedError. It then
+    reaches `save_embeddings` as `[nan,0,...]` and asyncpg raises
+    `DataError: NaN not allowed in halfvec` from a call site outside the
+    worker's own try/except, killing the process; `restart: unless-stopped`
+    brings it back to claim the same batch and die again, forever, with no
+    alert. fp16 inference overflowing to inf and then to NaN through
+    F.normalize is not exotic, so this is caught explicitly, before the norm
+    check ever runs on it.
+    """
+    client, _ = build(
+        {"model": "right/model", "dim": DIM, "vectors": [[float("nan"), 0.0, 0.0, 0.0]]}
+    )
+    with pytest.raises(EmbedError, match="finite"):
+        await client.embed(["a"])
+
+
+async def test_an_all_zero_vector_is_refused():
+    """Not a new guard: the existing norm check already refuses this, because
+    a zero vector's norm (0.0) sits 1.0 away from 1.0, over NORM_TOLERANCE.
+    Deferred separately from the NaN finding above, and nothing pinned it
+    with a test until now.
+    """
+    client, _ = build({"model": "right/model", "dim": DIM, "vectors": [[0.0, 0.0, 0.0, 0.0]]})
+    with pytest.raises(EmbedError, match="norm"):
+        await client.embed(["a"])
