@@ -581,8 +581,14 @@ document:
    hand-built cross-language set in `tests/eval/test_cross_language.py`, run with `pytest -m live`
    against the real Jetson `bge-m3` service and a real (if small) populated database — see task 8's
    report for the eight query/article pairs, each written by hand from a real archived body, each
-   query in a different language from the article it targets, covering all eight languages the
-   archive actually has: Persian, Serbian, Hungarian, Indonesian, Bulgarian, Polish, Spanish, English.
+   query in a different language from the article it targets — one topical article per language
+   actually present in the corpus, from the eight this project has long named for it: Persian,
+   Serbian, Hungarian, Indonesian, Bulgarian, Polish, Spanish, English. That phrasing is deliberately
+   weaker than "all eight languages the archive has": `lang` is NULL in every row (CLAUDE.md,
+   Status), so nothing in the schema can enumerate the archive's language set or confirm these eight
+   are the complete one at 162,618 rows — the list is inherited from an observation made at 10,093
+   articles, not a query.
+
    **This is a genuine measurement, not a vacuous one** — the target article still had to outrank
    several hundred real, multilingual distractor articles under `search_articles`'s default
    `CANDIDATES=500, RESULTS=20` — but it is not a measurement of the 25x over-fetch ratio's adequacy
