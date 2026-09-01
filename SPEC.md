@@ -490,6 +490,17 @@ neither will the next format: sniffing may only ever widen what is accepted, nev
 Expect more of this. Every false `dead` so far has arrived as a batch from a single host, which is
 why the warning names the host rather than the URL.
 
+**A host can also be written off by hand.** The rules above are what the worker *infers* per
+request; they cannot notice that a whole host stopped existing — a name that no longer resolves is
+`error`, retried five times, then abandoned in `error` without a label. After the walk finished the
+queue held millions of such rows on hosts gone for years (every `iNN.tinypic.com`, `prikachi.com`,
+…), each still costing five fetches. `babel image-hosts` reports hosts by queue depth with a live
+one-request probe, and `babel kill-image-host` moves a named host's `pending`/`error` rows to
+`dead` in one statement — the operator supplying the "positive evidence" the worker cannot. It is
+guarded by lifetime `ok` (a host we have ever fetched from needs `--force`) and fully reversed by
+`requeue-images --host`, because a batch write-off is exactly the shape of mistake that paragraph
+is about.
+
 **Nothing is translated at ingest time.** Store originals; translation is a phase 3 concern and
 belongs at query time, on the handful of documents actually retrieved.
 

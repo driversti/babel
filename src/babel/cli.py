@@ -18,6 +18,7 @@ from babel.config import Settings
 from babel.crawler.backfill import run_backfill
 from babel.crawler.fetcher import curl_getter
 from babel.crawler.hostlimit import HostLimiter
+from babel.crawler.hostprobe import WRITE_OFF_VERDICTS, probe_host
 from babel.crawler.images import ImageBlocked, ImageTooLarge, classify_url
 from babel.crawler.imageworker import run_image_worker
 from babel.crawler.ingest import Ingestor
@@ -562,6 +563,149 @@ async def _refetch(selection: list[int]) -> None:
     finally:
         await conn.close()
     click.echo(f"queued {changed:,} of {len(selection):,} selected article(s) for re-collection")
+
+
+# One request per host at a time is enough — the report touches hundreds of
+# unrelated third-party hosts, not one host hundreds of times, so a small cap
+# keeps it quick without hammering anyone.
+IMAGE_PROBE_CONCURRENCY = 10
+
+
+def parse_host_list(raw: str) -> list[str]:
+    """Comma-separated hosts to a deduplicated, lowercased list in first-seen order."""
+    out: list[str] = []
+    for part in raw.split(","):
+        host = part.strip().lower()
+        if host and host not in out:
+            out.append(host)
+    if not out:
+        raise ValueError("no host given")
+    return out
+
+
+def _echo_stuck_image_hosts(stuck: list[tuple[str, int]]) -> None:
+    if not stuck:
+        click.echo("no host has images stuck at all")
+        return
+    click.echo("hosts with stuck images:")
+    for name, count in stuck:
+        click.echo(f"  {count:>9,}  {name}")
+
+
+@main.command("image-hosts")
+@click.option("--min-rows", default=500, help="Only hosts with at least this many queued images (default 500).")
+@click.option("--no-probe", is_flag=True, help="Skip the live DNS/HTTP check; show counts only.")
+def image_hosts(min_rows: int, no_probe: bool) -> None:
+    """Report image hosts by how much of the queue they hold, with a live check.
+
+    'pending' + 'error' is the depth the worker will still spend attempts on;
+    lifetime 'ok' beside it separates a dead host from a slow one. The 'probe'
+    column is one request made now: nxdomain, blocked, unreachable, gone (404/410),
+    http-error (403/429/5xx — not written off), not-image (a landing page), alive.
+
+    Read-only. Feed the hosts it flags to `babel kill-image-host`.
+    """
+    asyncio.run(_image_hosts(min_rows, no_probe))
+
+
+async def _image_hosts(min_rows: int, no_probe: bool) -> None:
+    settings = Settings()
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        hosts = await repo.image_host_backlog(conn, min_rows)
+        if not hosts:
+            click.echo(f"no host has {min_rows:,}+ images queued")
+            return
+        samples = (
+            {}
+            if no_probe
+            else {h.host: await repo.sample_url_for_host(conn, h.host) for h in hosts}
+        )
+    finally:
+        await conn.close()
+
+    probes: dict[str, str] = {}
+    if not no_probe:
+        semaphore = asyncio.Semaphore(IMAGE_PROBE_CONCURRENCY)
+        async with AsyncSession(impersonate="chrome") as session:
+            get_bytes = _bytes_getter(session, settings.request_timeout_sec)
+
+            async def run_probe(host: str, url: str | None) -> None:
+                if url is None:
+                    probes[host] = "?"
+                    return
+                async with semaphore:
+                    try:
+                        probes[host] = await asyncio.wait_for(
+                            probe_host(get_bytes, url, max_bytes=settings.max_image_bytes),
+                            timeout=settings.image_timeout_sec,
+                        )
+                    except Exception:  # noqa: BLE001 — a probe that will not finish is unreachable
+                        probes[host] = "unreachable"
+
+            await asyncio.gather(*(run_probe(h.host, samples[h.host]) for h in hosts))
+
+    click.echo(f"{'pending':>10} {'error':>8} {'ok':>8} {'dead':>8}  {'probe':<12} host")
+    for h in hosts:
+        click.echo(
+            f"{h.pending:>10,} {h.error:>8,} {h.ok:>8,} {h.dead:>8,}  "
+            f"{probes.get(h.host, ''):<12} {h.host}"
+        )
+
+    if no_probe:
+        return
+    writeoff = [h for h in hosts if h.ok == 0 and probes.get(h.host) in WRITE_OFF_VERDICTS]
+    if not writeoff:
+        click.echo("\nnothing here looks safe to write off automatically — check the probe column by hand")
+        return
+    rows = sum(h.pending + h.error for h in writeoff)
+    click.echo(
+        f"\n{len(writeoff)} host(s), {rows:,} queued image(s) look safe to write off "
+        f"(probe says gone, never any ok):"
+    )
+    click.echo(f"  babel kill-image-host --host {','.join(h.host for h in writeoff)}")
+
+
+@main.command("kill-image-host")
+@click.option("--host", required=True, help="Host(s) to write off, comma-separated. Pass ? to list stuck hosts.")
+@click.option("--force", is_flag=True, help="Write off even a host we have stored images from.")
+def kill_image_host(host: str, force: bool) -> None:
+    """Move a dead image host's queued rows to 'dead' so the worker stops retrying them.
+
+    The exact reverse of `requeue-images`, and undone by it: a host written off by
+    mistake comes back with `babel requeue-images --host <h>`. A host with any
+    stored image is refused unless --force.
+    """
+    asyncio.run(_kill_image_hosts(host, force))
+
+
+async def _kill_image_hosts(host: str, force: bool) -> None:
+    settings = Settings()
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        if host.strip() == "?":
+            _echo_stuck_image_hosts(await repo.stuck_image_hosts(conn, STUCK_HOSTS_SHOWN))
+            return
+        selection = parse_host_list(host)
+        total = 0
+        for name in selection:
+            try:
+                changed = await repo.kill_image_host(conn, name, force=force)
+            except repo.HostHasLiveImages as refused:
+                click.echo(
+                    f"refused {name}: {refused.ok_count:,} stored image(s) — "
+                    f"add --force to write it off anyway"
+                )
+                continue
+            total += changed
+            if changed:
+                click.echo(f"marked {changed:,} image(s) from {name} as dead")
+            else:
+                click.echo(f"nothing queued under {name!r} — the host must match exactly")
+        if total == 0 and selection:
+            _echo_stuck_image_hosts(await repo.stuck_image_hosts(conn, STUCK_HOSTS_SHOWN))
+    finally:
+        await conn.close()
 
 
 @main.command()

@@ -257,6 +257,15 @@ are not searchable.
 - `babel run [--start-id N] [--no-poll] [--no-backfill]` — run the crawler until stopped
 - `babel images` — drain the image queue until stopped; a separate long-running service from
   `babel run`, stoppable and restartable independently
+- `babel image-hosts [--min-rows N] [--no-probe]` — read-only report of image hosts by queue depth
+  (`pending` + `error`), with lifetime `ok`/`dead` and a one-request-per-host live probe
+  (`nxdomain` / `blocked` / `unreachable` / `gone` / `http-error` / `not-image` / `alive`). After
+  the walk the queue is millions of `pending` rows, many on hosts gone for years — this finds them,
+  and prints a ready-to-paste `kill-image-host` line for the ones that are clearly dead
+- `babel kill-image-host --host a.example,b.example [--force]` — the reverse of `requeue-images`:
+  move a dead host's `pending`/`error` rows to `dead` so the worker stops retrying each one five
+  times. Refuses a host with any stored (`ok`) image unless `--force`; reversible with
+  `babel requeue-images --host <h>`. `--host ?` lists stuck hosts
 - `babel refetch --ids 123,456` or `babel refetch --from 100 --to 200` — queue already-collected
   articles for re-collection, e.g. after fixing a parser bug or when the site's markup has changed.
   Only `ok` and `error` rows are touched — a `missing` row is a fact about the article, not about
