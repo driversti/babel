@@ -141,6 +141,16 @@ article walk produces, so `article_images` still grows. Four separate causes wer
 (see the commits) and the queue is no longer growing for a *broken* reason — but whether the drain
 keeps up over a month is unmeasured. Watch the pending count and `docker compose logs images`.
 
+Update 2026-09-01: the walk finished (cursor 0, 1.54M articles). `article_images` at that point was
+`pending` 3.07M / `ok` 719k / `dead` 270k / `error` 266k, and 98.6% of the `error` rows were already
+at the five-attempt ceiling — abandoned but not labelled, and still counted by `stuck_image_hosts`.
+Most of the `pending` mass is on hosts that stopped existing years ago (every `iNN.tinypic.com`,
+`prikachi.com`, `www.dodaj.rs`, …), each still costing five fetches before it lands. `babel
+image-hosts` (report + live probe) and `babel kill-image-host` (bulk `pending`/`error` → `dead` for
+a named host, guarded by lifetime `ok`, reversible via `requeue-images`) exist to clear that —
+see Commands. This does not touch re-accumulation from the poller; a host written off can be
+re-enqueued by a later article citing it, which is rare enough to ignore for now.
+
 Found during Task 11's own review rounds (the markup render guard) rather than live, and now closed
 by the whole-branch review's fix wave — see
 `.superpowers/sdd/2026-07-27-article-markup/final-fix-report.md` for the full measurements and
@@ -361,6 +371,18 @@ measurement was cheap.
   to be misjudged. Pass a host you don't recognise to get a ranked list of hosts with stuck images.
   `dead` is permanent by design, and every false `dead` so far arrived as a batch from one host —
   this is the way back.
+- `docker compose run --rm crawler babel image-hosts [--min-rows 500] [--no-probe]` — read-only
+  report of image hosts by queue depth (`pending` + `error`), with lifetime `ok`/`dead` beside each
+  and a one-request-per-host live `probe` (`nxdomain` / `blocked` / `unreachable` / `gone` (404/410)
+  / `http-error` (403/429/5xx — *not* auto-safe) / `not-image` / `alive`). After the walk the queue
+  is millions of `pending` rows, a large share on hosts gone for years (tinypic since 2019); this is
+  how you find them. Ends with a ready-to-paste `kill-image-host` line for the hosts whose probe
+  says gone and which have never returned an `ok`.
+- `docker compose run --rm crawler babel kill-image-host --host i49.tinypic.com,prikachi.com` —
+  the exact reverse of `requeue-images`: moves a dead host's `pending`/`error` rows to `dead` so the
+  worker stops spending five attempts on each. Refuses a host with any stored (`ok`) image unless
+  `--force`; `attempts` is left as a record. Undone by `requeue-images --host <h>`. Pass `--host ?`
+  for the stuck-hosts list.
 - `babel images` — drain the `article_images` queue until stopped; runs as the separate `images`
   compose service, stoppable/restartable independently of `crawler` since ingest only enqueues
   image URLs and never fetches the bytes itself

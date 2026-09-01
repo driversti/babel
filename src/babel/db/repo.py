@@ -54,6 +54,21 @@ class CommentsVanishedError(Exception):
     """
 
 
+class HostHasLiveImages(Exception):  # noqa: N818 — a refusal, not a fault
+    """`kill_image_host` was asked to write off a host we have fetched from.
+
+    Every false 'dead' this project has seen arrived as a batch from one host, so
+    the same batch operation that recovers them (`requeue_images_by_host`) is the
+    one that could create them. Lifetime 'ok' > 0 is the evidence that the host
+    serves real images to us; the caller must pass force=True to override it.
+    """
+
+    def __init__(self, host: str, ok_count: int) -> None:
+        super().__init__(f"{host} has {ok_count} stored image(s); pass force to write it off anyway")
+        self.host = host
+        self.ok_count = ok_count
+
+
 async def save_article(conn: asyncpg.Connection, article: Article) -> None:
     """Insert or replace an article together with its comments and image slots.
 
@@ -401,6 +416,84 @@ async def stuck_image_hosts(conn: asyncpg.Connection, limit: int) -> list[tuple[
         limit,
     )
     return [(r["host"], r["n"]) for r in rows]
+
+
+@dataclass(frozen=True, slots=True)
+class HostBacklog:
+    host: str
+    pending: int
+    error: int
+    ok: int
+    dead: int
+
+
+async def image_host_backlog(conn: asyncpg.Connection, min_rows: int) -> list[HostBacklog]:
+    """Hosts with a real queue behind them, deepest first, with the context to judge them.
+
+    `pending + error` is the depth that matters — rows the worker will still spend
+    attempts on. Lifetime `ok` beside it is what tells a dead host (tinypic, gone
+    since 2019, `ok = 0`) from a live one having a bad week. `min_rows` filters the
+    184k-host long tail down to the few hundred that hold most of the backlog.
+    """
+    rows = await conn.fetch(
+        f"""
+        SELECT {_URL_HOST} AS host,
+               count(*) FILTER (WHERE status = 'pending') AS pending,
+               count(*) FILTER (WHERE status = 'error')   AS error,
+               count(*) FILTER (WHERE status = 'ok')      AS ok,
+               count(*) FILTER (WHERE status = 'dead')    AS dead
+        FROM article_images
+        GROUP BY 1
+        HAVING count(*) FILTER (WHERE status IN ('pending', 'error')) >= $1
+        ORDER BY count(*) FILTER (WHERE status IN ('pending', 'error')) DESC, host
+        """,
+        min_rows,
+    )
+    return [HostBacklog(**dict(r)) for r in rows]
+
+
+async def sample_url_for_host(conn: asyncpg.Connection, host: str) -> str | None:
+    """One still-queued source_url for the host, newest article first, or None.
+
+    The report probes a host by actually fetching one of its images; this picks
+    which one, in the same order the worker drains, so the probe sees what the
+    worker would see next.
+    """
+    return await conn.fetchval(
+        f"""SELECT source_url
+            FROM article_images
+            WHERE status IN ('pending', 'error') AND {_URL_HOST} = lower($1)
+            ORDER BY article_id DESC, position
+            LIMIT 1""",
+        host,
+    )
+
+
+async def kill_image_host(conn: asyncpg.Connection, host: str, *, force: bool = False) -> int:
+    """Write off a dead host: its 'pending'/'error' rows become 'dead'. Rows changed.
+
+    The exact reverse of `requeue_images_by_host`. 'dead' is never claimed, so the
+    worker stops dialling the host entirely instead of burning five attempts on
+    every one of its images. `attempts` is left as it stands — a record of what the
+    row went through, and harmless once the status is terminal.
+
+    Refuses with `HostHasLiveImages` when lifetime 'ok' > 0 for the host, unless
+    `force`. 'ok' is never touched regardless: a stored blob is a good capture.
+    """
+    if not force:
+        ok_count = await conn.fetchval(
+            f"SELECT count(*) FROM article_images WHERE {_URL_HOST} = lower($1) AND status = 'ok'",
+            host,
+        )
+        if ok_count:
+            raise HostHasLiveImages(host, ok_count)
+    result = await conn.execute(
+        f"""UPDATE article_images
+            SET status = 'dead', checked_at = now()
+            WHERE status IN ('pending', 'error') AND {_URL_HOST} = lower($1)""",
+        host,
+    )
+    return int(result.split()[-1])
 
 
 async def record_image_result(
