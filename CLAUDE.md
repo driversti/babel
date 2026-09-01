@@ -239,6 +239,26 @@ docker compose run --rm crawler babel migrate
 docker compose up -d crawler images web
 ```
 
+**`docker compose run --rm <service>` is not confined to that service — it reconciles every
+dependency against the compose file on the checked-out branch first, even for a one-off, read-only
+command.** Measured directly on 2026-09-01: `main` had already picked up `db: pgvector/pgvector:...`
+from the merged Phase-3 branch, while `.18`'s running `babel-db` was still the pre-cutover
+`postgres:17` container — the intended cutover was still pending, on purpose (see the Phase 3 note
+in "What is still open"). Running `docker compose run --rm crawler babel image-hosts` — a report
+command that touches no schema and calls no migration — from a branch checked out on top of that
+`main` recreated `babel-db` on the new image anyway, because Compose brings every `depends_on`
+service in line with the current file before running the one-off, regardless of whether the command
+itself would ever touch it. Data and schema survived intact (same volume, migration state unchanged
+at `007_body_markup.sql`, no `vector` extension) and Postgres itself restarted cleanly, but
+`babel-crawler`'s live connection was severed mid-query and the process crashed
+(`asyncpg... connection has been released back to the pool`) — caught and restarted by
+`restart: unless-stopped` within about a minute, no further recurrence. The lesson: a feature branch
+must not be checked out on this host — even to run something read-only — while it carries an
+image-tag change for a service the branch's own author did not intend to deploy yet. Test a new
+command by copying the changed files into the checkout with `rsync`, or by pulling only the compose
+services you are about to touch, never by `git checkout`-ing a whole branch that happens to sit
+ahead of what is actually running.
+
 **Rolling the crawler back after migration 007 leaves `body_raw` stale beside a freshly-updated
 `body`.** A rollback reverts the application image, not the schema — migration 007's `body_raw`
 column stays on the table regardless. The pre-`feat/article-markup` `save_article` never mentions
